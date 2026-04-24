@@ -121,6 +121,63 @@ from `SPEC.md` §9 and consider widening the default stickiness window.
 
 ---
 
+## CRITICAL: the SPEC §7 probe endpoint rejects OAuth tokens (2026-04-24)
+
+**Finding:** Live-probing all three operator profiles (`account-b`,
+`account-c`, `account-a`) against `GET https://api.anthropic.com/v1/models`
+with a `Bearer <claudeAiOauth.accessToken>` header returns HTTP 401
+with body:
+
+```json
+{
+  "error": {
+    "type": "authentication_error",
+    "message": "OAuth authentication is currently not supported."
+  }
+}
+```
+
+Classifier correctly labels this as `auth_dead`, but the built-in
+remediation hint (`claude login --profile <name>`) is wrong: no amount
+of re-logging in will make OAuth tokens work on `/v1/models`.
+
+**Implication for the tool:** claude-lb v0.1 in its current form cannot
+actually distinguish healthy from unhealthy OAuth profiles, because the
+probe endpoint rejects every OAuth token unconditionally. The whole
+seven-state taxonomy works correctly for the responses the server
+sends, but the responses tell us nothing useful about per-profile
+health.
+
+**Candidate resolutions to investigate in v0.2:**
+
+1. **Endpoint swap.** Find an API route that Anthropic accepts with
+   OAuth tokens. Candidates to test:
+   - `POST /v1/messages` with `max_tokens: 1` and `model: claude-3-5-haiku-latest` — known to work for Claude Code itself; costs ~1 cached input token per probe.
+   - `GET /v1/me` or `GET /v1/organizations/<id>` — may or may not exist publicly.
+   - A dedicated introspection endpoint if Anthropic adds one.
+2. **Token-shape sanity check at probe time.** If the operator stores
+   an API key (`sk-ant-api03-…`) in `.credentials.json` instead of an
+   OAuth token (`sk-ant-oat01-…`), `/v1/models` WILL work — but
+   `claude login` doesn't produce those. Document the distinction.
+3. **Classify this error as a new terminal state.** Add `unsupported`
+   (or similar) so the remediation hint differs from `auth_dead`. Gate
+   it on the exact message substring `"OAuth authentication is
+   currently not supported"` so future shape changes don't silently
+   break.
+
+**Workaround for today:** do not rely on `claude-lb` for health routing
+until the probe endpoint is fixed. Tools that need to pick a profile
+can still call `claude-lb list` (discovery works), `claude-lb pick`
+against an empty cache will return `unknown`-state entries in
+discovery order (first-healthy behaviour), and the rest of the
+plumbing (caching, stickiness, exit codes, JSON envelope) is
+independently correct.
+
+**Action item:** replace the SPEC §7 probe endpoint. Until then, this
+is the single biggest blocker between v0.1 and v0.1 being *useful*.
+
+---
+
 ## Other findings discovered during implementation
 
 - **403 is plan-exhaustion in disguise** (sometimes). Anthropic has been

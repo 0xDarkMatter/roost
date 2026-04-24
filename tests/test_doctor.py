@@ -76,3 +76,102 @@ def test_credentials_parseable_reports_token_source_distribution(profile_factory
     # Exact detail includes token-source distribution
     assert "modern shape: 1" in check.detail
     assert "legacy shape: 2" in check.detail
+
+
+# ---------------------------------------------------------------------------
+# Reachability check — iterate all address-family candidates
+# ---------------------------------------------------------------------------
+
+
+def test_reachability_iterates_addrinfo_entries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: was only trying infos[0]; IPv6-only boxes with v4 in [0]
+    would fail spuriously. Verify we fall through to a later candidate."""
+    import socket
+
+    call_count = {"n": 0}
+
+    fake_infos = [
+        (socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("::1", 443, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 443)),
+    ]
+
+    def fake_getaddrinfo(*args: object, **kwargs: object) -> list:
+        return fake_infos
+
+    class FakeSocket:
+        def __init__(self, family: int, socktype: int, proto: int) -> None:
+            self.family = family
+
+        def settimeout(self, s: float) -> None:
+            pass
+
+        def connect(self, addr: object) -> None:
+            call_count["n"] += 1
+            # First candidate fails, second succeeds
+            if self.family == socket.AF_INET6:
+                raise OSError("v6 not routable")
+            return None
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(socket, "socket", FakeSocket)
+
+    result = doctor_mod._check_anthropic_reachable(timeout_s=1.0)
+    assert result.passed is True
+    assert call_count["n"] == 2  # Tried v6, then v4
+
+
+def test_reachability_fails_when_all_candidates_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    import socket
+
+    fake_infos = [
+        (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 443)),
+    ]
+
+    def fake_getaddrinfo(*args: object, **kwargs: object) -> list:
+        return fake_infos
+
+    class FakeSocket:
+        def __init__(self, family: int, socktype: int, proto: int) -> None:
+            pass
+
+        def settimeout(self, s: float) -> None:
+            pass
+
+        def connect(self, addr: object) -> None:
+            raise OSError("refused")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(socket, "socket", FakeSocket)
+
+    result = doctor_mod._check_anthropic_reachable(timeout_s=1.0)
+    assert result.passed is False
+    assert "TCP connect" in result.detail
+
+
+def test_reachability_dns_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    import socket
+
+    def fake_getaddrinfo(*args: object, **kwargs: object) -> list:
+        raise OSError("dns dead")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    result = doctor_mod._check_anthropic_reachable(timeout_s=1.0)
+    assert result.passed is False
+    assert "DNS" in result.detail
+
+
+def test_reachability_empty_addrinfo(monkeypatch: pytest.MonkeyPatch) -> None:
+    import socket
+
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [])
+
+    result = doctor_mod._check_anthropic_reachable(timeout_s=1.0)
+    assert result.passed is False
+    assert "No A/AAAA" in result.detail

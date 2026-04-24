@@ -125,6 +125,36 @@ def test_show_json(profile_factory) -> None:
     assert payload["data"]["name"] == "account-a"
 
 
+def test_show_json_has_consistent_shape_when_never_probed(profile_factory) -> None:
+    """Regression: --json used to omit health fields when entry was absent.
+    Callers would have to null-guard half the fields. Now all keys are always
+    present; values are null when no entry exists."""
+    profile_factory("account-a")
+    result = runner.invoke(app, ["show", "account-a", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    expected_keys = {
+        "name",
+        "credentials_path",
+        "token_source",
+        "health",
+        "probed_at",
+        "expires_at",
+        "retry_after_s",
+        "session_reset_at",
+        "weekly_reset_at",
+        "usage",
+        "error",
+        "probe_latency_ms",
+    }
+    assert expected_keys <= set(payload["data"].keys())
+    # Never-probed profile: health is "unknown", all health metadata is null.
+    assert payload["data"]["health"] == "unknown"
+    assert payload["data"]["probed_at"] is None
+    assert payload["data"]["retry_after_s"] is None
+    assert payload["data"]["error"] is None
+
+
 # ---------------------------------------------------------------------------
 # profiles invalidate
 # ---------------------------------------------------------------------------

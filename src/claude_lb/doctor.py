@@ -142,12 +142,12 @@ def _check_anthropic_reachable(timeout_s: float = 3.0) -> CheckResult:
     """DNS + TCP handshake to api.anthropic.com:443.
 
     Doesn't authenticate or probe — just confirms the endpoint is reachable.
-    This is a best-effort check; network hiccups shouldn't fail doctor hard.
+    Tries each getaddrinfo result in turn so IPv6-only or IPv4-only hosts
+    both work.
     """
     host = "api.anthropic.com"
     port = 443
     try:
-        # getaddrinfo → resolves DNS without opening a socket
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
         return CheckResult(
@@ -161,23 +161,28 @@ def _check_anthropic_reachable(timeout_s: float = 3.0) -> CheckResult:
             passed=False,
             detail=f"No A/AAAA records for {host}",
         )
-    family, socktype, proto, _, sockaddr = infos[0]
-    s = socket.socket(family, socktype, proto)
-    s.settimeout(timeout_s)
-    try:
-        s.connect(sockaddr)
-    except OSError as exc:
-        return CheckResult(
-            name="anthropic_reachable",
-            passed=False,
-            detail=f"TCP connect to {host}:{port} failed: {exc}",
-        )
-    finally:
-        s.close()
+
+    last_exc: OSError | None = None
+    for family, socktype, proto, _canon, sockaddr in infos:
+        s = socket.socket(family, socktype, proto)
+        s.settimeout(timeout_s)
+        try:
+            s.connect(sockaddr)
+            return CheckResult(
+                name="anthropic_reachable",
+                passed=True,
+                detail=f"{host}:{port} reachable",
+            )
+        except OSError as exc:
+            last_exc = exc
+            continue
+        finally:
+            s.close()
+
     return CheckResult(
         name="anthropic_reachable",
-        passed=True,
-        detail=f"{host}:{port} reachable",
+        passed=False,
+        detail=f"TCP connect to {host}:{port} failed: {last_exc}",
     )
 
 

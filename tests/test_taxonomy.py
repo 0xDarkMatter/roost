@@ -228,6 +228,15 @@ def test_compute_expires_at_rate_limited_defaults_60s_without_retry_after() -> N
     assert expires == FIXED_NOW + timedelta(seconds=60)
 
 
+def test_compute_expires_at_rate_limited_honours_explicit_zero() -> None:
+    """Regression: retry-after=0 means 'retry now', not fall-through to 60s default."""
+    body = load_json(RL_FIXTURES / "plain-rate-limit.json")
+    result = classify(ProbeInput(status_code=429, body=body, headers={"retry-after": "0"}))
+    assert result.retry_after_s == 0
+    expires = compute_expires_at(result, FIXED_NOW)
+    assert expires == FIXED_NOW  # immediate retry, not +60s
+
+
 def test_compute_expires_at_network_error_is_30s() -> None:
     result = classify(ProbeInput(exception_kind="timeout", exception_message="t"))
     expires = compute_expires_at(result, FIXED_NOW)

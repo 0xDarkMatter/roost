@@ -349,30 +349,38 @@ def profiles_show(
     cache = load_cache()
     entry = cache.profiles.get(name)
     if json_output:
-        payload: dict[str, Any] = {
-            "data": {
-                "name": name,
-                "credentials_path": profile.credentials_path,
-                "token_source": profile.token_source,
-            }
+        # Emit a consistent shape regardless of whether the profile has been
+        # probed yet — callers should not have to null-guard half the fields.
+        from datetime import datetime as _dt
+
+        def _iso_or_none(dt: _dt | None) -> str | None:
+            if dt is None:
+                return None
+            return dt.isoformat().replace("+00:00", "Z")
+
+        data: dict[str, Any] = {
+            "name": name,
+            "credentials_path": profile.credentials_path,
+            "token_source": profile.token_source,
+            "health": entry.health.value if entry is not None else "unknown",
+            "probed_at": _iso_or_none(entry.probed_at) if entry is not None else None,
+            "expires_at": _iso_or_none(entry.expires_at) if entry is not None else None,
+            "retry_after_s": entry.retry_after_s if entry is not None else None,
+            "session_reset_at": (
+                _iso_or_none(entry.session_reset_at) if entry is not None else None
+            ),
+            "weekly_reset_at": (
+                _iso_or_none(entry.weekly_reset_at) if entry is not None else None
+            ),
+            "usage": (
+                entry.usage.model_dump() if entry is not None and entry.usage else None
+            ),
+            "error": (
+                entry.error.model_dump() if entry is not None and entry.error else None
+            ),
+            "probe_latency_ms": entry.probe_latency_ms if entry is not None else None,
         }
-        if entry is not None:
-            payload["data"]["health"] = entry.health.value
-            payload["data"]["probed_at"] = entry.probed_at.isoformat().replace(
-                "+00:00", "Z"
-            )
-            payload["data"]["expires_at"] = (
-                entry.expires_at.isoformat().replace("+00:00", "Z")
-                if entry.expires_at
-                else None
-            )
-            payload["data"]["retry_after_s"] = entry.retry_after_s
-            payload["data"]["usage"] = entry.usage.model_dump() if entry.usage else None
-            payload["data"]["error"] = entry.error.model_dump() if entry.error else None
-            payload["data"]["probe_latency_ms"] = entry.probe_latency_ms
-        else:
-            payload["data"]["health"] = "unknown"
-        emit_json(payload)
+        emit_json({"data": data})
         return
     stderr.print(f"[bold]{name}[/bold]")
     stderr.print(f"  credentials: {profile.credentials_path}")

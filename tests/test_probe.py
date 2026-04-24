@@ -91,3 +91,59 @@ async def test_probe_sends_bearer_token(respx_mock: respx.MockRouter) -> None:
     request = route.calls.last.request
     assert request.headers["authorization"] == "Bearer sk-ant-oat01-test"
     assert request.headers["anthropic-version"] == "2023-06-01"
+
+
+@pytest.mark.asyncio
+async def test_probe_many_with_empty_list_returns_empty() -> None:
+    results = await probe_many([])
+    assert results == []
+
+
+def test_probe_many_sync_empty() -> None:
+    """Synchronous wrapper must not crash on empty input."""
+    from claude_lb.probe import probe_many_sync
+
+    assert probe_many_sync([]) == []
+
+
+@pytest.mark.asyncio
+async def test_probe_records_credentials_mtime(respx_mock: respx.MockRouter) -> None:
+    """Regression: probe results must carry the profile's mtime forward so
+    cache.is_entry_fresh can detect credentials re-write."""
+    respx_mock.get(API_URL).respond(200, json={"data": []})
+    profile = _profile()
+    result = await probe_profile(profile)
+    assert result.credentials_mtime == profile.credentials_mtime
+
+
+@pytest.mark.asyncio
+async def test_probe_uses_supplied_client_without_opening_new_one(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """When an httpx.AsyncClient is supplied, probe_profile should use it
+    instead of constructing its own."""
+    respx_mock.get(API_URL).respond(200, json={"data": []})
+    profile = _profile()
+    async with httpx.AsyncClient() as client:
+        result = await probe_profile(profile, client=client)
+    assert result.health is Health.OK
+
+
+@pytest.mark.asyncio
+async def test_probe_http_not_json_is_unknown(respx_mock: respx.MockRouter) -> None:
+    """5xx with HTML-ish body: status 500 → unknown, no crash on body parse."""
+    respx_mock.get(API_URL).respond(500, text="<html>whoops</html>")
+    result = await probe_profile(_profile())
+    assert result.health is Health.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_probe_429_with_body_as_list_falls_back_gracefully(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """Anthropic error bodies are usually objects, but if the server ever
+    returns a JSON array the classifier should NOT crash — it should yield
+    RATE_LIMITED (the type-extraction yields 'unknown', no keyword match)."""
+    respx_mock.get(API_URL).respond(429, json=[])
+    result = await probe_profile(_profile())
+    assert result.health is Health.RATE_LIMITED

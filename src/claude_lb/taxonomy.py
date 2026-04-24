@@ -251,7 +251,9 @@ def compute_expires_at(
     if h is Health.SESSION_LIMIT:
         return result.session_reset_at or _default_session_reset(probed_at)
     if h is Health.RATE_LIMITED:
-        retry_seconds: int = result.retry_after_s or 60
+        # `retry_after_s is None` means server didn't tell us — default 60s.
+        # Explicit 0 means "retry now" and must not fall through to the default.
+        retry_seconds = result.retry_after_s if result.retry_after_s is not None else 60
         return probed_at + timedelta(seconds=retry_seconds)
     ttl = DEFAULT_TTL_SECONDS.get(h)
     if ttl is None:
