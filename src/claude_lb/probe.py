@@ -115,6 +115,7 @@ def _classification_to_health(
         usage=result.usage,
         probe_latency_ms=latency_ms,
         credentials_mtime=profile.credentials_mtime,
+        subscription_type=profile.subscription_type,
     )
 
 
@@ -146,6 +147,7 @@ def _local_auth_expired(profile: Profile) -> ProfileHealth | None:
         ),
         probe_latency_ms=0,
         credentials_mtime=profile.credentials_mtime,
+        subscription_type=profile.subscription_type,
     )
 
 

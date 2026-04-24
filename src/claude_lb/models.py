@@ -97,6 +97,7 @@ class ProfileHealth(BaseModel):
     usage: Usage | None = None
     probe_latency_ms: int | None = None
     credentials_mtime: float | None = None
+    subscription_type: str | None = None  # e.g. "max", "team", "pro"
 
 
 class HealthCache(BaseModel):
@@ -117,6 +118,7 @@ class Profile(BaseModel):
     token_source: str = "claudeAiOauth.accessToken"
     access_token_expires_at: datetime | None = None
     refresh_token_present: bool = False
+    subscription_type: str | None = None  # e.g. "max", "team", "pro"
 
 
 class ClassificationResult(BaseModel):

@@ -220,6 +220,7 @@ def profiles_list(
                     "name": p.name,
                     "credentials_path": p.credentials_path,
                     "token_source": p.token_source,
+                    "subscription_type": p.subscription_type,
                 }
                 for p in profiles
             ],
@@ -408,6 +409,7 @@ def profiles_show(
             "name": name,
             "credentials_path": profile.credentials_path,
             "token_source": profile.token_source,
+            "subscription_type": profile.subscription_type,
             "health": entry.health.value if entry is not None else "unknown",
             "probed_at": _iso_or_none(entry.probed_at) if entry is not None else None,
             "expires_at": _iso_or_none(entry.expires_at) if entry is not None else None,
@@ -431,6 +433,8 @@ def profiles_show(
     stderr.print(f"[bold]{name}[/bold]")
     stderr.print(f"  credentials: {profile.credentials_path}")
     stderr.print(f"  token_source: {profile.token_source}")
+    if profile.subscription_type:
+        stderr.print(f"  plan: {profile.subscription_type}")
     if entry is not None:
         stderr.print(f"  health: {entry.health.value}")
         if entry.probe_latency_ms is not None:

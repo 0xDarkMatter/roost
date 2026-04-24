@@ -114,3 +114,41 @@ def test_credentials_mtime_is_captured(profile_factory) -> None:
     cred = profile_factory("account-a")
     profile = discovery.discover_profiles()[0]
     assert profile.credentials_mtime == cred.stat().st_mtime
+
+
+def test_subscription_type_extracted_from_modern_shape(profile_factory) -> None:
+    """Modern credentials include subscriptionType; surface it on Profile."""
+    profile_factory("account-a", shape="modern")
+    profile = discovery.discover_profiles()[0]
+    assert profile.subscription_type == "max"
+
+
+def test_subscription_type_absent_when_legacy_shape(profile_factory) -> None:
+    """Legacy shapes don't carry plan info; subscription_type stays None."""
+    profile_factory("old", shape="legacy_oauth")
+    profile = discovery.discover_profiles()[0]
+    assert profile.subscription_type is None
+
+
+def test_subscription_type_normalised_to_lowercase(
+    credentials_dir: Path,
+) -> None:
+    """Defensive: if Anthropic ever returns 'Max' or 'TEAM', we lowercase it."""
+    import json as _json
+
+    name = "enterprise1"
+    profile_dir = credentials_dir / name
+    profile_dir.mkdir()
+    (profile_dir / ".credentials.json").write_text(
+        _json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "t",
+                    "subscriptionType": "TEAM",
+                }
+            }
+        )
+    )
+    profile = discovery.get_profile(name)
+    assert profile is not None
+    assert profile.subscription_type == "team"

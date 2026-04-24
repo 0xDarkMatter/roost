@@ -85,6 +85,22 @@ def _has_refresh_token(payload: dict[str, Any]) -> bool:
     return isinstance(rt, str) and bool(rt.strip())
 
 
+def _subscription_type(payload: dict[str, Any]) -> str | None:
+    """Read `.claudeAiOauth.subscriptionType` (e.g. 'max', 'team', 'pro').
+
+    Anthropic has been observed to return this lowercase; we normalise to
+    lowercase defensively so table rendering stays consistent if the shape
+    ever drifts.
+    """
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    value = oauth.get("subscriptionType")
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return None
+
+
 def _make_profile(name: str, cred_path: Path) -> Profile | None:
     """Build a Profile from a credentials file, or return None if unusable."""
     payload = _read_credentials(cred_path)
@@ -106,6 +122,7 @@ def _make_profile(name: str, cred_path: Path) -> Profile | None:
         token_source=source,
         access_token_expires_at=_expires_at_from(payload),
         refresh_token_present=_has_refresh_token(payload),
+        subscription_type=_subscription_type(payload),
     )
 
 

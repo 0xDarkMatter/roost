@@ -161,12 +161,15 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
     now = datetime.now(UTC)
 
     # Optional columns: only show if at least one entry has the data.
+    has_plan = any(e.subscription_type for e in entries)
     has_sonnet = any(e.usage and e.usage.sonnet_pct is not None for e in entries)
     has_opus = any(e.usage and e.usage.opus_pct is not None for e in entries)
     has_extra = any(e.usage and e.usage.extra is not None for e in entries)
 
     table = Table(title="claude-lb profiles", show_lines=False)
     table.add_column("Profile", style="bold")
+    if has_plan:
+        table.add_column("Plan")
     table.add_column("Health")
     table.add_column("Session", justify="right")
     table.add_column("Weekly", justify="right")
@@ -176,7 +179,7 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
         table.add_column("Opus", justify="right")
     if has_extra:
         table.add_column("Overage", justify="right")
-    table.add_column("Resets in")
+    table.add_column("Resets (S/W)", no_wrap=True)
     table.add_column("Probed")
 
     for e in entries:
@@ -191,32 +194,38 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
             _pct_cell(e.usage.weekly_pct) if (e.usage and e.usage.weekly_pct is not None) else "—"
         )
 
-        # Resets-in column: prefer session reset (more imminent), then weekly,
-        # then retry_after_s, then auth hints.
+        # Resets column: show BOTH session and weekly reset when available,
+        # since operators often care which window rolls over first. Broken
+        # states (auth_*, rate_limited) take precedence with the remediation.
         if e.retry_after_s is not None:
             resets_cell = f"in {e.retry_after_s}s"
-        elif e.session_reset_at is not None:
-            resets_cell = humanize_until(e.session_reset_at, now)
-        elif e.weekly_reset_at is not None:
-            resets_cell = humanize_until(e.weekly_reset_at, now)
         elif e.health.value == "auth_expired":
             resets_cell = f"claude-lb refresh {e.name}"
         elif e.health.value == "auth_dead":
             resets_cell = "claude login"
         else:
-            resets_cell = "—"
+            parts: list[str] = []
+            if e.session_reset_at is not None:
+                parts.append(f"S {humanize_until(e.session_reset_at, now).removeprefix('in ')}")
+            if e.weekly_reset_at is not None:
+                parts.append(f"W {humanize_until(e.weekly_reset_at, now).removeprefix('in ')}")
+            resets_cell = " · ".join(parts) if parts else "—"
 
         probed_at = e.probed_at
         if probed_at.tzinfo is None:
             probed_at = probed_at.replace(tzinfo=UTC)
         age = _humanize_age((now - probed_at).total_seconds())
 
-        row: list[str] = [
-            e.name,
-            f"[{style}]{health_str}[/{style}]",
-            session_cell,
-            weekly_cell,
-        ]
+        row: list[str] = [e.name]
+        if has_plan:
+            row.append(e.subscription_type or "—")
+        row.extend(
+            [
+                f"[{style}]{health_str}[/{style}]",
+                session_cell,
+                weekly_cell,
+            ]
+        )
         if has_sonnet:
             row.append(
                 _pct_cell(e.usage.sonnet_pct) if (e.usage and e.usage.sonnet_pct is not None) else "—"
@@ -253,6 +262,7 @@ def build_status_payload(cache: HealthCache, discovered_names: list[str]) -> dic
             data.append({
                 "name": name,
                 "health": "unknown",
+                "subscription_type": None,
                 "probed_at": now.isoformat().replace("+00:00", "Z"),
                 "usage": None,
                 "retry_after_s": None,
@@ -265,6 +275,7 @@ def build_status_payload(cache: HealthCache, discovered_names: list[str]) -> dic
         data.append({
             "name": entry.name,
             "health": entry.health.value,
+            "subscription_type": entry.subscription_type,
             "probed_at": _iso(entry.probed_at),
             "expires_at": _iso(entry.expires_at),
             "usage": entry.usage.model_dump() if entry.usage else None,

@@ -5,6 +5,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+### Added
+
+- **`Plan` column in the status table** — surfaces `claudeAiOauth.subscriptionType` (e.g. `max`, `team`, `pro`) from the credentials file. Only rendered when at least one profile has the data, so older credential shapes aren't affected.
+- `subscription_type` field on `Profile`, `ProfileHealth`, and `list`/`show`/`status` JSON payloads. Normalised to lowercase defensively.
+
+### Changed
+
+- **`Resets in` → `Resets (S/W)`** — shows both session and weekly reset windows as `S 34m · W 1d 4h` instead of just the more-imminent one. Broken states (`auth_*`, `rate_limited`) still show the remediation hint instead. Column is `no_wrap=True` so it doesn't get squeezed into vertical mush on dense tables.
+
 ## [0.4.0] - 2026-04-24
 
 ### Added

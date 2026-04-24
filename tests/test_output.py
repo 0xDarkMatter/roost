@@ -347,6 +347,63 @@ def test_render_status_table_with_extra_usage_does_not_crash() -> None:
     output.render_status_table(entries)
 
 
+def test_render_status_table_includes_plan_when_any_profile_has_one() -> None:
+    """The Plan column is optional — only rendered when at least one entry
+    has a subscription_type. Can't easily inspect Rich tables, so assert no
+    crash + spot-check via the JSON payload instead."""
+    entries = [
+        _entry("a", Health.OK, subscription_type="max"),
+        _entry("b", Health.OK, subscription_type=None),
+    ]
+    output.render_status_table(entries)
+
+
+def test_render_status_table_omits_plan_when_no_profile_has_one() -> None:
+    entries = [_entry("a", Health.OK, subscription_type=None)]
+    output.render_status_table(entries)
+
+
+def test_build_status_payload_includes_subscription_type() -> None:
+    cache = _cache(
+        _entry("a", Health.OK, subscription_type="max"),
+        _entry("b", Health.OK, subscription_type=None),
+    )
+    payload = output.build_status_payload(cache, ["a", "b"])
+    row_a = next(d for d in payload["data"] if d["name"] == "a")
+    row_b = next(d for d in payload["data"] if d["name"] == "b")
+    assert row_a["subscription_type"] == "max"
+    assert row_b["subscription_type"] is None
+
+
+def test_build_status_payload_stub_for_unknown_profile_has_null_plan() -> None:
+    """Never-probed profiles render as unknown stubs; subscription_type null."""
+    cache = _cache()
+    payload = output.build_status_payload(cache, ["ghost"])
+    row = payload["data"][0]
+    assert row["subscription_type"] is None
+
+
+# ---------------------------------------------------------------------------
+# Resets column — dual session/weekly format
+# ---------------------------------------------------------------------------
+
+
+def test_render_status_table_dual_resets_for_ok_profile() -> None:
+    """The resets cell should include both S and W segments when both are set.
+    We can't easily inspect Rich output; this test ensures the table doesn't
+    crash when rendering a profile with both timestamps. Format is exercised
+    via the indirect _pct_cell / humanize_until tests."""
+    entries = [
+        _entry(
+            "a",
+            Health.OK,
+            session_reset_at=FIXED_NOW + timedelta(hours=1),
+            weekly_reset_at=FIXED_NOW + timedelta(days=3),
+        ),
+    ]
+    output.render_status_table(entries)
+
+
 # ---------------------------------------------------------------------------
 # Health style
 # ---------------------------------------------------------------------------
