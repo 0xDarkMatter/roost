@@ -159,3 +159,71 @@ def test_apply_update_no_uv_on_path_reports_error(
     assert result.applied is False
     assert result.error is not None
     assert "uv" in result.error.lower()
+
+
+# ---------------------------------------------------------------------------
+# Windows self-lock guard
+# ---------------------------------------------------------------------------
+
+
+def test_would_self_lock_false_on_non_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(updater.sys, "platform", "linux")
+    assert updater._would_self_lock() is False
+
+
+def test_would_self_lock_true_when_running_from_uv_tool_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(
+        updater.sys,
+        "prefix",
+        r"C:\Users\Mack\AppData\Roaming\uv\tools\claude-lb",
+    )
+    assert updater._would_self_lock() is True
+
+
+def test_would_self_lock_false_when_running_from_dev_venv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A contributor running from a repo-local .venv must not be mis-detected."""
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(updater.sys, "prefix", r"X:\Forge\claude-lb\.venv")
+    assert updater._would_self_lock() is False
+
+
+def test_apply_update_emits_clear_workaround_on_windows_self_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When self-lock is detected, apply_update must refuse cleanly with a
+    copy-pasteable `uv tool install` command — not surface a raw EACCES from uv.
+    """
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(
+        updater.sys,
+        "prefix",
+        r"C:\Users\Mack\AppData\Roaming\uv\tools\claude-lb",
+    )
+    monkeypatch.setattr(updater.shutil, "which", lambda _: "/fake/uv")
+
+    import tempfile
+
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], cwd: Path) -> tuple[int, str]:
+        calls.append(cmd)
+        return 0, "Already up to date."
+
+    monkeypatch.setattr(updater, "_run", _fake_run)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        monkeypatch.setattr(updater, "_package_install_dir", lambda: tmp_path)
+        result = updater.apply_update(pull=False)
+
+    assert result.applied is False
+    assert result.reinstalled is False
+    assert result.error is not None
+    assert "uv tool install --reinstall --editable" in result.error
+    # Ensure we didn't actually attempt the uv install (that would crash).
+    assert not any(c[0] == "uv" for c in calls)

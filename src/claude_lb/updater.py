@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import shutil
 import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,34 @@ def _package_install_dir() -> Path | None:
     src_root = pkg_dir.parent
     candidate = src_root.parent if src_root.name == "src" else src_root
     return candidate
+
+
+def _would_self_lock() -> bool:
+    """True iff we're on Windows AND running as the uv-tool-installed claude-lb.
+
+    Windows refuses to overwrite memory-mapped `.pyd`/`.dll` files that the
+    current process has loaded. `uv tool install --reinstall` rewrites every
+    file in the tool venv — which fails with EACCES on the pydantic_core
+    `.pyd` (and any other native extension) because this very process has
+    them mapped. POSIX has no such restriction: inode swap via unlink +
+    create makes `os.replace` atomic even for in-use shared libraries.
+
+    Detection: `sys.prefix` sits under a uv tool tree when we're running
+    from `uv tool install ...`. Non-tool installs (e.g. a contributor's
+    `.venv` inside the repo, pip-installed) don't self-lock.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        sys_prefix = Path(sys.prefix).resolve()
+    except (OSError, ValueError):
+        return False
+    parts_lower = [p.lower() for p in sys_prefix.parts]
+    return (
+        "uv" in parts_lower
+        and "tools" in parts_lower
+        and "claude-lb" in parts_lower
+    )
 
 
 def _run(cmd: list[str], cwd: Path) -> tuple[int, str]:
@@ -225,6 +254,27 @@ def apply_update(*, pull: bool = True) -> UpdateApplyResult:
             pulled=pulled,
             reinstalled=False,
             error="`uv` not found on PATH; manual reinstall required.",
+            stdout="\n".join(stdout_parts),
+        )
+
+    # Windows self-lock guard: we can't overwrite our own mapped .pyd files.
+    # Print the exact copy-pasteable workaround rather than surfacing a
+    # raw EACCES from uv, which is opaque to most users.
+    if _would_self_lock():
+        return UpdateApplyResult(
+            current_version=__version__,
+            install_dir=str(install_dir),
+            applied=False,
+            pulled=pulled,
+            reinstalled=False,
+            error=(
+                "Windows self-upgrade limitation: claude-lb can't reinstall "
+                "itself while running (the current process has its own .pyd "
+                "files mapped, so uv tool install can't overwrite them). "
+                "Run the following from any shell that is NOT claude-lb "
+                "(bash, cmd, or PowerShell all work):\n"
+                f"    uv tool install --reinstall --editable \"{install_dir}\""
+            ),
             stdout="\n".join(stdout_parts),
         )
 

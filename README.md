@@ -234,6 +234,19 @@ claude-lb update --apply         # git pull --ff-only + uv tool install --reinst
 claude-lb update --apply --no-pull  # Just re-sync deps (useful when a new dep was added locally)
 ```
 
+**Windows self-upgrade caveat:** on Windows, `claude-lb update --apply` can't
+reinstall itself while running — the current process has its own `.pyd` files
+memory-mapped, so `uv tool install --reinstall` hits `EACCES` on those files.
+claude-lb detects this and prints the exact workaround. Run the reinstall
+from a shell that isn't claude-lb (bash, cmd, or PowerShell):
+
+```bash
+uv tool install --reinstall --editable "X:/Forge/claude-lb"
+```
+
+POSIX platforms (macOS, Linux) are unaffected — inode-swap semantics let
+`os.replace` overwrite in-use shared libraries atomically.
+
 ## Cache & Filesystem
 
 | Purpose | Path |
