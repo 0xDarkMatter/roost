@@ -223,6 +223,19 @@ async def refresh_profile(
             error_message=f"HTTP {status}",
         )
 
+    # A 200 without an access_token means the server said "success" but gave
+    # us nothing to rotate. Treat as UNEXPECTED_RESPONSE rather than "success
+    # but no-op" — otherwise callers think they refreshed when they didn't.
+    access = body.get("access_token")
+    if not isinstance(access, str) or not access:
+        return RefreshResult(
+            name=profile.name,
+            refreshed=False,
+            previous_expires_at=profile.access_token_expires_at,
+            error_code="UNEXPECTED_RESPONSE",
+            error_message="200 OK but response omitted access_token",
+        )
+
     new_payload, new_expires = _apply_token_response(payload, body)
     try:
         _atomic_write_credentials(path, new_payload)

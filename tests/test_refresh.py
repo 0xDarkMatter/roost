@@ -124,6 +124,67 @@ async def test_refresh_many_parallel(
 
 
 @pytest.mark.asyncio
+async def test_refresh_empty_list_returns_empty() -> None:
+    results = await refresh_many([])
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_unreadable_credentials_file(
+    tmp_path: Path, respx_mock: respx.MockRouter
+) -> None:
+    """Credentials file vanished between discovery and refresh."""
+    cred = tmp_path / "ghost" / ".credentials.json"
+    # File intentionally not created
+    result = await refresh_profile(_profile(cred, name="ghost"))
+    assert result.refreshed is False
+    assert result.error_code == "UNREADABLE"
+    assert not respx_mock.calls.called  # fail fast before network
+
+
+@pytest.mark.asyncio
+async def test_refresh_500_is_unexpected_response(
+    tmp_path: Path, respx_mock: respx.MockRouter
+) -> None:
+    cred = tmp_path / "account-a" / ".credentials.json"
+    _write_credentials(cred)
+    respx_mock.post(TOKEN_URL).respond(500, text="<html>500</html>")
+    result = await refresh_profile(_profile(cred))
+    assert result.refreshed is False
+    assert result.error_code == "UNEXPECTED_RESPONSE"
+    # Credentials preserved
+    data = json.loads(cred.read_text())
+    assert data["claudeAiOauth"]["accessToken"] == "old-access"
+
+
+@pytest.mark.asyncio
+async def test_refresh_200_with_missing_access_token_is_not_success(
+    tmp_path: Path, respx_mock: respx.MockRouter
+) -> None:
+    """Regression target: server 200 but body omits `access_token`. Current
+    code treats this as 'refreshed=True' because each field update is guarded
+    individually with truthiness — nothing rotates but we claim success and
+    overwrite the credentials file. Caller has no way to know the tokens
+    didn't actually change.
+
+    Fixed behaviour: missing access_token -> UNEXPECTED_RESPONSE, no rewrite."""
+    cred = tmp_path / "account-a" / ".credentials.json"
+    _write_credentials(cred, access="old-A", refresh="old-R")
+    respx_mock.post(TOKEN_URL).respond(
+        200,
+        json={"expires_in": 3600},  # access_token + refresh_token both missing
+    )
+    result = await refresh_profile(_profile(cred))
+    assert result.refreshed is False, (
+        "Server 200 without access_token must not be treated as a successful refresh"
+    )
+    # Credentials must still hold the old tokens
+    data = json.loads(cred.read_text())
+    assert data["claudeAiOauth"]["accessToken"] == "old-A"
+    assert data["claudeAiOauth"]["refreshToken"] == "old-R"
+
+
+@pytest.mark.asyncio
 async def test_refresh_sends_client_id_and_beta_header(
     tmp_path: Path, respx_mock: respx.MockRouter
 ) -> None:
