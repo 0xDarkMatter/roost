@@ -179,7 +179,8 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
         table.add_column("Opus", justify="right")
     if has_extra:
         table.add_column("Overage", justify="right")
-    table.add_column("Resets (S/W)", no_wrap=True)
+    table.add_column("Session in", justify="right", no_wrap=True)
+    table.add_column("Weekly in", justify="right", no_wrap=True)
     table.add_column("Probed")
 
     for e in entries:
@@ -194,22 +195,33 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
             _pct_cell(e.usage.weekly_pct) if (e.usage and e.usage.weekly_pct is not None) else "—"
         )
 
-        # Resets column: show BOTH session and weekly reset when available,
-        # since operators often care which window rolls over first. Broken
-        # states (auth_*, rate_limited) take precedence with the remediation.
+        # Separate Session / Weekly reset columns so tabular output lines up.
+        # Broken states (auth_*, rate_limited) surface the remediation in the
+        # Session column; Weekly is "—" in those cases since it's not
+        # meaningful. For OK-ish profiles, both show durations without the
+        # "in " prefix (the column header makes the meaning clear).
+        session_in: str
+        weekly_in: str
         if e.retry_after_s is not None:
-            resets_cell = f"in {e.retry_after_s}s"
+            session_in = f"{e.retry_after_s}s"
+            weekly_in = "—"
         elif e.health.value == "auth_expired":
-            resets_cell = f"claude-lb refresh {e.name}"
+            session_in = f"claude-lb refresh {e.name}"
+            weekly_in = "—"
         elif e.health.value == "auth_dead":
-            resets_cell = "claude login"
+            session_in = "claude login"
+            weekly_in = "—"
         else:
-            parts: list[str] = []
-            if e.session_reset_at is not None:
-                parts.append(f"S {humanize_until(e.session_reset_at, now).removeprefix('in ')}")
-            if e.weekly_reset_at is not None:
-                parts.append(f"W {humanize_until(e.weekly_reset_at, now).removeprefix('in ')}")
-            resets_cell = " · ".join(parts) if parts else "—"
+            session_in = (
+                humanize_until(e.session_reset_at, now).removeprefix("in ")
+                if e.session_reset_at is not None
+                else "—"
+            )
+            weekly_in = (
+                humanize_until(e.weekly_reset_at, now).removeprefix("in ")
+                if e.weekly_reset_at is not None
+                else "—"
+            )
 
         probed_at = e.probed_at
         if probed_at.tzinfo is None:
@@ -236,7 +248,7 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
             )
         if has_extra:
             row.append(_render_extra_usage(e.usage.extra) if e.usage else "—")
-        row.extend([resets_cell, age])
+        row.extend([session_in, weekly_in, age])
         table.add_row(*row)
     stderr.print(table)
 

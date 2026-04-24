@@ -12,7 +12,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ### Changed
 
-- **`Resets in` → `Resets (S/W)`** — shows both session and weekly reset windows as `S 34m · W 1d 4h` instead of just the more-imminent one. Broken states (`auth_*`, `rate_limited`) still show the remediation hint instead. Column is `no_wrap=True` so it doesn't get squeezed into vertical mush on dense tables.
+- **Status table reset columns split** — a single `Resets (S/W)` cell with `S 34m · W 1d 4h` was hard to scan; now rendered as two right-justified columns `Session in` and `Weekly in` so durations line up vertically across profiles. Broken states (`auth_*`, `rate_limited`) place the remediation in `Session in` and leave `Weekly in` as `—`. The "in " prefix is stripped from cell values since it now lives in the column header.
 
 ## [0.4.0] - 2026-04-24
 
