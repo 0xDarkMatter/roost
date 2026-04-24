@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -44,9 +44,15 @@ class PickFailureReason(str, Enum):
 
 @dataclass
 class PickOutcome:
-    """Result of pick(): either a chosen profile or a structured failure."""
+    """Result of pick(): either a chosen profile or a structured failure.
+
+    `chosen` is the primary (first) pick; `chosen_many` is the ordered list of
+    all picks (length 1 for single-pick, up to `count` for multi-pick). The
+    two fields always agree: `chosen == chosen_many[0]` when ok is True.
+    """
 
     chosen: ProfileHealth | None = None
+    chosen_many: list[ProfileHealth] = field(default_factory=list)
     strategy_used: Strategy | None = None
     reason: PickFailureReason | None = None
     earliest_recovery_at: datetime | None = None
@@ -278,6 +284,7 @@ def pick(
     strategy: Strategy = Strategy.STICKY,
     stickiness_s: int | None = None,
     require_ok: bool = False,
+    count: int = 1,
     now: datetime | None = None,
     last_pick_path_override: Path | None = None,
 ) -> PickOutcome:
@@ -286,8 +293,16 @@ def pick(
     `discovered_names` provides the authoritative list; entries absent from
     the cache are treated as health=UNKNOWN but still considered pickable
     (callers should probe first for good results).
+
+    When `count > 1`, returns up to `count` profiles in `chosen_many` (strategy
+    order). Stickiness is ignored for count > 1 — sticky is a "keep returning
+    the same profile" semantic that doesn't compose with multi-pick. If fewer
+    than `count` candidates pass the filter ladder, returns what we have; the
+    caller decides whether partial fulfilment is acceptable.
     """
     now = now or _now()
+    if count < 1:
+        count = 1
 
     # Materialise ProfileHealth entries in discovery order, including stubs
     # for profiles without a cache record.
@@ -307,8 +322,10 @@ def pick(
     if not selectable:
         return _diagnose_failure(entries, require_ok)
 
-    # Stickiness pre-check (only when strategy is STICKY).
-    if strategy is Strategy.STICKY:
+    # Stickiness pre-check — only when strategy is STICKY AND single-pick.
+    # Multi-pick (count > 1) ignores stickiness: "keep returning the same
+    # profile" doesn't compose with "give me N distinct profiles."
+    if strategy is Strategy.STICKY and count == 1:
         stickiness = _stickiness_seconds(stickiness_s)
         if stickiness > 0:
             last = read_last_pick(last_pick_path_override)
@@ -320,6 +337,7 @@ def pick(
                         if entry.name == last_name and entry.health is Health.OK:
                             return PickOutcome(
                                 chosen=entry,
+                                chosen_many=[entry],
                                 strategy_used=Strategy.STICKY,
                                 rationale=(
                                     f"sticky: last pick within {stickiness}s window"
@@ -344,9 +362,11 @@ def pick(
         ordered = _sort_least_used(selectable)
         rationale = "least-used: lowest weekly usage among healthy"
 
-    chosen = ordered[0]
+    top = ordered[:count]
+    chosen = top[0]
     return PickOutcome(
         chosen=chosen,
+        chosen_many=top,
         strategy_used=fallback if strategy is Strategy.STICKY else strategy,
         rationale=rationale,
     )

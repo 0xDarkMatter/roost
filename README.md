@@ -71,12 +71,27 @@ claude-lb pick --export                  # Shell-sourceable VAR=value
 claude-lb pick --json                    # {data: {name, health, rationale}}
 claude-lb pick --warn-at 80              # Stderr warning when session/weekly ≥80%
 claude-lb pick --auto-refresh            # Refresh auth_expired profiles inline, then pick
+claude-lb pick --count 3                 # Return up to 3 profiles (newline-separated)
+claude-lb pick -n 3 --strategy least-used  # Short form; lowest-3 weekly%
 ```
 
 `--auto-refresh` folds the `refresh --expired` preflight into `pick` itself:
 any cached `auth_expired` profile with a stored refresh token is refreshed
 before selection. Refresh failures are non-fatal — the expired profile is
 filtered out and a healthy one is returned if any exists.
+
+`--count N` returns up to N profiles in strategy order. If fewer than N pass
+the filter ladder, returns what's available (exit 0). Each pick is logged to
+`picks.log`; only the primary (first) pick updates the stickiness state, so
+a subsequent single-pick call honours the primary. Stickiness is ignored when
+`N > 1`. `--export` is rejected with `--count > 1` — use `--json` to consume
+multiple names programmatically. The JSON shape flips to an array when
+`N > 1`:
+
+```bash
+claude-lb pick --count 3 --json
+# {"data": [{...}, {...}, {...}], "meta": {"count": 3, "requested": 3, ...}}
+```
 
 ### Refresh
 

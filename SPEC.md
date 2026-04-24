@@ -451,13 +451,34 @@ claude-lb pick --strategy round-robin # Load-spread explicitly (ignores stickine
 ```
 1. Start with all discovered profiles
 2. Drop auth_dead
-3. Drop weekly_limit where weekly_reset_at > now
-4. Drop session_limit where session_reset_at > now
-5. Drop rate_limited where retry_after_s > now (from probed_at)
-6. If --require=ok: drop anything not ok
-7. Sort by strategy
-8. Return top 1 (or all, for `--all`)
+3. Drop auth_expired (unless --auto-refresh heals them first; see "Auto-refresh" below)
+4. Drop weekly_limit where weekly_reset_at > now
+5. Drop session_limit where session_reset_at > now
+6. Drop rate_limited where retry_after_s > now (from probed_at)
+7. If --require=ok: drop anything not ok
+8. Sort by strategy
+9. Return top 1 — or top N for --count N
 ```
+
+### Multi-pick (`--count N`, alias `-n N`)
+
+Returns up to N profiles in strategy order. If fewer than N pass the ladder,
+returns what's available (exit 0); callers decide whether partial fulfilment
+is acceptable. Stickiness is **ignored** when `N > 1` — the "pin to the last
+pick" semantic doesn't compose with "give me N distinct profiles". Every
+picked profile gets a `picks.log` entry; only the primary (first) pick
+updates `last-pick.json`, so a subsequent single-pick call still honours
+stickiness against the primary. `--export` is rejected with `--count > 1`
+(can't export N vars with one name) and exits `VALIDATION (4)`.
+
+### Auto-refresh (`--auto-refresh`)
+
+Before running the filter ladder, refreshes any cached `auth_expired`
+profile whose credentials file has a stored refresh token. Success → re-probe
+→ updated health. Failure → stderr warning; the profile stays `auth_expired`
+and is filtered out as normal. Profiles without a refresh token are skipped
+silently (they need `claude login`, not `refresh`). Collapses the
+`refresh --expired && pick` preflight into one call.
 
 ### Empty-set behaviour
 

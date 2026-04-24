@@ -559,11 +559,31 @@ def profiles_pick(
             ),
         ),
     ] = False,
+    count: Annotated[
+        int,
+        typer.Option(
+            "--count",
+            "-n",
+            help=(
+                "Return up to N profiles (newline-separated) instead of one. "
+                "Stickiness is ignored when N > 1. If fewer than N candidates "
+                "pass the filter ladder, returns what's available. Incompatible "
+                "with --export (ambiguous: can't export N vars with one name)."
+            ),
+            min=1,
+        ),
+    ] = 1,
 ) -> None:
     """Pick the best healthy profile for scripting."""
     chosen_strategy = _validate_strategy(strategy)
     if warn_at is not None and not (0 <= warn_at <= 100):
         stderr.print(f"[red]--warn-at must be between 0 and 100, got:[/red] {warn_at}")
+        raise typer.Exit(EXIT_VALIDATION)
+    if count > 1 and export:
+        stderr.print(
+            "[red]--export is incompatible with --count > 1[/red] "
+            "(can't export N vars with one name). Use --json instead."
+        )
         raise typer.Exit(EXIT_VALIDATION)
     cache, names = _load_or_probe(refresh=no_cache, max_age=max_age)
 
@@ -576,6 +596,7 @@ def profiles_pick(
         strategy=chosen_strategy,
         stickiness_s=stickiness,
         require_ok=require_ok,
+        count=count,
     )
 
     if not outcome.ok:
@@ -601,11 +622,21 @@ def profiles_pick(
 
     assert outcome.chosen is not None
     chosen = outcome.chosen
-    score = 1.0 if chosen.health is Health.OK else 0.5
+    picks = outcome.chosen_many or [chosen]
+    strategy_used = outcome.strategy_used or chosen_strategy
+
+    # last-pick: only the primary (first) pick updates stickiness state, so
+    # a subsequent single-pick call without --count still sees the primary.
     write_last_pick(chosen.name)
-    append_pick_log(chosen.name, outcome.strategy_used or chosen_strategy, score)
+    # picks.log: every picked profile gets an audit-trail entry so parallel
+    # dispatch is observable.
+    for entry in picks:
+        score = 1.0 if entry.health is Health.OK else 0.5
+        append_pick_log(entry.name, strategy_used, score)
 
     # --warn-at: non-fatal stderr hint if utilisation exceeds threshold.
+    # For multi-pick, warn on the primary pick (consistent with single-pick
+    # semantics; callers driving parallel dispatch can eyeball all N via --json).
     if warn_at is not None and chosen.usage is not None:
         hot_pcts: list[tuple[str, int]] = []
         if chosen.usage.session_pct is not None and chosen.usage.session_pct >= warn_at:
@@ -619,20 +650,42 @@ def profiles_pick(
             )
 
     if json_output:
-        emit_json({
-            "data": {
-                "name": chosen.name,
-                "health": chosen.health.value,
-                "score": score,
-                "rationale": outcome.rationale,
-                "strategy": (outcome.strategy_used or chosen_strategy).value,
-            }
-        })
+        # Shape: single-object {"data": {...}} for count == 1 (backward compat),
+        # array {"data": [...], "meta": {...}} for count > 1.
+        if count == 1:
+            primary_score = 1.0 if chosen.health is Health.OK else 0.5
+            emit_json({
+                "data": {
+                    "name": chosen.name,
+                    "health": chosen.health.value,
+                    "score": primary_score,
+                    "rationale": outcome.rationale,
+                    "strategy": strategy_used.value,
+                }
+            })
+        else:
+            emit_json({
+                "data": [
+                    {
+                        "name": e.name,
+                        "health": e.health.value,
+                        "score": 1.0 if e.health is Health.OK else 0.5,
+                    }
+                    for e in picks
+                ],
+                "meta": {
+                    "count": len(picks),
+                    "requested": count,
+                    "strategy": strategy_used.value,
+                    "rationale": outcome.rationale,
+                },
+            })
         return
     if export:
         emit_text(f"{var_name}={chosen.name}")
         return
-    emit_text(chosen.name)
+    for entry in picks:
+        emit_text(entry.name)
 
 
 @app.command("pick")
@@ -647,6 +700,7 @@ def top_pick(
     max_age: Annotated[int | None, typer.Option("--max-age")] = None,
     warn_at: Annotated[int | None, typer.Option("--warn-at")] = None,
     auto_refresh: Annotated[bool, typer.Option("--auto-refresh")] = False,
+    count: Annotated[int, typer.Option("--count", "-n", min=1)] = 1,
 ) -> None:
     """Alias for `profiles pick`."""
     profiles_pick(
@@ -660,6 +714,7 @@ def top_pick(
         max_age=max_age,
         warn_at=warn_at,
         auto_refresh=auto_refresh,
+        count=count,
     )
 
 

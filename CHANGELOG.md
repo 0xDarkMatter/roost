@@ -14,6 +14,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
   through to the filter ladder (AUTH_EXPIRED profiles are still excluded), so
   pick never hangs on a broken token. Profiles without refresh tokens are
   skipped silently — they require `claude login`, not `refresh`.
+- **`claude-lb pick --count N` (alias `-n N`)** — return up to N profiles
+  ordered by strategy, newline-separated on stdout. If fewer than N pass the
+  filter ladder, returns what's available (exit 0). Each pick is appended to
+  `picks.log`; only the primary (first) pick updates `last-pick.json` so a
+  subsequent single-pick call still honours stickiness. Ignores stickiness
+  itself when `N > 1` — "pin to last pick" doesn't compose with "give me N
+  distinct profiles". `--export` is incompatible with `--count > 1` (ambiguous:
+  can't export N vars with one name) and exits `VALIDATION (4)`.
+- `PickOutcome.chosen_many: list[ProfileHealth]` — ordered multi-pick result
+  (length 1 for single-pick; up to `count` for multi-pick). The primary
+  `chosen` field is always `chosen_many[0]` on success.
+
+### Changed
+
+- **`pick --json` shape is now count-aware.** `--count 1` (explicit or default)
+  keeps the single-object `{"data": {...}}` shape (backward compatible).
+  `--count > 1` emits `{"data": [...], "meta": {count, requested, strategy, rationale}}`.
+  Scripts that never pass `--count` see no change.
 
 ## [0.4.1] - 2026-04-25
 

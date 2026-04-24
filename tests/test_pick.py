@@ -438,3 +438,97 @@ def test_missing_cache_entry_yields_unknown_stub() -> None:
     assert outcome.chosen is not None
     assert outcome.chosen.name == "account-a"
     assert outcome.chosen.health is Health.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# Multi-pick (count > 1)
+# ---------------------------------------------------------------------------
+
+
+def test_count_returns_top_n_in_strategy_order() -> None:
+    """count=3 with least-used returns 3 profiles ordered by ascending weekly%."""
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=40),
+        _entry("b", Health.OK, weekly_pct=10),
+        _entry("c", Health.OK, weekly_pct=20),
+        _entry("d", Health.OK, weekly_pct=60),
+    )
+    outcome = pick(
+        cache, ["a", "b", "c", "d"],
+        strategy=Strategy.LEAST_USED, count=3, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "b"  # primary = lowest weekly
+    assert [e.name for e in outcome.chosen_many] == ["b", "c", "a"]
+
+
+def test_count_returns_fewer_when_candidates_limited() -> None:
+    """If only 2 profiles pass the ladder, count=5 returns 2, not a failure."""
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=10),
+        _entry("b", Health.OK, weekly_pct=20),
+        _entry("c", Health.AUTH_DEAD),
+    )
+    outcome = pick(
+        cache, ["a", "b", "c"],
+        strategy=Strategy.LEAST_USED, count=5, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert len(outcome.chosen_many) == 2
+    assert {e.name for e in outcome.chosen_many} == {"a", "b"}
+
+
+def test_count_greater_than_one_ignores_stickiness(
+    _isolate_pick_paths: Path,
+) -> None:
+    """Sticky semantic (pin to last pick) doesn't compose with multi-pick."""
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=50),
+        _entry("b", Health.OK, weekly_pct=10),
+        _entry("c", Health.OK, weekly_pct=30),
+    )
+    _write_last_pick_at("a", FIXED_NOW - timedelta(seconds=30))
+    outcome = pick(
+        cache, ["a", "b", "c"],
+        strategy=Strategy.STICKY, count=2, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    # Without stickiness, least-used ordering wins: b (10%) then c (30%).
+    assert [e.name for e in outcome.chosen_many] == ["b", "c"]
+    assert outcome.chosen.name == "b"
+
+
+def test_count_one_still_honours_stickiness(_isolate_pick_paths: Path) -> None:
+    """Explicit count=1 must not disable stickiness — it's the default."""
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=50),
+        _entry("b", Health.OK, weekly_pct=10),
+    )
+    _write_last_pick_at("a", FIXED_NOW - timedelta(seconds=30))
+    outcome = pick(
+        cache, ["a", "b"],
+        strategy=Strategy.STICKY, count=1, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "a"
+    assert outcome.chosen_many == [outcome.chosen]
+
+
+def test_count_zero_treated_as_one() -> None:
+    """count=0 would be a useless invocation; clamp to 1 defensively."""
+    cache = _cache(_entry("a", Health.OK))
+    outcome = pick(cache, ["a"], count=0, now=FIXED_NOW)
+    assert outcome.chosen is not None
+    assert len(outcome.chosen_many) == 1
+
+
+def test_count_fails_when_no_candidates_pass_ladder() -> None:
+    """All AUTH_DEAD -> failure regardless of count."""
+    cache = _cache(
+        _entry("a", Health.AUTH_DEAD),
+        _entry("b", Health.AUTH_DEAD),
+    )
+    outcome = pick(cache, ["a", "b"], count=3, now=FIXED_NOW)
+    assert outcome.chosen is None
+    assert outcome.chosen_many == []
+    assert outcome.reason is PickFailureReason.ALL_AUTH_DEAD

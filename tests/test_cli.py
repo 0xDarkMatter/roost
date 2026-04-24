@@ -550,3 +550,158 @@ def test_auto_refresh_last_candidate_falls_through_to_exit_2(profile_factory) ->
         result = runner.invoke(app, ["pick", "--auto-refresh"])
     assert result.exit_code == 2
     assert "auto-refresh failed" in result.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# pick --count N (multi-pick)
+# ---------------------------------------------------------------------------
+
+
+def _stub_probe_with_weeklies(*, weekly_by_name: dict[str, int]):
+    """Stub that returns ProfileHealth with per-profile weekly% for ordering tests."""
+    from datetime import datetime
+
+    from claude_lb.models import Usage
+
+    def _stub(profiles, *, prev_health=None, timeout=10.0):
+        now = datetime.now(UTC)
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.OK,
+                probed_at=now,
+                usage=Usage(weekly_pct=weekly_by_name.get(p.name, 50), session_pct=0),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    return _stub
+
+
+def test_pick_count_emits_multiple_names(profile_factory) -> None:
+    profile_factory("account-a")
+    profile_factory("account-b")
+    profile_factory("account-c")
+    weeklies = {"account-a": 10, "account-b": 60, "account-c": 30}
+    with patch.object(
+        cli_mod, "probe_many_sync", _stub_probe_with_weeklies(weekly_by_name=weeklies)
+    ):
+        result = runner.invoke(
+            app, ["pick", "--count", "3", "--strategy", "least-used"]
+        )
+    assert result.exit_code == 0
+    # Newline-separated, ordered least-used first.
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    assert lines == ["account-a", "account-c", "account-b"]
+
+
+def test_pick_count_short_flag_n(profile_factory) -> None:
+    """-n is the short form of --count."""
+    profile_factory("account-a")
+    profile_factory("account-b")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["pick", "-n", "2"])
+    assert result.exit_code == 0
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 2
+
+
+def test_pick_count_returns_fewer_when_candidates_limited(profile_factory) -> None:
+    """Request 5, only 2 pass the ladder → returns 2, exit 0."""
+    profile_factory("account-a")
+    profile_factory("account-b")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["pick", "--count", "5"])
+    assert result.exit_code == 0
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 2
+
+
+def test_pick_count_no_profiles_exits_9() -> None:
+    """No profiles discovered: --count doesn't change the failure code."""
+    result = runner.invoke(app, ["pick", "--count", "3"])
+    assert result.exit_code == 9  # UNAVAILABLE
+
+
+def test_pick_count_with_export_rejected(profile_factory) -> None:
+    """--export with --count > 1 is ambiguous → EXIT_VALIDATION."""
+    profile_factory("account-a")
+    profile_factory("account-b")
+    result = runner.invoke(app, ["pick", "--count", "2", "--export"])
+    assert result.exit_code == 4  # VALIDATION
+    assert "export" in result.stderr.lower()
+
+
+def test_pick_count_with_export_and_count_one_is_fine(profile_factory) -> None:
+    """--export is only rejected when count > 1. Explicit --count 1 works."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["pick", "--count", "1", "--export"])
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "AXIOM_CLAUDE_PROFILE=account-a"
+
+
+def test_pick_count_json_is_array_shape(profile_factory) -> None:
+    """count > 1 flips JSON from single-object to array with meta."""
+    profile_factory("account-a")
+    profile_factory("account-b")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["pick", "--count", "2", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert isinstance(payload["data"], list)
+    assert len(payload["data"]) == 2
+    assert payload["meta"]["count"] == 2
+    assert payload["meta"]["requested"] == 2
+    assert "strategy" in payload["meta"]
+
+
+def test_pick_count_one_keeps_single_object_json(profile_factory) -> None:
+    """Backward compat: --count 1 (explicit or default) keeps the single-object shape."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["pick", "--count", "1", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert isinstance(payload["data"], dict)
+    assert payload["data"]["name"] == "account-a"
+
+
+def test_pick_count_respects_strategy(profile_factory) -> None:
+    """--count N must still honour --strategy ordering."""
+    profile_factory("a")
+    profile_factory("b")
+    profile_factory("c")
+    weeklies = {"a": 40, "b": 10, "c": 20}
+    with patch.object(
+        cli_mod, "probe_many_sync", _stub_probe_with_weeklies(weekly_by_name=weeklies)
+    ):
+        result = runner.invoke(
+            app, ["pick", "--count", "2", "--strategy", "least-used"]
+        )
+    assert result.exit_code == 0
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    assert lines == ["b", "c"]  # lowest two weeklies, ascending
+
+
+def test_pick_count_logs_each_to_picks_log(
+    profile_factory, _isolated_home: Path
+) -> None:
+    """Each picked profile gets a picks.log entry (audit trail for parallel dispatch)."""
+    profile_factory("a")
+    profile_factory("b")
+    profile_factory("c")
+    weeklies = {"a": 40, "b": 10, "c": 20}
+    log_path = _isolated_home / "picks.log"
+    with patch.object(
+        cli_mod, "probe_many_sync", _stub_probe_with_weeklies(weekly_by_name=weeklies)
+    ):
+        result = runner.invoke(
+            app, ["pick", "--count", "3", "--strategy", "least-used"]
+        )
+    assert result.exit_code == 0
+    log_text = log_path.read_text()
+    # One line per pick, containing each profile name.
+    for name in ("a", "b", "c"):
+        assert f"\t{name}\t" in log_text
