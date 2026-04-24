@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+### Added
+
+- **`claude-lb pick --auto-refresh`** — before picking, inline-refresh any
+  profile whose cached health is `auth_expired` and which has a stored refresh
+  token. Collapses the two-step `claude-lb refresh --expired && claude-lb pick`
+  preflight into a single call. Refresh failures are logged to stderr and fall
+  through to the filter ladder (AUTH_EXPIRED profiles are still excluded), so
+  pick never hangs on a broken token. Profiles without refresh tokens are
+  skipped silently — they require `claude login`, not `refresh`.
+
 ## [0.4.1] - 2026-04-25
 
 ### Fixed

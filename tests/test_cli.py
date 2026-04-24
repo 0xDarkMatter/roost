@@ -14,7 +14,7 @@ from typer.testing import CliRunner
 from claude_lb import cli as cli_mod
 from claude_lb import paths as paths_mod
 from claude_lb.cli import app
-from claude_lb.models import Health, ProfileHealth
+from claude_lb.models import ErrorInfo, Health, ProfileHealth
 
 runner = CliRunner()
 
@@ -402,3 +402,151 @@ def test_update_json_output() -> None:
     payload = json.loads(result.stdout)
     assert "current_version" in payload["data"]
     assert "update_available" in payload["meta"]
+
+
+# ---------------------------------------------------------------------------
+# pick --auto-refresh
+# ---------------------------------------------------------------------------
+
+
+def _stateful_probe_stub(first_health: Health, second_health: Health = Health.OK):
+    """probe_many_sync stub: returns first_health on call 1, second_health after.
+
+    Mirrors the real flow where _load_or_probe runs the first probe (seeding
+    the cache) and _attempt_auto_refresh runs the second probe (post-refresh).
+    """
+    from datetime import datetime
+
+    state = {"count": 0}
+
+    def _stub(profiles, *, prev_health=None, timeout=10.0):
+        state["count"] += 1
+        h = first_health if state["count"] == 1 else second_health
+        now = datetime.now(UTC)
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=h,
+                probed_at=now,
+                expires_at=None,
+                credentials_mtime=p.credentials_mtime,
+                error=(
+                    ErrorInfo(type="token_expired", message="expired")
+                    if h is Health.AUTH_EXPIRED
+                    else None
+                ),
+            )
+            for p in profiles
+        ]
+
+    return _stub
+
+
+def _stub_refresh_success(profiles, *, timeout=10.0):
+    from claude_lb.refresh import RefreshResult
+
+    return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
+
+
+def _stub_refresh_fail(profiles, *, timeout=10.0):
+    from claude_lb.refresh import RefreshResult
+
+    return [
+        RefreshResult(
+            name=p.name,
+            refreshed=False,
+            error_code="REFRESH_REJECTED",
+            error_message="token rejected",
+        )
+        for p in profiles
+    ]
+
+
+def test_auto_refresh_happy_path(profile_factory) -> None:
+    """One profile, AUTH_EXPIRED with refresh token. --auto-refresh refreshes
+    it, re-probes to OK, pick returns the name."""
+    profile_factory("account-a")
+    probe_stub = _stateful_probe_stub(Health.AUTH_EXPIRED, Health.OK)
+    with patch.object(cli_mod, "probe_many_sync", probe_stub), \
+         patch.object(cli_mod, "refresh_many_sync", _stub_refresh_success):
+        result = runner.invoke(app, ["pick", "--auto-refresh"])
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "account-a"
+
+
+def test_auto_refresh_falls_through_on_refresh_failure(profile_factory) -> None:
+    """Mix of AUTH_EXPIRED + OK. Refresh fails → pick still returns the OK profile."""
+    from datetime import datetime
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    def _mixed_probe(profiles, *, prev_health=None, timeout=10.0):
+        now = datetime.now(UTC)
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.AUTH_EXPIRED if p.name == "account-a" else Health.OK,
+                probed_at=now,
+                expires_at=None,
+                credentials_mtime=p.credentials_mtime,
+                error=(
+                    ErrorInfo(type="token_expired", message="expired")
+                    if p.name == "account-a"
+                    else None
+                ),
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _mixed_probe), \
+         patch.object(cli_mod, "refresh_many_sync", _stub_refresh_fail):
+        result = runner.invoke(app, ["pick", "--auto-refresh"])
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "account-b"
+    assert "auto-refresh failed" in result.stderr.lower()
+
+
+def test_auto_refresh_no_refresh_token_is_noop(credentials_dir: Path) -> None:
+    """AUTH_EXPIRED profile with NO refreshToken on disk → never attempts refresh.
+    Falls through to exit 2 (AUTH_REQUIRED) since no other candidates exist."""
+    profile_dir = credentials_dir / "account-a"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    cred_path = profile_dir / ".credentials.json"
+    # Modern shape but missing refreshToken — simulates pre-refresh-token
+    # profiles or ones created before Anthropic shipped OAuth refresh.
+    cred_path.write_text(
+        json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-test",
+                "expiresAt": 99999999999999,
+            }
+        })
+    )
+
+    refresh_call_count = {"n": 0}
+
+    def _tracking_refresh(profiles, *, timeout=10.0):
+        refresh_call_count["n"] += 1
+        return []
+
+    probe_stub = _stateful_probe_stub(Health.AUTH_EXPIRED, Health.AUTH_EXPIRED)
+    with patch.object(cli_mod, "probe_many_sync", probe_stub), \
+         patch.object(cli_mod, "refresh_many_sync", _tracking_refresh):
+        result = runner.invoke(app, ["pick", "--auto-refresh"])
+    assert result.exit_code == 2  # AUTH_REQUIRED — can't refresh without a refresh token
+    assert refresh_call_count["n"] == 0, "refresh must not be attempted without a refresh token"
+
+
+def test_auto_refresh_last_candidate_falls_through_to_exit_2(profile_factory) -> None:
+    """Only one profile, expired. Refresh fails. Exit 2 (AUTH_REQUIRED)."""
+    profile_factory("account-a")
+    # Both probe calls return AUTH_EXPIRED — refresh failure means we don't
+    # actually heal the token, and the second probe never fires anyway because
+    # refreshed_profiles is empty.
+    probe_stub = _stateful_probe_stub(Health.AUTH_EXPIRED, Health.AUTH_EXPIRED)
+    with patch.object(cli_mod, "probe_many_sync", probe_stub), \
+         patch.object(cli_mod, "refresh_many_sync", _stub_refresh_fail):
+        result = runner.invoke(app, ["pick", "--auto-refresh"])
+    assert result.exit_code == 2
+    assert "auto-refresh failed" in result.stderr.lower()

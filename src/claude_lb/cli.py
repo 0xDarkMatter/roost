@@ -30,6 +30,7 @@ from .pick import (
     write_last_pick,
 )
 from .probe import probe_many_sync
+from .refresh import refresh_many_sync
 from .updater import apply_result_to_dict, apply_update, check_for_update, status_to_dict
 
 app = typer.Typer(
@@ -172,6 +173,54 @@ def _load_or_probe(
         save_cache(cache)
 
     return cache, names
+
+
+def _attempt_auto_refresh(cache: HealthCache, names: list[str]) -> HealthCache:
+    """Heal AUTH_EXPIRED profiles before picking.
+
+    For each discovered profile whose cached health is AUTH_EXPIRED and which
+    has a refresh token on disk, call refresh_many_sync(); on success, re-probe
+    and update the cache. Refresh failures are reported on stderr but do not
+    raise — the filter ladder in pick() will skip them naturally.
+
+    Rationale: `pick --auto-refresh` should behave like "run refresh --expired,
+    then pick" without the extra hop. Profiles without refresh tokens are never
+    attempted (they require `claude login`, not `refresh`).
+    """
+    expired_targets = []
+    for name in names:
+        entry = cache.profiles.get(name)
+        if entry is None or entry.health is not Health.AUTH_EXPIRED:
+            continue
+        profile = get_profile(name)
+        if profile is None or not profile.refresh_token_present:
+            continue
+        expired_targets.append(profile)
+
+    if not expired_targets:
+        return cache
+
+    results = refresh_many_sync(expired_targets)
+    refreshed_profiles = []
+    for profile, result in zip(expired_targets, results):
+        if result.refreshed:
+            refreshed_profiles.append(profile)
+        else:
+            stderr.print(
+                f"[yellow]warn:[/yellow] auto-refresh failed for {result.name}: "
+                f"{result.error_code or 'ERROR'} — {result.error_message or ''}"
+            )
+
+    if not refreshed_profiles:
+        return cache
+
+    # Refresh bumped credentials mtime (implicit invalidation). Re-probe the
+    # refreshed profiles so pick() sees the new health state.
+    probed = probe_many_sync(refreshed_profiles)
+    for h in probed:
+        cache.profiles[h.name] = h
+    save_cache(cache)
+    return cache
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +548,17 @@ def profiles_pick(
             ),
         ),
     ] = None,
+    auto_refresh: Annotated[
+        bool,
+        typer.Option(
+            "--auto-refresh",
+            help=(
+                "Before picking, inline-refresh any profile whose cached health "
+                "is auth_expired and which has a stored refresh token. Failed "
+                "refreshes fall through — the filter ladder excludes them."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Pick the best healthy profile for scripting."""
     chosen_strategy = _validate_strategy(strategy)
@@ -506,6 +566,9 @@ def profiles_pick(
         stderr.print(f"[red]--warn-at must be between 0 and 100, got:[/red] {warn_at}")
         raise typer.Exit(EXIT_VALIDATION)
     cache, names = _load_or_probe(refresh=no_cache, max_age=max_age)
+
+    if auto_refresh:
+        cache = _attempt_auto_refresh(cache, names)
 
     outcome = pick(
         cache,
@@ -583,6 +646,7 @@ def top_pick(
     no_cache: Annotated[bool, typer.Option("--no-cache")] = False,
     max_age: Annotated[int | None, typer.Option("--max-age")] = None,
     warn_at: Annotated[int | None, typer.Option("--warn-at")] = None,
+    auto_refresh: Annotated[bool, typer.Option("--auto-refresh")] = False,
 ) -> None:
     """Alias for `profiles pick`."""
     profiles_pick(
@@ -595,6 +659,7 @@ def top_pick(
         no_cache=no_cache,
         max_age=max_age,
         warn_at=warn_at,
+        auto_refresh=auto_refresh,
     )
 
 
@@ -647,8 +712,6 @@ def _run_refresh(
     json_output: bool,
 ) -> None:
     from datetime import UTC, datetime
-
-    from .refresh import refresh_many_sync
 
     discovered = discover_profiles()
     if not discovered:

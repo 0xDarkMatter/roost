@@ -70,7 +70,13 @@ claude-lb pick --require-ok              # Exit 5 if none are ok
 claude-lb pick --export                  # Shell-sourceable VAR=value
 claude-lb pick --json                    # {data: {name, health, rationale}}
 claude-lb pick --warn-at 80              # Stderr warning when session/weekly ≥80%
+claude-lb pick --auto-refresh            # Refresh auth_expired profiles inline, then pick
 ```
+
+`--auto-refresh` folds the `refresh --expired` preflight into `pick` itself:
+any cached `auth_expired` profile with a stored refresh token is refreshed
+before selection. Refresh failures are non-fatal — the expired profile is
+filtered out and a healthy one is returned if any exists.
 
 ### Refresh
 
@@ -89,12 +95,11 @@ invalidates the health cache. A cron hook like
 ### Scripting
 
 ```bash
-# Preferred pre-flight: refresh expired tokens, then pick
-claude-lb refresh --expired 2>/dev/null
-profile=$(claude-lb pick 2>/dev/null)
+# Single-shot preflight (pick + inline refresh of expired tokens)
+profile=$(claude-lb pick --auto-refresh 2>/dev/null)
 case $? in
   0) export AXIOM_CLAUDE_PROFILE="$profile" ;;
-  2) echo "All profiles dead or expired: claude-lb refresh --expired or claude login" ;;
+  2) echo "All profiles dead or expired: run claude login --profile <name>" ;;
   5) echo "No profile is currently ok — retry or relax --require-ok" ;;
   6) echo "All profiles throttled — back off" ;;
   9) echo "All profiles exhausted — operator intervention required" ;;
