@@ -69,6 +69,10 @@ Single resource: `profiles`. For convenience, top-level aliases collapse the res
 | `claude-lb profiles probe [<name>]` | `claude-lb probe` | Live-probe (all or one); update cache |
 | `claude-lb profiles pick [--strategy <s>]` | `claude-lb pick` | Return the best healthy profile name |
 | `claude-lb profiles invalidate <name>` | `claude-lb invalidate <name>` | Drop cache for a profile; forces re-probe |
+| `claude-lb profiles refresh [<name>\|--all\|--expired]` | `claude-lb refresh ...` | Refresh OAuth tokens (§10) |
+| `claude-lb exec <cmd...>` | — | Pick a profile, run a child command with `AXIOM_CLAUDE_PROFILE` set; propagate child rc |
+| `claude-lb doctor` | — | Diagnose local setup (§11) |
+| `claude-lb update [--apply]` | — | Check or apply an in-place upgrade |
 | `claude-lb --version` | — | Print semver, exit 0 |
 | `claude-lb --help` | — | Show help, exit 0 |
 

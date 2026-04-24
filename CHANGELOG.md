@@ -5,7 +5,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-25
+
 ### Added
+
+- **`claude-lb exec <cmd...>`** — pick a profile, run a child command with
+  `AXIOM_CLAUDE_PROFILE` (configurable via `--var-name`) set in its env, and
+  propagate the child's exit code as claude-lb's own. Collapses the whole
+  spawn-worker wrapper from `profile=$(claude-lb pick --auto-refresh) &&
+  AXIOM_CLAUDE_PROFILE=$profile claude ...` into:
+  `claude-lb exec --auto-refresh -- claude ...`. Inherits all `pick` flags
+  (`--strategy`, `--stickiness`, `--require-ok`, `--auto-refresh`). Additional
+  flags:
+  - `--retry-on-429 N` (default 1) — if the child exits non-zero AND a
+    re-probe of the used profile shows it flipped from `ok` to `rate_limited`
+    or `session_limit`, re-pick a different profile and rerun once.
+    Heuristic; set 0 to disable. Timeout + command-not-found never trigger
+    retry.
+  - `--timeout S` — kill the child after S seconds (`rc=124`, POSIX convention).
+  - `--dry-run` — print the env assignment and command that would execute,
+    exit 0 without running the child.
+  - `--log-full-argv` — log the full child argv in `picks.log`. Default logs
+    argv[0] only (argv often contains tokens / secrets).
+  - `--var-name NAME` — env var name for the picked profile (default
+    `AXIOM_CLAUDE_PROFILE`).
+  
+  stdin/stdout/stderr are inherited so interactive children (like `claude`
+  itself) work unchanged. Ctrl+C is forwarded on both POSIX and Windows.
+  Every run logs `{ts}\t{profile}\tEXEC\targv=...\trc=...\tdur=...ms` to
+  `picks.log` for post-hoc investigation.
 
 - **`claude-lb pick --auto-refresh`** — before picking, inline-refresh any
   profile whose cached health is `auth_expired` and which has a stored refresh
@@ -25,6 +53,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 - `PickOutcome.chosen_many: list[ProfileHealth]` — ordered multi-pick result
   (length 1 for single-pick; up to `count` for multi-pick). The primary
   `chosen` field is always `chosen_many[0]` on success.
+- `src/claude_lb/exec_cmd.py` — subprocess orchestration module. Named
+  `exec_cmd` (not `exec`) to avoid shadowing the Python builtin.
 
 ### Changed
 

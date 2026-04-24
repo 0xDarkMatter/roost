@@ -1,6 +1,6 @@
 [project]
 name = "claude-lb"
-version = "0.4.1"
+version = "0.5.0"
 description = "Pick the healthiest Claude Code Max profile — health taxonomy + load balancer"
 readme = "README.md"
 requires-python = ">=3.11"

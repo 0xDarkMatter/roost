@@ -3,7 +3,7 @@
 [![Forma](https://img.shields.io/badge/forma-experimental-orange.svg)](https://github.com/forma-tools/forma)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](CHANGELOG.md)
 
 > Pick the healthiest Claude Code Max profile — health taxonomy + load balancer for local OAuth profiles.
 
@@ -107,10 +107,40 @@ atomically rewrites `.credentials.json` (preserving non-oauth fields), and
 invalidates the health cache. A cron hook like
 `0 * * * * claude-lb refresh --expired --json` keeps the fleet warm.
 
-### Scripting
+### Running commands
 
 ```bash
-# Single-shot preflight (pick + inline refresh of expired tokens)
+# The north-star idiom: pick + refresh + dispatch in one call.
+claude-lb exec --auto-refresh -- claude --dangerously-skip-permissions "write fn"
+
+# With explicit strategy, timeout, and retry-on-rate-limit:
+claude-lb exec --strategy least-used --timeout 300 --retry-on-429 1 -- claude ...
+
+# Dry-run: show what would execute without talking to the API
+claude-lb exec --dry-run -- claude --help
+# → AXIOM_CLAUDE_PROFILE=account-a claude --help
+```
+
+`claude-lb exec` picks a profile, sets `AXIOM_CLAUDE_PROFILE=<name>` in the
+child's env, and execs the command. The child's exit code becomes claude-lb's
+exit code, so scripts can treat `exec` as a transparent wrapper. stdin/stdout/
+stderr are inherited (interactive children work unchanged). Every run is
+audited to `picks.log` with duration + rc.
+
+Key flags:
+
+- `--auto-refresh` — inline-refresh expired tokens before picking
+- `--retry-on-429 N` — if the child fails AND the profile re-probes as
+  rate-limited/session-exhausted, retry once with a different profile (best-effort)
+- `--timeout S` — kill after S seconds (exit 124)
+- `--dry-run` — print the env + command, don't execute
+- `--var-name NAME` — override `AXIOM_CLAUDE_PROFILE`
+- `--log-full-argv` — log the full child argv instead of just argv[0] (may leak secrets)
+
+### Scripting (lower-level)
+
+```bash
+# If `exec` doesn't fit, drop to pick + eval yourself:
 profile=$(claude-lb pick --auto-refresh 2>/dev/null)
 case $? in
   0) export AXIOM_CLAUDE_PROFILE="$profile" ;;
@@ -119,6 +149,12 @@ case $? in
   6) echo "All profiles throttled — back off" ;;
   9) echo "All profiles exhausted — operator intervention required" ;;
 esac
+
+# Parallel dispatch to N accounts via --count
+for profile in $(claude-lb pick --count 3 --strategy least-used); do
+    AXIOM_CLAUDE_PROFILE=$profile axiom launch-parcel &
+done
+wait
 ```
 
 ### Diagnostics

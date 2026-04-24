@@ -29,6 +29,7 @@ from .pick import (
     pick,
     write_last_pick,
 )
+from .exec_cmd import RC_NOT_FOUND, RC_TIMEOUT, ExecResult, run_child
 from .probe import probe_many_sync
 from .refresh import refresh_many_sync
 from .updater import apply_result_to_dict, apply_update, check_for_update, status_to_dict
@@ -951,6 +952,318 @@ def top_refresh(
         timeout=timeout,
         json_output=json_output,
     )
+
+
+# ---------------------------------------------------------------------------
+# exec — pick + run a child command
+# ---------------------------------------------------------------------------
+
+
+def _append_exec_log(
+    profile: str,
+    argv0: str,
+    rc: int,
+    duration_ms: int,
+    *,
+    full_argv: str | None = None,
+) -> None:
+    """Append an EXEC line to picks.log. Default logs argv[0] only; caller
+    can opt into full argv (secrets risk — argv often contains tokens).
+    """
+    from datetime import UTC, datetime
+
+    from .pick import pick_log_path
+
+    target = pick_log_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(UTC).isoformat()
+    payload = full_argv if full_argv is not None else argv0
+    line = f"{ts}\t{profile}\tEXEC\targv={payload}\trc={rc}\tdur={duration_ms}ms\n"
+    with target.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def _pick_one(
+    cache: HealthCache,
+    names: list[str],
+    *,
+    strategy: Strategy,
+    stickiness: int | None,
+    require_ok: bool,
+    auto_refresh: bool,
+    exclude: set[str] | None = None,
+) -> tuple[ProfileHealth, HealthCache]:
+    """Run the full pick pipeline for `exec`, honoring auto-refresh + exclude.
+
+    On failure, emits stderr + raises typer.Exit with the appropriate code
+    (same mapping as `pick`). Returns (chosen, updated_cache) on success.
+    """
+    if auto_refresh:
+        cache = _attempt_auto_refresh(cache, names)
+    filtered = [n for n in names if n not in (exclude or set())]
+    outcome = pick(
+        cache,
+        filtered,
+        strategy=strategy,
+        stickiness_s=stickiness,
+        require_ok=require_ok,
+    )
+    if not outcome.ok:
+        reason = outcome.reason or PickFailureReason.NO_PROFILES
+        exit_code = REASON_TO_EXIT.get(reason, EXIT_ERROR)
+        message = REASON_MESSAGES.get(reason, "Pick failed.")
+        if outcome.earliest_recovery_at:
+            message = (
+                f"{message} Earliest recovery: "
+                f"{outcome.earliest_recovery_at.isoformat().replace('+00:00', 'Z')}"
+            )
+        stderr.print(f"[red]{message}[/red]")
+        raise typer.Exit(exit_code)
+    assert outcome.chosen is not None
+    return outcome.chosen, cache
+
+
+def _reprobe_after_child(
+    cache: HealthCache, name: str
+) -> ProfileHealth | None:
+    """Re-probe a single profile to see if its health shifted (post-child).
+
+    Writes the fresh result to the cache. Used by exec's rate-limit retry
+    heuristic — if a profile flips from OK to RATE_LIMITED/SESSION_LIMIT
+    during the child's run, the child's non-zero exit was probably caused
+    by hitting that limit.
+    """
+    profile = get_profile(name)
+    if profile is None:
+        return None
+    prev = cache.profiles.get(name)
+    prev_h = {name: prev.health} if prev is not None else None
+    results = probe_many_sync([profile], prev_health=prev_h)
+    if not results:
+        return None
+    fresh = results[0]
+    cache.profiles[name] = fresh
+    save_cache(cache)
+    return fresh
+
+
+def _child_hit_rate_limit(
+    before: ProfileHealth | None, after: ProfileHealth | None
+) -> bool:
+    """True iff the profile was OK (or unknown) before and is now throttled.
+
+    Conservative: requires a clear OK→throttled transition. Pre-existing
+    throttled profiles don't trigger retry (pick would have filtered them).
+    """
+    if after is None:
+        return False
+    transient = {Health.RATE_LIMITED, Health.SESSION_LIMIT}
+    if after.health not in transient:
+        return False
+    return before is None or before.health is Health.OK
+
+
+@app.command(
+    "exec",
+    context_settings={
+        "allow_extra_args": True,
+        "ignore_unknown_options": True,
+    },
+)
+def exec_cmd(
+    ctx: typer.Context,
+    strategy: Annotated[
+        str, typer.Option("--strategy", help="Pick strategy.")
+    ] = "sticky",
+    stickiness: Annotated[
+        int | None, typer.Option("--stickiness")
+    ] = None,
+    require_ok: Annotated[
+        bool, typer.Option("--require-ok", help="Only pick an `ok` profile.")
+    ] = False,
+    auto_refresh: Annotated[
+        bool,
+        typer.Option(
+            "--auto-refresh",
+            help="Inline-refresh auth_expired profiles before picking.",
+        ),
+    ] = False,
+    var_name: Annotated[
+        str,
+        typer.Option(
+            "--var-name",
+            help="Env var name set to the picked profile (default AXIOM_CLAUDE_PROFILE).",
+        ),
+    ] = "AXIOM_CLAUDE_PROFILE",
+    retry_on_429: Annotated[
+        int,
+        typer.Option(
+            "--retry-on-429",
+            min=0,
+            max=3,
+            help=(
+                "If the child exits non-zero AND the profile re-probes as "
+                "rate_limited/session_limit, re-pick a different profile and "
+                "rerun. Default 1; set 0 to disable."
+            ),
+        ),
+    ] = 1,
+    timeout: Annotated[
+        float | None,
+        typer.Option(
+            "--timeout",
+            help=(
+                "Kill the child after N seconds. Exit 124 on timeout "
+                "(POSIX convention). Default: no timeout."
+            ),
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help=(
+                "Print the env assignment + command that would run, exit 0. "
+                "Does not talk to Anthropic's API (uses cache only)."
+            ),
+        ),
+    ] = False,
+    log_full_argv: Annotated[
+        bool,
+        typer.Option(
+            "--log-full-argv",
+            help=(
+                "Log the full child argv in picks.log (may contain secrets). "
+                "Default logs only argv[0]."
+            ),
+        ),
+    ] = False,
+    no_cache: Annotated[bool, typer.Option("--no-cache")] = False,
+    max_age: Annotated[int | None, typer.Option("--max-age")] = None,
+) -> None:
+    """Pick a profile, run a child command with AXIOM_CLAUDE_PROFILE set.
+
+    Everything after the last flag is passed to the child. Use `--` to
+    disambiguate child flags from claude-lb's own flags:
+
+        claude-lb exec --auto-refresh -- claude --dangerously-skip-permissions <args>
+
+    claude-lb's exit code equals the child's exit code, so scripts can
+    treat this as a transparent wrapper. Picks are audited to picks.log
+    with rc + duration for post-hoc investigation.
+    """
+    import shlex
+
+    chosen_strategy = _validate_strategy(strategy)
+    argv = list(ctx.args or [])
+    if not argv:
+        stderr.print(
+            "[red]exec requires a command.[/red] "
+            "Example: claude-lb exec -- claude --help"
+        )
+        raise typer.Exit(EXIT_VALIDATION)
+
+    cache, names = _load_or_probe(refresh=no_cache, max_age=max_age)
+    chosen, cache = _pick_one(
+        cache,
+        names,
+        strategy=chosen_strategy,
+        stickiness=stickiness,
+        require_ok=require_ok,
+        auto_refresh=auto_refresh,
+    )
+
+    if dry_run:
+        pretty = " ".join(shlex.quote(a) for a in argv)
+        emit_text(f"{var_name}={chosen.name} {pretty}")
+        return
+
+    # Update last-pick + picks.log before handing off. If we crash during
+    # the child's run, we still have an audit trail of what was dispatched.
+    write_last_pick(chosen.name)
+    score = 1.0 if chosen.health is Health.OK else 0.5
+    append_pick_log(chosen.name, chosen_strategy, score)
+
+    result: ExecResult = run_child(
+        argv,
+        env_var_name=var_name,
+        profile_name=chosen.name,
+        timeout=timeout,
+    )
+
+    full_argv_str = " ".join(shlex.quote(a) for a in argv) if log_full_argv else None
+    _append_exec_log(
+        chosen.name,
+        argv[0],
+        result.rc,
+        result.duration_ms,
+        full_argv=full_argv_str,
+    )
+
+    if result.timed_out:
+        stderr.print(
+            f"[yellow]timeout:[/yellow] child killed after {timeout}s "
+            f"(rc={RC_TIMEOUT}, profile={chosen.name})"
+        )
+    elif result.not_found:
+        stderr.print(
+            f"[red]command not found:[/red] {argv[0]} "
+            f"(rc={RC_NOT_FOUND})"
+        )
+
+    # Rate-limit retry: if the child failed AND re-probe shows the profile
+    # flipped to throttled, retry once with a different profile. Timeout +
+    # not_found are not rate-limit symptoms — skip the retry for those.
+    if (
+        result.rc != 0
+        and retry_on_429 > 0
+        and not result.timed_out
+        and not result.not_found
+    ):
+        before = cache.profiles.get(chosen.name)
+        after = _reprobe_after_child(cache, chosen.name)
+        if _child_hit_rate_limit(before, after):
+            stderr.print(
+                f"[yellow]retry:[/yellow] {chosen.name} flipped to "
+                f"{after.health.value if after else '?'} — retrying with another profile"
+            )
+            try:
+                second, cache = _pick_one(
+                    cache,
+                    names,
+                    strategy=chosen_strategy,
+                    stickiness=stickiness,
+                    require_ok=require_ok,
+                    auto_refresh=auto_refresh,
+                    exclude={chosen.name},
+                )
+            except typer.Exit:
+                # No other candidates; propagate the child's original rc.
+                raise typer.Exit(result.rc) from None
+
+            write_last_pick(second.name)
+            second_score = 1.0 if second.health is Health.OK else 0.5
+            append_pick_log(second.name, chosen_strategy, second_score)
+
+            result2 = run_child(
+                argv,
+                env_var_name=var_name,
+                profile_name=second.name,
+                timeout=timeout,
+            )
+            full_argv_str2 = (
+                " ".join(shlex.quote(a) for a in argv) if log_full_argv else None
+            )
+            _append_exec_log(
+                second.name,
+                argv[0],
+                result2.rc,
+                result2.duration_ms,
+                full_argv=full_argv_str2,
+            )
+            raise typer.Exit(result2.rc)
+
+    raise typer.Exit(result.rc)
 
 
 # ---------------------------------------------------------------------------

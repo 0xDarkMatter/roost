@@ -75,6 +75,9 @@ Invariants an agent cannot intuit from `--help`:
 12. **Token-shape fallback matters.** For reading: try `claudeAiOauth.accessToken`, then `oauthAccessToken`, then `accessToken`. For writing (refresh): modern shape only.
 13. **Stickiness is the default.** Don't change the default strategy to `round-robin` or similar without explicit operator approval — it thrashes Anthropic's per-account prompt cache.
 14. **Refresh doesn't need `--dry-run`** because failed refreshes never mutate `.credentials.json` (tempfile-only writes — the server-side rejection is detected before rename). But warn if you're designing auto-refresh: two parallel `claude-lb pick` invocations both consuming the same refresh token is a real race.
+15. **`exec` forwards stdin/stdout/stderr to the child verbatim.** Don't try to capture the child's output by redirecting claude-lb's own stdout — claude-lb's stdout is silent when `exec` runs a child. Redirect the child's argv directly if you need to capture: `claude-lb exec -- sh -c 'child > out.log 2>&1'`. Ctrl+C is forwarded on both POSIX and Windows via `subprocess.run`.
+16. **`exec` default logs argv[0] only.** Child argv often contains tokens, prompts, or paths that look like secrets. Audit log in `picks.log` is `argv=<argv0>` by default; `--log-full-argv` opts into full logging. If you add a new subcommand that exec's or wraps a child, follow the same default.
+17. **Multi-pick (`pick --count N`) disables stickiness.** Sticky's "pin to last pick" semantic doesn't compose with "give me N distinct profiles". The first returned profile IS written to `last-pick.json` so a subsequent single-pick call still honours stickiness against the primary. Don't re-enable stickiness for multi-pick without a clear semantic.
 
 **Prompt injection:** not applicable. `claude-lb` returns only its own telemetry — profile names, utilization numbers, timestamps — never user-authored content from Anthropic's API.
 

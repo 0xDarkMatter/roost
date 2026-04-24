@@ -64,7 +64,7 @@ def test_version() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert "claude-lb" in result.stdout
-    assert "0.4.1" in result.stdout
+    assert "0.5.0" in result.stdout
 
 
 def test_help_exits_zero() -> None:
@@ -705,3 +705,284 @@ def test_pick_count_logs_each_to_picks_log(
     # One line per pick, containing each profile name.
     for name in ("a", "b", "c"):
         assert f"\t{name}\t" in log_text
+
+
+# ---------------------------------------------------------------------------
+# exec — child dispatch
+# ---------------------------------------------------------------------------
+
+
+def _stub_run_child_factory(*, rc_sequence: list[int], timed_out: bool = False,
+                            not_found: bool = False):
+    """Build a run_child stub that returns the next rc in sequence per call.
+
+    Captures the args of each call in `.calls` for assertion. Walks rc_sequence;
+    if the list is exhausted, keeps returning the last rc so tests don't have
+    to count invocations precisely.
+    """
+    from claude_lb.exec_cmd import ExecResult
+
+    calls: list[dict] = []
+
+    def _stub(argv, *, env_var_name, profile_name, timeout):
+        calls.append({
+            "argv": list(argv),
+            "env_var_name": env_var_name,
+            "profile_name": profile_name,
+            "timeout": timeout,
+        })
+        i = min(len(calls) - 1, len(rc_sequence) - 1)
+        rc = rc_sequence[i]
+        return ExecResult(
+            rc=rc,
+            duration_ms=100,
+            timed_out=timed_out and i == 0,
+            not_found=not_found and i == 0,
+        )
+
+    _stub.calls = calls  # type: ignore[attr-defined]
+    return _stub
+
+
+def test_exec_happy_path(profile_factory, _isolated_home: Path) -> None:
+    """Pick profile, run child, return child rc. picks.log gets PICK + EXEC lines."""
+    profile_factory("account-a")
+    stub_run = _stub_run_child_factory(rc_sequence=[0])
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync), \
+         patch.object(cli_mod, "run_child", stub_run):
+        result = runner.invoke(app, ["exec", "echo", "hello"])
+    assert result.exit_code == 0
+    assert len(stub_run.calls) == 1
+    call = stub_run.calls[0]
+    assert call["argv"] == ["echo", "hello"]
+    assert call["env_var_name"] == "AXIOM_CLAUDE_PROFILE"
+    assert call["profile_name"] == "account-a"
+
+    log_text = (_isolated_home / "picks.log").read_text()
+    assert "EXEC" in log_text
+    assert "account-a" in log_text
+    assert "rc=0" in log_text
+
+
+def test_exec_no_command_given_exits_validation(profile_factory) -> None:
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["exec"])
+    assert result.exit_code == 4  # VALIDATION
+    assert "requires a command" in result.stderr.lower()
+
+
+def test_exec_no_healthy_profile_exits_9() -> None:
+    """No profiles discovered → propagate pick failure (exit 9)."""
+    result = runner.invoke(app, ["exec", "echo", "hi"])
+    assert result.exit_code == 9  # UNAVAILABLE
+
+
+def test_exec_dry_run_prints_without_running(profile_factory) -> None:
+    profile_factory("account-a")
+    stub_run = _stub_run_child_factory(rc_sequence=[0])
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync), \
+         patch.object(cli_mod, "run_child", stub_run):
+        result = runner.invoke(app, ["exec", "--dry-run", "echo", "hello"])
+    assert result.exit_code == 0
+    assert len(stub_run.calls) == 0  # child never ran
+    assert "AXIOM_CLAUDE_PROFILE=account-a" in result.stdout
+    assert "echo" in result.stdout
+
+
+def test_exec_propagates_child_exit_code(profile_factory) -> None:
+    profile_factory("account-a")
+    stub_run = _stub_run_child_factory(rc_sequence=[42])
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync), \
+         patch.object(cli_mod, "run_child", stub_run):
+        result = runner.invoke(app, ["exec", "failing-cmd"])
+    # No retry because re-probe won't show rate-limit change (stub always returns OK).
+    assert result.exit_code == 42
+
+
+def test_exec_custom_var_name(profile_factory) -> None:
+    profile_factory("account-a")
+    stub_run = _stub_run_child_factory(rc_sequence=[0])
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync), \
+         patch.object(cli_mod, "run_child", stub_run):
+        result = runner.invoke(
+            app, ["exec", "--var-name", "MY_VAR", "echo"]
+        )
+    assert result.exit_code == 0
+    assert stub_run.calls[0]["env_var_name"] == "MY_VAR"
+
+
+def test_exec_timeout_returns_124(profile_factory) -> None:
+    profile_factory("account-a")
+    stub_run = _stub_run_child_factory(rc_sequence=[124], timed_out=True)
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync), \
+         patch.object(cli_mod, "run_child", stub_run):
+        result = runner.invoke(
+            app, ["exec", "--timeout", "1", "sleep", "10"]
+        )
+    assert result.exit_code == 124
+    assert "timeout" in result.stderr.lower()
+
+
+def test_exec_logs_argv0_only_by_default(
+    profile_factory, _isolated_home: Path
+) -> None:
+    """picks.log should contain argv[0] but not downstream args (secrets risk)."""
+    profile_factory("account-a")
+    stub_run = _stub_run_child_factory(rc_sequence=[0])
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync), \
+         patch.object(cli_mod, "run_child", stub_run):
+        result = runner.invoke(
+            app, ["exec", "echo", "super-secret-token-abc123"]
+        )
+    assert result.exit_code == 0
+    log_text = (_isolated_home / "picks.log").read_text()
+    assert "echo" in log_text
+    assert "super-secret-token-abc123" not in log_text
+
+
+def test_exec_log_full_argv_opts_in(
+    profile_factory, _isolated_home: Path
+) -> None:
+    profile_factory("account-a")
+    stub_run = _stub_run_child_factory(rc_sequence=[0])
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync), \
+         patch.object(cli_mod, "run_child", stub_run):
+        result = runner.invoke(
+            app, ["exec", "--log-full-argv", "echo", "visible-arg"]
+        )
+    assert result.exit_code == 0
+    log_text = (_isolated_home / "picks.log").read_text()
+    assert "visible-arg" in log_text
+
+
+def test_exec_retry_on_rate_limit(profile_factory) -> None:
+    """First child fails + profile flips OK→RATE_LIMITED → retry w/ different profile."""
+    from datetime import datetime
+
+    from claude_lb.models import Usage
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    probe_state = {"count": 0}
+
+    def _stateful_probe(profiles, *, prev_health=None, timeout=10.0):
+        """First call: both profiles OK (seeds cache).
+        Second call (single-profile re-probe of chosen): that profile RATE_LIMITED.
+        """
+        probe_state["count"] += 1
+        now = datetime.now(UTC)
+        # Re-probe of a single profile after child fails
+        if probe_state["count"] >= 2 and len(profiles) == 1:
+            p = profiles[0]
+            return [
+                ProfileHealth(
+                    name=p.name,
+                    health=Health.RATE_LIMITED,
+                    probed_at=now,
+                    expires_at=now,
+                    credentials_mtime=p.credentials_mtime,
+                    error=ErrorInfo(type="rate_limited", message="slow down"),
+                )
+            ]
+        # First call: both OK with distinct weeklies for deterministic ordering
+        weeklies = {"account-a": 10, "account-b": 50}
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.OK,
+                probed_at=now,
+                usage=Usage(weekly_pct=weeklies.get(p.name, 50), session_pct=0),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    # First run_child: rc=1 (as if rate-limited). Second: rc=0.
+    stub_run = _stub_run_child_factory(rc_sequence=[1, 0])
+    with patch.object(cli_mod, "probe_many_sync", _stateful_probe), \
+         patch.object(cli_mod, "run_child", stub_run):
+        result = runner.invoke(
+            app, ["exec", "--strategy", "least-used", "claude-bin"]
+        )
+    assert result.exit_code == 0  # retry succeeded
+    assert len(stub_run.calls) == 2
+    # Primary pick: account-a (least-used, 10%). Retry excludes it → account-b.
+    assert stub_run.calls[0]["profile_name"] == "account-a"
+    assert stub_run.calls[1]["profile_name"] == "account-b"
+    assert "retry" in result.stderr.lower()
+
+
+def test_exec_retry_disabled_when_budget_zero(profile_factory) -> None:
+    """--retry-on-429 0 means never retry, even if rate-limited."""
+    from datetime import datetime
+
+    from claude_lb.models import Usage
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    probe_state = {"count": 0}
+
+    def _stateful_probe(profiles, *, prev_health=None, timeout=10.0):
+        probe_state["count"] += 1
+        now = datetime.now(UTC)
+        if probe_state["count"] >= 2 and len(profiles) == 1:
+            p = profiles[0]
+            return [
+                ProfileHealth(
+                    name=p.name,
+                    health=Health.RATE_LIMITED,
+                    probed_at=now,
+                    expires_at=now,
+                    credentials_mtime=p.credentials_mtime,
+                )
+            ]
+        weeklies = {"account-a": 10, "account-b": 50}
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.OK,
+                probed_at=now,
+                usage=Usage(weekly_pct=weeklies.get(p.name, 50), session_pct=0),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    stub_run = _stub_run_child_factory(rc_sequence=[1])
+    with patch.object(cli_mod, "probe_many_sync", _stateful_probe), \
+         patch.object(cli_mod, "run_child", stub_run):
+        result = runner.invoke(
+            app, ["exec", "--retry-on-429", "0", "claude-bin"]
+        )
+    assert result.exit_code == 1
+    assert len(stub_run.calls) == 1  # no retry attempted
+
+
+def test_exec_no_retry_on_timeout(profile_factory) -> None:
+    """Timeout is not a rate-limit symptom — shouldn't trigger retry."""
+    profile_factory("account-a")
+    profile_factory("account-b")
+    stub_run = _stub_run_child_factory(rc_sequence=[124], timed_out=True)
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync), \
+         patch.object(cli_mod, "run_child", stub_run):
+        result = runner.invoke(
+            app, ["exec", "--timeout", "1", "sleep", "10"]
+        )
+    assert result.exit_code == 124
+    assert len(stub_run.calls) == 1
+
+
+def test_exec_auto_refresh_is_honored(profile_factory, _isolated_home: Path) -> None:
+    """exec --auto-refresh refreshes expired profiles before picking."""
+    profile_factory("account-a")
+    probe_stub = _stateful_probe_stub(Health.AUTH_EXPIRED, Health.OK)
+    stub_run = _stub_run_child_factory(rc_sequence=[0])
+    with patch.object(cli_mod, "probe_many_sync", probe_stub), \
+         patch.object(cli_mod, "refresh_many_sync", _stub_refresh_success), \
+         patch.object(cli_mod, "run_child", stub_run):
+        result = runner.invoke(app, ["exec", "--auto-refresh", "claude-bin"])
+    assert result.exit_code == 0
+    assert stub_run.calls[0]["profile_name"] == "account-a"
