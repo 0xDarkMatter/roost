@@ -327,9 +327,9 @@ def pick(
     fallback = Strategy.LEAST_USED if strategy is Strategy.STICKY else strategy
 
     if fallback is Strategy.ROUND_ROBIN:
-        last = read_last_pick(last_pick_path_override)
-        last_name = last[0] if last else None
-        ordered = _sort_round_robin(selectable, None, last_name)
+        rr_last = read_last_pick(last_pick_path_override)
+        rr_last_name = rr_last[0] if rr_last else None
+        ordered = _sort_round_robin(selectable, None, rr_last_name)
         rationale = "round-robin: rotated past last pick"
     elif fallback is Strategy.WEIGHTED:
         ordered = _sort_weighted(selectable)

@@ -5,13 +5,14 @@ from __future__ import annotations
 import logging
 import sys
 from datetime import UTC
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
 from . import __version__
 from .cache import is_entry_fresh, load_cache, remove_profile, save_cache
 from .discovery import discover_profiles, get_profile
+from .doctor import report_to_dict, run_doctor
 from .models import Health, HealthCache, ProfileHealth
 from .output import (
     build_status_payload,
@@ -29,6 +30,7 @@ from .pick import (
     write_last_pick,
 )
 from .probe import probe_many_sync
+from .updater import check_for_update, status_to_dict
 
 app = typer.Typer(
     name="claude-lb",
@@ -347,7 +349,7 @@ def profiles_show(
     cache = load_cache()
     entry = cache.profiles.get(name)
     if json_output:
-        payload: dict = {
+        payload: dict[str, Any] = {
             "data": {
                 "name": name,
                 "credentials_path": profile.credentials_path,
@@ -538,6 +540,80 @@ def top_invalidate(
 ) -> None:
     """Alias for `profiles invalidate`."""
     profiles_invalidate(name=name, json_output=json_output)
+
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+
+@app.command("doctor")
+def doctor(
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    skip_network: Annotated[
+        bool,
+        typer.Option("--skip-network", help="Skip the api.anthropic.com reachability probe."),
+    ] = False,
+) -> None:
+    """Diagnose the local setup — config dir, profiles, credentials, cache, network."""
+    report = run_doctor(skip_network=skip_network)
+    if json_output:
+        emit_json(report_to_dict(report))
+        if not report.all_passed:
+            raise typer.Exit(EXIT_ERROR)
+        return
+    stderr.print(f"[bold]claude-lb doctor[/bold] (v{report.version})")
+    for check in report.checks:
+        mark = "[green]OK[/green]" if check.passed else "[red]FAIL[/red]"
+        stderr.print(f"  {mark}  {check.name}: {check.detail}")
+    if report.all_passed:
+        stderr.print("[green]All checks passed.[/green]")
+    else:
+        failed = [c.name for c in report.checks if not c.passed]
+        stderr.print(f"[red]{len(failed)} check(s) failed:[/red] {', '.join(failed)}")
+        raise typer.Exit(EXIT_ERROR)
+
+
+# ---------------------------------------------------------------------------
+# update
+# ---------------------------------------------------------------------------
+
+
+@app.command("update")
+def update(
+    check_only: Annotated[
+        bool,
+        typer.Option("--check", help="Check for updates without applying."),
+    ] = True,  # check-only is the only supported mode in v0.1
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Check whether a newer version is available upstream.
+
+    v0.1 only supports `--check`. When an actual upgrade command is needed,
+    follow the printed upgrade hint (typically `git pull && uv tool install
+    --editable .`).
+    """
+    # check_only is currently forced to True; the flag exists so future
+    # versions can add an in-place upgrade mode without breaking scripts.
+    _ = check_only
+    status = check_for_update()
+    if json_output:
+        emit_json(status_to_dict(status))
+        return
+    stderr.print(f"[bold]claude-lb[/bold] {status.current_version}")
+    if status.install_dir:
+        stderr.print(f"  install: {status.install_dir}")
+    if status.is_git_repo and status.local_commit:
+        stderr.print(f"  commit:  {status.local_commit[:12]}")
+        if status.behind is not None:
+            if status.behind == 0 and (status.ahead or 0) == 0:
+                stderr.print("  status:  [green]up-to-date[/green]")
+            else:
+                stderr.print(
+                    f"  status:  [yellow]{status.ahead or 0} ahead, "
+                    f"{status.behind} behind[/yellow]"
+                )
+    stderr.print(f"  hint:    {status.upgrade_hint}")
 
 
 # ---------------------------------------------------------------------------

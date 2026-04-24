@@ -43,12 +43,14 @@ def _isolated_home(
 
     # Modules that imported the path helpers at module-top need their local
     # bindings patched too.
-    from claude_lb import cache, pick
+    from claude_lb import cache, doctor, pick
 
     monkeypatch.setattr(cache, "cache_path", lambda: config / "health.json")
     monkeypatch.setattr(cache, "ensure_config_dir", lambda: config)
     monkeypatch.setattr(pick, "last_pick_path", lambda: config / "last-pick.json")
     monkeypatch.setattr(pick, "pick_log_path", lambda: config / "picks.log")
+    monkeypatch.setattr(doctor, "config_dir", lambda: config)
+    monkeypatch.setattr(doctor, "cache_path", lambda: config / "health.json")
 
     yield config
 
@@ -247,3 +249,47 @@ def test_probe_named_profile(profile_factory) -> None:
     with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
         result = runner.invoke(app, ["probe", "account-a", "--json"])
     assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_human_output(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["doctor", "--skip-network"])
+    assert result.exit_code == 0
+
+
+def test_doctor_json_output(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["doctor", "--skip-network", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["version"]
+    assert payload["meta"]["passed"] >= 1
+
+
+def test_doctor_fails_when_no_profiles() -> None:
+    result = runner.invoke(app, ["doctor", "--skip-network"])
+    # profiles_discoverable check fails -> exit 1
+    assert result.exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# update
+# ---------------------------------------------------------------------------
+
+
+def test_update_human_output() -> None:
+    result = runner.invoke(app, ["update"])
+    assert result.exit_code == 0
+
+
+def test_update_json_output() -> None:
+    result = runner.invoke(app, ["update", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert "current_version" in payload["data"]
+    assert "update_available" in payload["meta"]

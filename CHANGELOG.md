@@ -5,6 +5,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+### Added
+
+- `claude-lb doctor [--skip-network] [--json]` — diagnose local setup (config dir writability, profile discovery, credential parsing, cache readability, `api.anthropic.com` reachability).
+- `claude-lb update [--json]` — report current version, detect git-upstream ahead/behind if applicable, emit a concrete upgrade hint.
+- `py.typed` marker — downstream type-checkers now consume claude-lb's type hints.
+- Environment variable documentation in README (`CLAUDE_LB_STICKINESS`, `CLAUDE_LB_PROFILES_DIR`, `CLAUDE_CONFIG_DIR`, `XDG_CONFIG_HOME`).
+
+### Changed
+
+- mypy strict mode now passes across the whole source tree (was not enforced in v0.1.0).
+
 ## [0.1.0] - 2026-04-24
 
 ### Added

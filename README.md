@@ -130,6 +130,36 @@ Stickiness window can be overridden with `--stickiness <s>` or
 | 8 | `TIMEOUT` |
 | 9 | `UNAVAILABLE` — no profiles, or all terminal-bad |
 
+## Environment Variables
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `CLAUDE_LB_STICKINESS` | `300` | Stickiness window in seconds for the default strategy. `0` disables. Overridden by `--stickiness <s>` on the command line. |
+| `CLAUDE_LB_PROFILES_DIR` | `~/.claude-profiles` | Absolute path to the directory containing `<name>/.credentials.json` subtrees. Useful for testing or multi-tenant setups. |
+| `CLAUDE_CONFIG_DIR` | unset | If the primary profiles dir is empty, and this points at a directory containing a direct `.credentials.json`, that file is loaded as a single profile named `default`. Matches the `claude` CLI's env-based single-profile mode. |
+| `XDG_CONFIG_HOME` | unset | On Linux/macOS, overrides where `~/.config/claude-lb/` lives. Windows ignores this and always uses `%APPDATA%\claude-lb\`. |
+
+Example:
+
+```bash
+# Scripting: pin a stickiness window of 10 minutes for a long parcel wave
+CLAUDE_LB_STICKINESS=600 axiom queue daemon-start
+
+# Testing: point at a sandboxed profile tree
+CLAUDE_LB_PROFILES_DIR=/tmp/fake-profiles claude-lb status
+```
+
+## Diagnostics
+
+```bash
+claude-lb doctor                 # Check config dir, profiles, credentials, cache, network
+claude-lb doctor --skip-network  # Offline variant (skips api.anthropic.com probe)
+claude-lb doctor --json          # Machine-readable
+
+claude-lb update                 # Report current version + upgrade hint (checks git upstream)
+claude-lb update --json          # Machine-readable; meta.update_available tells you if behind
+```
+
 ## Cache & Filesystem
 
 | Purpose | Path |

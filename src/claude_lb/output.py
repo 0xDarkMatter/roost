@@ -132,7 +132,7 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
 def build_status_payload(cache: HealthCache, discovered_names: list[str]) -> dict[str, Any]:
     """Produce the --json payload for `profiles status`."""
     now = datetime.now(UTC)
-    data = []
+    data: list[dict[str, Any]] = []
     counts: dict[str, int] = {
         "ok": 0,
         "rate_limited": 0,
@@ -170,7 +170,7 @@ def build_status_payload(cache: HealthCache, discovered_names: list[str]) -> dic
             "error": entry.error.model_dump() if entry.error else None,
             "probe_latency_ms": entry.probe_latency_ms,
         })
-    meta = {"count": len(data), **counts}
+    meta: dict[str, Any] = {"count": len(data), **counts}
     return {"data": data, "meta": meta}
 
 
