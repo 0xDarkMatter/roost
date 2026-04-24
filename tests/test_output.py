@@ -237,6 +237,117 @@ def test_humanize_age_future() -> None:
 
 
 # ---------------------------------------------------------------------------
+# humanize_until
+# ---------------------------------------------------------------------------
+
+
+def test_humanize_until_none_returns_dash() -> None:
+    assert output.humanize_until(None) == "—"
+
+
+def test_humanize_until_past_returns_now() -> None:
+    assert output.humanize_until(FIXED_NOW - timedelta(seconds=10), now=FIXED_NOW) == "now"
+
+
+def test_humanize_until_seconds() -> None:
+    assert output.humanize_until(FIXED_NOW + timedelta(seconds=45), now=FIXED_NOW) == "in 45s"
+
+
+def test_humanize_until_minutes() -> None:
+    assert output.humanize_until(FIXED_NOW + timedelta(minutes=37), now=FIXED_NOW) == "in 37m"
+
+
+def test_humanize_until_hours_clean() -> None:
+    assert output.humanize_until(FIXED_NOW + timedelta(hours=5), now=FIXED_NOW) == "in 5h"
+
+
+def test_humanize_until_hours_and_minutes() -> None:
+    assert (
+        output.humanize_until(FIXED_NOW + timedelta(hours=3, minutes=20), now=FIXED_NOW)
+        == "in 3h 20m"
+    )
+
+
+def test_humanize_until_days() -> None:
+    assert output.humanize_until(FIXED_NOW + timedelta(days=2, hours=3), now=FIXED_NOW) == "in 2d"
+
+
+def test_humanize_until_naive_target_coerced_utc() -> None:
+    naive = (FIXED_NOW + timedelta(minutes=10)).replace(tzinfo=None)
+    assert output.humanize_until(naive, now=FIXED_NOW) == "in 10m"
+
+
+# ---------------------------------------------------------------------------
+# _pct_cell + _render_extra_usage
+# ---------------------------------------------------------------------------
+
+
+def test_pct_cell_thresholds() -> None:
+    assert output._pct_cell(None) == "—"
+    assert output._pct_cell(10) == "10%"
+    assert "yellow" in output._pct_cell(80)
+    assert "red" in output._pct_cell(100)
+
+
+def test_render_extra_usage_none_is_dash() -> None:
+    assert output._render_extra_usage(None) == "—"
+
+
+def test_render_extra_usage_disabled() -> None:
+    from claude_lb.models import ExtraUsage
+    assert output._render_extra_usage(ExtraUsage(is_enabled=False)) == "off"
+
+
+def test_render_extra_usage_enabled_with_utilisation_and_currency() -> None:
+    from claude_lb.models import ExtraUsage
+    extra = ExtraUsage(is_enabled=True, utilization=45, currency="AUD")
+    rendered = output._render_extra_usage(extra)
+    assert "45%" in rendered
+    assert "AUD" in rendered
+
+
+def test_render_extra_usage_exhausted_is_red() -> None:
+    from claude_lb.models import ExtraUsage
+    extra = ExtraUsage(is_enabled=True, utilization=100, currency="USD")
+    rendered = output._render_extra_usage(extra)
+    assert "red" in rendered
+
+
+# ---------------------------------------------------------------------------
+# render_status_table — per-model & extra_usage columns only appear when data present
+# ---------------------------------------------------------------------------
+
+
+def test_render_status_table_drops_optional_columns_when_absent() -> None:
+    """No entry has sonnet/opus/extra → those columns should not be rendered.
+    We assert via render not crashing; colum-count is a Rich internal we don't check."""
+    entries = [_entry("a", Health.OK, usage=None)]
+    output.render_status_table(entries)
+
+
+def test_render_status_table_with_extra_usage_does_not_crash() -> None:
+    from claude_lb.models import ExtraUsage, Usage
+
+    entries = [
+        _entry(
+            "a",
+            Health.OK,
+            usage=Usage(
+                session_pct=30,
+                weekly_pct=10,
+                sonnet_pct=5,
+                opus_pct=2,
+                extra=ExtraUsage(
+                    is_enabled=True, utilization=75, currency="AUD",
+                    monthly_limit=100.0, used_credits=75.0,
+                ),
+            ),
+        ),
+    ]
+    output.render_status_table(entries)
+
+
+# ---------------------------------------------------------------------------
 # Health style
 # ---------------------------------------------------------------------------
 

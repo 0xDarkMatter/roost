@@ -219,3 +219,41 @@ def probe_many_sync(
 ) -> list[ProfileHealth]:
     """Blocking wrapper around probe_many(). Convenient for CLI callers."""
     return asyncio.run(probe_many(profiles, prev_health=prev_health, timeout=timeout))
+
+
+async def probe_raw_many(
+    profiles: list[Profile],
+    *,
+    timeout: float = DEFAULT_TIMEOUT_S,
+) -> list[tuple[str, int | None, dict[str, Any] | None, dict[str, str]]]:
+    """Diagnostic: return raw (name, status_code, body, headers) tuples.
+
+    Bypasses classification + caching. Intended for `claude-lb probe --raw`
+    to help capture unknown response shapes during development, or to inspect
+    what Anthropic is currently returning when a user reports weird behaviour.
+    """
+    if not profiles:
+        return []
+    out: list[tuple[str, int | None, dict[str, Any] | None, dict[str, str]]] = []
+    async with httpx.AsyncClient() as client:
+        tasks = [_probe_once(client, p, timeout) for p in profiles]
+        pairs = await asyncio.gather(*tasks, return_exceptions=False)
+    for profile, (probe, _latency) in zip(profiles, pairs):
+        out.append(
+            (
+                profile.name,
+                probe.status_code,
+                probe.body,
+                probe.headers or {},
+            )
+        )
+    return out
+
+
+def probe_raw_many_sync(
+    profiles: list[Profile],
+    *,
+    timeout: float = DEFAULT_TIMEOUT_S,
+) -> list[tuple[str, int | None, dict[str, Any] | None, dict[str, str]]]:
+    """Blocking wrapper around probe_raw_many()."""
+    return asyncio.run(probe_raw_many(profiles, timeout=timeout))

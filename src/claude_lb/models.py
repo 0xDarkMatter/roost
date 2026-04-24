@@ -48,10 +48,30 @@ class ErrorInfo(BaseModel):
     message: str = ""
 
 
+class ExtraUsage(BaseModel):
+    """Monthly overage quota from `/api/oauth/usage` (extra_usage block).
+
+    Anthropic Max plans support pay-as-you-go overage when the weekly window
+    is exhausted. `is_enabled` indicates the account has overage turned on;
+    `utilization >= 100` means the monthly overage budget itself is spent
+    (the account falls back to the hard weekly/session caps).
+    """
+
+    is_enabled: bool = False
+    monthly_limit: float | None = None
+    used_credits: float | None = None
+    utilization: int | None = None
+    currency: str | None = None
+
+    @property
+    def is_exhausted(self) -> bool:
+        return self.utilization is not None and self.utilization >= 100
+
+
 class Usage(BaseModel):
     """Usage percentages sourced from /api/oauth/usage (SPEC §7).
 
-    All fields are 0-100 integers, rounded from the upstream float.
+    Window percentages are 0-100 integers, rounded from the upstream float.
     `None` means the corresponding window was absent or the probe could not
     read it (e.g. 403 scope-missing fallback).
     """
@@ -60,6 +80,7 @@ class Usage(BaseModel):
     weekly_pct: int | None = None
     sonnet_pct: int | None = None
     opus_pct: int | None = None
+    extra: ExtraUsage | None = None
 
 
 class ProfileHealth(BaseModel):

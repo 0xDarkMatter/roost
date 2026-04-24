@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 
 from . import __version__
 from .models import Profile
@@ -33,6 +35,18 @@ TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code public OAuth client
 ANTHROPIC_BETA = "oauth-2025-04-20"
 DEFAULT_TIMEOUT_S = 10.0
+DEFAULT_LOCK_TIMEOUT_S = 30.0
+
+
+def _lock_path(credentials_path: Path) -> Path:
+    """Sibling lock file next to the credentials file.
+
+    `str(path) + ".lock"` preserves the `.credentials.json.lock` tail so it
+    is visually obvious what the lock protects. Two profile names pointing
+    at the same credentials file serialize correctly because the lock is
+    keyed on the physical file, not the profile name.
+    """
+    return Path(str(credentials_path) + ".lock")
 
 
 @dataclass
@@ -160,100 +174,132 @@ async def refresh_profile(
     profile: Profile,
     *,
     timeout: float = DEFAULT_TIMEOUT_S,
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_S,
     client: httpx.AsyncClient | None = None,
 ) -> RefreshResult:
-    """Refresh one profile's OAuth token. Rewrites .credentials.json on success."""
+    """Refresh one profile's OAuth token. Rewrites .credentials.json on success.
+
+    Acquires a per-profile file lock (sibling `.credentials.json.lock`) before
+    reading the refresh token, so two parallel `claude-lb refresh` invocations
+    against the same profile serialize. Parallel refreshes of DIFFERENT
+    profiles still fan out concurrently — each profile has its own lock file.
+    """
     path = Path(profile.credentials_path)
-    payload = _read_credentials(path)
-    if payload is None:
+    lock_file = _lock_path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    # Acquire the lock in a thread so it doesn't stall the asyncio event loop.
+    lock = FileLock(str(lock_file), timeout=lock_timeout)
+    try:
+        await asyncio.to_thread(lock.acquire)
+    except FileLockTimeout:
         return RefreshResult(
             name=profile.name,
             refreshed=False,
             previous_expires_at=profile.access_token_expires_at,
-            error_code="UNREADABLE",
-            error_message=f"Could not read {path}",
-        )
-    rt = _extract_refresh_token(payload)
-    if rt is None:
-        return RefreshResult(
-            name=profile.name,
-            refreshed=False,
-            previous_expires_at=profile.access_token_expires_at,
-            error_code="NO_REFRESH_TOKEN",
-            error_message="No refresh token stored; run `claude login`",
+            error_code="LOCK_HELD",
+            error_message=(
+                f"Another process is refreshing {profile.name} "
+                f"(lock held > {lock_timeout:.0f}s at {lock_file})"
+            ),
         )
 
-    owns_client = client is None
-    if client is None:
-        client = httpx.AsyncClient()
     try:
-        status, body, raw = await _post_refresh(client, rt, timeout)
+        payload = _read_credentials(path)
+        if payload is None:
+            return RefreshResult(
+                name=profile.name,
+                refreshed=False,
+                previous_expires_at=profile.access_token_expires_at,
+                error_code="UNREADABLE",
+                error_message=f"Could not read {path}",
+            )
+        rt = _extract_refresh_token(payload)
+        if rt is None:
+            return RefreshResult(
+                name=profile.name,
+                refreshed=False,
+                previous_expires_at=profile.access_token_expires_at,
+                error_code="NO_REFRESH_TOKEN",
+                error_message="No refresh token stored; run `claude login`",
+            )
+
+        owns_client = client is None
+        if client is None:
+            client = httpx.AsyncClient()
+        try:
+            status, body, raw = await _post_refresh(client, rt, timeout)
+        finally:
+            if owns_client:
+                await client.aclose()
+
+        if status == 0:
+            return RefreshResult(
+                name=profile.name,
+                refreshed=False,
+                previous_expires_at=profile.access_token_expires_at,
+                error_code="NETWORK_ERROR",
+                error_message=raw or "network error",
+            )
+        if status == 401 or status == 400:
+            err = (body or {}).get("error") if isinstance(body, dict) else None
+            msg = ""
+            if isinstance(err, dict):
+                msg = str(err.get("message") or err.get("type") or "")
+            elif isinstance(err, str):
+                msg = err
+            return RefreshResult(
+                name=profile.name,
+                refreshed=False,
+                previous_expires_at=profile.access_token_expires_at,
+                error_code="REFRESH_REJECTED",
+                error_message=msg or f"HTTP {status}: refresh token rejected — run `claude login`",
+            )
+        if status != 200 or body is None:
+            return RefreshResult(
+                name=profile.name,
+                refreshed=False,
+                previous_expires_at=profile.access_token_expires_at,
+                error_code="UNEXPECTED_RESPONSE",
+                error_message=f"HTTP {status}",
+            )
+
+        # A 200 without an access_token means the server said "success" but
+        # gave us nothing to rotate. Treat as UNEXPECTED_RESPONSE rather than
+        # "success but no-op" — callers would think they refreshed.
+        access = body.get("access_token")
+        if not isinstance(access, str) or not access:
+            return RefreshResult(
+                name=profile.name,
+                refreshed=False,
+                previous_expires_at=profile.access_token_expires_at,
+                error_code="UNEXPECTED_RESPONSE",
+                error_message="200 OK but response omitted access_token",
+            )
+
+        new_payload, new_expires = _apply_token_response(payload, body)
+        try:
+            _atomic_write_credentials(path, new_payload)
+        except OSError as exc:
+            return RefreshResult(
+                name=profile.name,
+                refreshed=False,
+                previous_expires_at=profile.access_token_expires_at,
+                error_code="WRITE_FAILED",
+                error_message=str(exc),
+            )
+
+        return RefreshResult(
+            name=profile.name,
+            refreshed=True,
+            previous_expires_at=profile.access_token_expires_at,
+            new_expires_at=new_expires,
+        )
     finally:
-        if owns_client:
-            await client.aclose()
-
-    if status == 0:
-        return RefreshResult(
-            name=profile.name,
-            refreshed=False,
-            previous_expires_at=profile.access_token_expires_at,
-            error_code="NETWORK_ERROR",
-            error_message=raw or "network error",
-        )
-    if status == 401 or status == 400:
-        err = (body or {}).get("error") if isinstance(body, dict) else None
-        msg = ""
-        if isinstance(err, dict):
-            msg = str(err.get("message") or err.get("type") or "")
-        elif isinstance(err, str):
-            msg = err
-        return RefreshResult(
-            name=profile.name,
-            refreshed=False,
-            previous_expires_at=profile.access_token_expires_at,
-            error_code="REFRESH_REJECTED",
-            error_message=msg or f"HTTP {status}: refresh token rejected — run `claude login`",
-        )
-    if status != 200 or body is None:
-        return RefreshResult(
-            name=profile.name,
-            refreshed=False,
-            previous_expires_at=profile.access_token_expires_at,
-            error_code="UNEXPECTED_RESPONSE",
-            error_message=f"HTTP {status}",
-        )
-
-    # A 200 without an access_token means the server said "success" but gave
-    # us nothing to rotate. Treat as UNEXPECTED_RESPONSE rather than "success
-    # but no-op" — otherwise callers think they refreshed when they didn't.
-    access = body.get("access_token")
-    if not isinstance(access, str) or not access:
-        return RefreshResult(
-            name=profile.name,
-            refreshed=False,
-            previous_expires_at=profile.access_token_expires_at,
-            error_code="UNEXPECTED_RESPONSE",
-            error_message="200 OK but response omitted access_token",
-        )
-
-    new_payload, new_expires = _apply_token_response(payload, body)
-    try:
-        _atomic_write_credentials(path, new_payload)
-    except OSError as exc:
-        return RefreshResult(
-            name=profile.name,
-            refreshed=False,
-            previous_expires_at=profile.access_token_expires_at,
-            error_code="WRITE_FAILED",
-            error_message=str(exc),
-        )
-
-    return RefreshResult(
-        name=profile.name,
-        refreshed=True,
-        previous_expires_at=profile.access_token_expires_at,
-        new_expires_at=new_expires,
-    )
+        await asyncio.to_thread(lock.release)
 
 
 async def refresh_many(

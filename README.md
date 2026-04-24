@@ -3,7 +3,7 @@
 [![Forma](https://img.shields.io/badge/forma-experimental-orange.svg)](https://github.com/forma-tools/forma)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](CHANGELOG.md)
 
 > Pick the healthiest Claude Code Max profile — health taxonomy + load balancer for local OAuth profiles.
 
@@ -69,6 +69,7 @@ claude-lb pick --strategy weighted       # Combine weekly + session usage
 claude-lb pick --require-ok              # Exit 5 if none are ok
 claude-lb pick --export                  # Shell-sourceable VAR=value
 claude-lb pick --json                    # {data: {name, health, rationale}}
+claude-lb pick --warn-at 80              # Stderr warning when session/weekly ≥80%
 ```
 
 ### Refresh
@@ -99,6 +100,16 @@ case $? in
   9) echo "All profiles exhausted — operator intervention required" ;;
 esac
 ```
+
+### Diagnostics
+
+```bash
+claude-lb probe --raw                    # Dump untouched /api/oauth/usage body
+claude-lb probe --raw --json             # Machine-readable raw dump
+```
+
+`--raw` bypasses classification and the cache write; useful for inspecting
+unknown fields Anthropic might add, or for capturing test fixtures.
 
 ## Health Taxonomy
 
@@ -141,6 +152,7 @@ Stickiness window: `--stickiness <s>` or `CLAUDE_LB_STICKINESS=<s>`. Set to `0` 
 | 4 | `VALIDATION` — bad flag (e.g. unknown strategy, or `refresh` with no args) |
 | 5 | `FORBIDDEN` — `--require-ok` but no profile is `ok` |
 | 6 | `RATE_LIMITED` — all profiles throttled |
+| 7 | `CONFLICT` — `refresh` lost a lock race; another process is refreshing |
 | 8 | `TIMEOUT` |
 | 9 | `UNAVAILABLE` — no profiles, or all terminal-bad |
 
@@ -185,7 +197,35 @@ Cache writes are atomic (tempfile + `os.replace`). A credentials file's
   (populated by `claude login --profile <name>`)
 - Outbound HTTPS access to `api.anthropic.com`
 
+## Monthly Overage
+
+Anthropic Max plans support pay-as-you-go overage when the weekly window is
+exhausted. `claude-lb` surfaces it via `usage.extra` on every probe:
+
+```json
+"extra": {
+  "is_enabled": true,
+  "monthly_limit": 31000,
+  "used_credits": 31280.0,
+  "utilization": 100,
+  "currency": "AUD"
+}
+```
+
+`utilization ≥ 100` means the monthly overage budget is spent — the account
+still works but falls back to the hard weekly/session caps until the next
+month. The status table shows an **Overage** column (colour-coded) when any
+profile has overage enabled.
+
 ## Recent Changes
+
+### v0.4.0 (2026-04-24)
+
+- `usage.extra` — monthly overage surfaced (credits used, budget, currency, utilisation)
+- `refresh` concurrent-write race closed with per-profile `filelock` + `EXIT_CONFLICT=7`
+- `pick --warn-at <pct>` — non-fatal stderr warning when a chosen profile is running hot
+- `probe --raw` — dump the literal `/api/oauth/usage` response body for diagnostics
+- Status table adds Session / Sonnet / Opus / Overage columns (conditional) and `"resets in 37m"` formatting
 
 ### v0.3.0 (2026-04-24)
 

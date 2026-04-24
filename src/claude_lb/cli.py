@@ -53,8 +53,19 @@ EXIT_NOT_FOUND = 3
 EXIT_VALIDATION = 4
 EXIT_FORBIDDEN = 5
 EXIT_RATE_LIMITED = 6
+EXIT_CONFLICT = 7
 EXIT_TIMEOUT = 8
 EXIT_UNAVAILABLE = 9
+
+REFRESH_ERROR_TO_EXIT: dict[str, int] = {
+    "UNREADABLE": EXIT_NOT_FOUND,
+    "NO_REFRESH_TOKEN": EXIT_AUTH_REQUIRED,
+    "NETWORK_ERROR": EXIT_UNAVAILABLE,
+    "REFRESH_REJECTED": EXIT_AUTH_REQUIRED,
+    "UNEXPECTED_RESPONSE": EXIT_ERROR,
+    "WRITE_FAILED": EXIT_ERROR,
+    "LOCK_HELD": EXIT_CONFLICT,
+}
 
 REASON_TO_EXIT: dict[PickFailureReason, int] = {
     PickFailureReason.NO_PROFILES: EXIT_UNAVAILABLE,
@@ -242,6 +253,16 @@ def profiles_probe(
         typer.Argument(help="Probe only this profile (default: all)."),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
+    raw: Annotated[
+        bool,
+        typer.Option(
+            "--raw",
+            help=(
+                "Emit the untouched /api/oauth/usage response body for each "
+                "probed profile to stdout. Diagnostic only — does not update cache."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Live-probe profile(s) and update cache."""
     profiles = discover_profiles()
@@ -262,6 +283,26 @@ def profiles_probe(
     else:
         targets = profiles
 
+    if raw:
+        # Diagnostic mode: dump raw response bodies, skip classification + cache write.
+        from .probe import probe_raw_many_sync
+
+        raw_results = probe_raw_many_sync(targets)
+        payload = {
+            "data": [
+                {
+                    "name": name,
+                    "status_code": status,
+                    "body": body,
+                    "headers": headers,
+                }
+                for name, status, body, headers in raw_results
+            ],
+            "meta": {"count": len(raw_results)},
+        }
+        emit_json(payload)
+        return
+
     cache = load_cache()
     prev = {p.name: cache.profiles[p.name].health for p in targets if p.name in cache.profiles}
     results = probe_many_sync(targets, prev_health=prev)
@@ -280,9 +321,10 @@ def profiles_probe(
 def top_probe(
     name: Annotated[str | None, typer.Argument()] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
+    raw: Annotated[bool, typer.Option("--raw")] = False,
 ) -> None:
     """Alias for `profiles probe`."""
-    profiles_probe(name=name, json_output=json_output)
+    profiles_probe(name=name, json_output=json_output, raw=raw)
 
 
 # ---------------------------------------------------------------------------
@@ -438,9 +480,22 @@ def profiles_pick(
     json_output: Annotated[bool, typer.Option("--json")] = False,
     no_cache: Annotated[bool, typer.Option("--no-cache")] = False,
     max_age: Annotated[int | None, typer.Option("--max-age")] = None,
+    warn_at: Annotated[
+        int | None,
+        typer.Option(
+            "--warn-at",
+            help=(
+                "If the chosen profile's session OR weekly utilisation is >= N%%, "
+                "print a warning to stderr. Exit code is still 0."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Pick the best healthy profile for scripting."""
     chosen_strategy = _validate_strategy(strategy)
+    if warn_at is not None and not (0 <= warn_at <= 100):
+        stderr.print(f"[red]--warn-at must be between 0 and 100, got:[/red] {warn_at}")
+        raise typer.Exit(EXIT_VALIDATION)
     cache, names = _load_or_probe(refresh=no_cache, max_age=max_age)
 
     outcome = pick(
@@ -478,6 +533,19 @@ def profiles_pick(
     write_last_pick(chosen.name)
     append_pick_log(chosen.name, outcome.strategy_used or chosen_strategy, score)
 
+    # --warn-at: non-fatal stderr hint if utilisation exceeds threshold.
+    if warn_at is not None and chosen.usage is not None:
+        hot_pcts: list[tuple[str, int]] = []
+        if chosen.usage.session_pct is not None and chosen.usage.session_pct >= warn_at:
+            hot_pcts.append(("session", chosen.usage.session_pct))
+        if chosen.usage.weekly_pct is not None and chosen.usage.weekly_pct >= warn_at:
+            hot_pcts.append(("weekly", chosen.usage.weekly_pct))
+        if hot_pcts:
+            parts = ", ".join(f"{label} {pct}%" for label, pct in hot_pcts)
+            stderr.print(
+                f"[yellow]warn:[/yellow] {chosen.name} {parts} (>= {warn_at}% threshold)"
+            )
+
     if json_output:
         emit_json({
             "data": {
@@ -505,6 +573,7 @@ def top_pick(
     json_output: Annotated[bool, typer.Option("--json")] = False,
     no_cache: Annotated[bool, typer.Option("--no-cache")] = False,
     max_age: Annotated[int | None, typer.Option("--max-age")] = None,
+    warn_at: Annotated[int | None, typer.Option("--warn-at")] = None,
 ) -> None:
     """Alias for `profiles pick`."""
     profiles_pick(
@@ -516,6 +585,7 @@ def top_pick(
         json_output=json_output,
         no_cache=no_cache,
         max_age=max_age,
+        warn_at=warn_at,
     )
 
 
@@ -690,8 +760,20 @@ def _run_refresh(
             )
 
     if failed_count and not refreshed_count:
-        raise typer.Exit(EXIT_AUTH_REQUIRED)
+        # Pick the most specific exit code across the failures. LOCK_HELD
+        # beats anything else (operator may just need to retry), then
+        # AUTH_REQUIRED for refresh/dead errors, then generic ERROR.
+        failed_codes = [r.error_code for r in results if not r.refreshed]
+        if any(c == "LOCK_HELD" for c in failed_codes):
+            raise typer.Exit(EXIT_CONFLICT)
+        mapped = [REFRESH_ERROR_TO_EXIT.get(c or "", EXIT_ERROR) for c in failed_codes]
+        raise typer.Exit(max(mapped) if mapped else EXIT_ERROR)
     if failed_count:
+        # Some succeeded, some failed. Still exit non-zero but make LOCK_HELD
+        # observable so scripts can retry just the conflicted ones.
+        failed_codes = [r.error_code for r in results if not r.refreshed]
+        if any(c == "LOCK_HELD" for c in failed_codes):
+            raise typer.Exit(EXIT_CONFLICT)
         raise typer.Exit(EXIT_ERROR)
 
 

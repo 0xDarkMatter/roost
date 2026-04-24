@@ -64,7 +64,7 @@ def test_version() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert "claude-lb" in result.stdout
-    assert "0.3.0" in result.stdout
+    assert "0.4.0" in result.stdout
 
 
 def test_help_exits_zero() -> None:
@@ -247,6 +247,61 @@ def test_pick_bad_strategy_returns_validation(profile_factory) -> None:
     assert result.exit_code == 4  # VALIDATION
 
 
+def test_pick_warn_at_out_of_range_rejected(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["pick", "--warn-at", "150"])
+    assert result.exit_code == 4  # VALIDATION
+
+
+def _stub_probe_with_usage(session_pct: int, weekly_pct: int):
+    """Build a probe_many_sync stub that returns entries with explicit usage."""
+    from datetime import datetime
+
+    from claude_lb.models import Usage
+
+    def _stub(profiles, *, prev_health=None, timeout=10.0):
+        now = datetime.now(UTC)
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.OK,
+                probed_at=now,
+                usage=Usage(session_pct=session_pct, weekly_pct=weekly_pct),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    return _stub
+
+
+def test_pick_warn_at_below_threshold_no_warning(profile_factory) -> None:
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_with_usage(30, 20)):
+        result = runner.invoke(app, ["pick", "--warn-at", "80"])
+    assert result.exit_code == 0
+    assert "warn" not in result.stderr.lower()
+
+
+def test_pick_warn_at_above_threshold_emits_warning(profile_factory) -> None:
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_with_usage(85, 20)):
+        result = runner.invoke(app, ["pick", "--warn-at", "80"])
+    assert result.exit_code == 0  # still succeeds
+    assert "warn" in result.stderr.lower()
+    assert "85%" in result.stderr
+    assert "account-a" in result.stdout  # pick still emitted to stdout
+
+
+def test_pick_warn_at_weekly_also_triggers(profile_factory) -> None:
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_with_usage(10, 95)):
+        result = runner.invoke(app, ["pick", "--warn-at", "90"])
+    assert result.exit_code == 0
+    assert "weekly" in result.stderr.lower()
+    assert "95%" in result.stderr
+
+
 # ---------------------------------------------------------------------------
 # status with stubbed probe
 # ---------------------------------------------------------------------------
@@ -279,6 +334,30 @@ def test_probe_named_profile(profile_factory) -> None:
     with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
         result = runner.invoke(app, ["probe", "account-a", "--json"])
     assert result.exit_code == 0
+
+
+def test_probe_raw_dumps_untouched_body(profile_factory) -> None:
+    """--raw bypasses classification and emits the literal upstream body."""
+    fake_body = {"five_hour": {"utilization": 77.0}, "extra_usage": {"is_enabled": True}}
+
+    def _stub_raw(profiles, *, timeout=10.0):
+        return [(p.name, 200, fake_body, {"x-test": "1"}) for p in profiles]
+
+    from claude_lb import probe as probe_mod
+
+    profile_factory("account-a")
+    with patch.object(probe_mod, "probe_raw_many_sync", _stub_raw):
+        result = runner.invoke(app, ["probe", "--raw"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 1
+    row = payload["data"][0]
+    assert row["name"] == "account-a"
+    assert row["status_code"] == 200
+    # Full body passed through untouched
+    assert row["body"]["five_hour"]["utilization"] == 77.0
+    assert row["body"]["extra_usage"]["is_enabled"] is True
+    assert row["headers"]["x-test"] == "1"
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-24
+
+### Added
+
+- **`extra_usage` block on every probe** — monthly overage quota tracking from
+  `/api/oauth/usage`. `usage.extra` on `ProfileHealth` exposes `is_enabled`,
+  `monthly_limit`, `used_credits`, `utilization`, `currency`. Surfaces as an
+  "Overage" column in the status table (colour-coded; red at ≥100%).
+- **Per-profile file lock on refresh** — `<credentials-path>.lock` (via
+  [`filelock`](https://pypi.org/project/filelock/)). Two parallel
+  `claude-lb refresh` invocations against the same profile now serialize
+  instead of racing; refreshes of *different* profiles still run concurrently.
+- **`LOCK_HELD` refresh error** → exit code `7` (`EXIT_CONFLICT`, Forma §5).
+- **`claude-lb pick --warn-at <pct>`** — print a non-fatal warning to stderr
+  when the chosen profile's session or weekly utilisation is ≥ N%. Exit code
+  remains 0; stdout still just emits the profile name, so scripts are
+  unaffected.
+- **`claude-lb probe --raw`** — dump the untouched `/api/oauth/usage`
+  response body per profile to stdout. Diagnostic only (no cache write);
+  useful for capturing fixtures or inspecting unknown fields.
+- **Richer status table** — new columns for Session %, Sonnet %, Opus %
+  (only rendered when at least one profile has the data), human "Resets in
+  37m" column replacing the raw timestamp, and colour coding at ≥80 / ≥100%.
+- `output.humanize_until()` public helper for formatting future timestamps.
+
+### Changed
+
+- Status table column order: `Profile · Health · Session · Weekly · [Sonnet]
+  · [Opus] · [Overage] · Resets in · Probed`. Columns in brackets are
+  conditional on data presence to keep narrow-terminal output readable.
+
+### Fixed
+
+- Refresh no longer reports success when Anthropic returns HTTP 200 with a
+  body that omits `access_token`; classifies as `UNEXPECTED_RESPONSE` so the
+  credentials file is not rewritten with unchanged tokens. (Carried from the
+  0.3.1 fix on `main`; consolidated into this minor bump.)
+
 ## [0.3.0] - 2026-04-24
 
 ### Added

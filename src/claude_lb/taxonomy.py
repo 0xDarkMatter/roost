@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .models import ClassificationResult, ErrorInfo, Health, Usage
+from .models import ClassificationResult, ErrorInfo, ExtraUsage, Health, Usage
 
 
 @dataclass
@@ -104,6 +104,26 @@ def _window(body: dict[str, Any] | None, key: str) -> dict[str, Any] | None:
     return window if isinstance(window, dict) else None
 
 
+def _build_extra_usage(body: dict[str, Any] | None) -> ExtraUsage | None:
+    """Extract the `extra_usage` block (monthly overage credits) if present.
+
+    Returns None when the field is absent or not a dict; otherwise an
+    ExtraUsage with whatever fields were populated.
+    """
+    extra = _window(body, "extra_usage")
+    if extra is None:
+        return None
+    monthly_limit = extra.get("monthly_limit")
+    used_credits = extra.get("used_credits")
+    return ExtraUsage(
+        is_enabled=bool(extra.get("is_enabled", False)),
+        monthly_limit=float(monthly_limit) if isinstance(monthly_limit, (int, float)) else None,
+        used_credits=float(used_credits) if isinstance(used_credits, (int, float)) else None,
+        utilization=_utilization_to_pct(extra.get("utilization")),
+        currency=str(extra["currency"]) if isinstance(extra.get("currency"), str) else None,
+    )
+
+
 def _build_usage(body: dict[str, Any] | None) -> Usage:
     """Assemble a Usage model from the /api/oauth/usage response body."""
     five_hour = _window(body, "five_hour") or {}
@@ -115,6 +135,7 @@ def _build_usage(body: dict[str, Any] | None) -> Usage:
         weekly_pct=_utilization_to_pct(seven_day.get("utilization")),
         sonnet_pct=_utilization_to_pct(sonnet.get("utilization")),
         opus_pct=_utilization_to_pct(opus.get("utilization")),
+        extra=_build_extra_usage(body),
     )
 
 

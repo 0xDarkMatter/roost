@@ -74,6 +74,33 @@ def _humanize_age(delta_seconds: float) -> str:
     return f"{int(delta_seconds / 86400)}d ago"
 
 
+def humanize_until(target: datetime | None, now: datetime | None = None) -> str:
+    """Format a future timestamp as 'in Xm' / 'in Xh Ym' / 'in Xd'.
+
+    Callers get a short, scannable string suitable for terminal columns.
+    Past timestamps return 'now' (reset is already available). None returns '—'.
+    """
+    if target is None:
+        return "—"
+    current = now or datetime.now(UTC)
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    delta = (target - current).total_seconds()
+    if delta <= 0:
+        return "now"
+    if delta < 60:
+        return f"in {int(delta)}s"
+    if delta < 3600:
+        return f"in {int(delta / 60)}m"
+    if delta < 48 * 3600:
+        hours = int(delta / 3600)
+        minutes = int((delta - hours * 3600) / 60)
+        return f"in {hours}h {minutes}m" if minutes else f"in {hours}h"
+    return f"in {int(delta / 86400)}d"
+
+
 def _health_style(health: str) -> str:
     return {
         "ok": "green",
@@ -87,48 +114,121 @@ def _health_style(health: str) -> str:
     }.get(health, "white")
 
 
+def _pct_cell(pct: int | None, threshold_high: int = 100) -> str:
+    """Render a utilisation percent with colour coding."""
+    if pct is None:
+        return "—"
+    if pct >= threshold_high:
+        return f"[red]{pct}%[/red]"
+    if pct >= 80:
+        return f"[yellow]{pct}%[/yellow]"
+    return f"{pct}%"
+
+
+def _render_extra_usage(extra: object) -> str:
+    """Render the extra_usage (monthly overage) column."""
+    if extra is None:
+        return "—"
+    # Avoid importing ExtraUsage here — duck-type the fields we need.
+    is_enabled = getattr(extra, "is_enabled", False)
+    utilization = getattr(extra, "utilization", None)
+    currency = getattr(extra, "currency", None)
+    if not is_enabled:
+        return "off"
+    if utilization is None:
+        return "on"
+    label = f"{utilization}%"
+    if currency:
+        label += f" {currency}"
+    if utilization >= 100:
+        return f"[red]{label}[/red]"
+    if utilization >= 80:
+        return f"[yellow]{label}[/yellow]"
+    return label
+
+
 def render_status_table(entries: list[ProfileHealth]) -> None:
-    """Render the status table to stderr."""
+    """Render the status table to stderr.
+
+    Columns: Profile · Health · Session% · Weekly% · Sonnet% · Opus% · Overage · Resets in · Probed.
+
+    Per-model columns (Sonnet/Opus) are dropped when no entry has the data,
+    keeping the table compact for typical use.
+    """
     if not entries:
         stderr.print("[yellow]No profiles discovered.[/yellow]")
         return
     now = datetime.now(UTC)
+
+    # Optional columns: only show if at least one entry has the data.
+    has_sonnet = any(e.usage and e.usage.sonnet_pct is not None for e in entries)
+    has_opus = any(e.usage and e.usage.opus_pct is not None for e in entries)
+    has_extra = any(e.usage and e.usage.extra is not None for e in entries)
+
     table = Table(title="claude-lb profiles", show_lines=False)
     table.add_column("Profile", style="bold")
     table.add_column("Health")
-    table.add_column("Retry / Reset")
-    table.add_column("Weekly")
+    table.add_column("Session", justify="right")
+    table.add_column("Weekly", justify="right")
+    if has_sonnet:
+        table.add_column("Sonnet", justify="right")
+    if has_opus:
+        table.add_column("Opus", justify="right")
+    if has_extra:
+        table.add_column("Overage", justify="right")
+    table.add_column("Resets in")
     table.add_column("Probed")
+
     for e in entries:
         health_str = e.health.value
         style = _health_style(health_str)
-        retry = "—"
-        if e.retry_after_s:
-            retry = f"{e.retry_after_s}s"
-        elif e.session_reset_at:
-            retry = e.session_reset_at.strftime("%Y-%m-%d %H:%M UTC")
-        elif e.weekly_reset_at:
-            retry = e.weekly_reset_at.strftime("%Y-%m-%d %H:%M UTC")
-        elif e.health.value == "auth_expired":
-            retry = f"claude-lb refresh {e.name}"
-        elif e.health.value == "auth_dead":
-            retry = "claude login"
-        weekly = (
-            f"{e.usage.weekly_pct}%"
-            if (e.usage and e.usage.weekly_pct is not None)
-            else "—"
+
+        # Session + weekly percent columns
+        session_cell = (
+            _pct_cell(e.usage.session_pct) if (e.usage and e.usage.session_pct is not None) else "—"
         )
+        weekly_cell = (
+            _pct_cell(e.usage.weekly_pct) if (e.usage and e.usage.weekly_pct is not None) else "—"
+        )
+
+        # Resets-in column: prefer session reset (more imminent), then weekly,
+        # then retry_after_s, then auth hints.
+        if e.retry_after_s is not None:
+            resets_cell = f"in {e.retry_after_s}s"
+        elif e.session_reset_at is not None:
+            resets_cell = humanize_until(e.session_reset_at, now)
+        elif e.weekly_reset_at is not None:
+            resets_cell = humanize_until(e.weekly_reset_at, now)
+        elif e.health.value == "auth_expired":
+            resets_cell = f"claude-lb refresh {e.name}"
+        elif e.health.value == "auth_dead":
+            resets_cell = "claude login"
+        else:
+            resets_cell = "—"
+
         probed_at = e.probed_at
         if probed_at.tzinfo is None:
             probed_at = probed_at.replace(tzinfo=UTC)
         age = _humanize_age((now - probed_at).total_seconds())
-        table.add_row(
+
+        row: list[str] = [
             e.name,
             f"[{style}]{health_str}[/{style}]",
-            retry,
-            weekly,
-            age,
-        )
+            session_cell,
+            weekly_cell,
+        ]
+        if has_sonnet:
+            row.append(
+                _pct_cell(e.usage.sonnet_pct) if (e.usage and e.usage.sonnet_pct is not None) else "—"
+            )
+        if has_opus:
+            row.append(
+                _pct_cell(e.usage.opus_pct) if (e.usage and e.usage.opus_pct is not None) else "—"
+            )
+        if has_extra:
+            row.append(_render_extra_usage(e.usage.extra) if e.usage else "—")
+        row.extend([resets_cell, age])
+        table.add_row(*row)
     stderr.print(table)
 
 

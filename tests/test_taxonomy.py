@@ -47,6 +47,47 @@ def test_200_empty_body_still_ok() -> None:
     assert result.usage.session_pct is None
 
 
+def test_200_extracts_extra_usage_block() -> None:
+    body = load_json(USAGE_FIXTURES / "ok-with-extra-usage.json")
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.health is Health.OK
+    assert result.usage is not None
+    extra = result.usage.extra
+    assert extra is not None
+    assert extra.is_enabled is True
+    assert extra.monthly_limit == 31000.0
+    assert extra.used_credits == 31280.0
+    assert extra.utilization == 100
+    assert extra.currency == "AUD"
+    assert extra.is_exhausted is True
+
+
+def test_200_without_extra_usage_leaves_field_none() -> None:
+    body = {
+        "five_hour": {"utilization": 12.0},
+        "seven_day": {"utilization": 3.0},
+    }
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.usage is not None
+    assert result.usage.extra is None
+
+
+def test_extra_usage_with_non_dict_is_ignored() -> None:
+    body = {"five_hour": {"utilization": 10.0}, "extra_usage": "not a dict"}
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.usage is not None
+    assert result.usage.extra is None
+
+
+def test_extra_usage_is_enabled_false_keeps_exhaustion_false() -> None:
+    body = {"five_hour": {}, "extra_usage": {"is_enabled": False}}
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.usage is not None
+    assert result.usage.extra is not None
+    assert result.usage.extra.is_enabled is False
+    assert result.usage.extra.is_exhausted is False
+
+
 # ---------------------------------------------------------------------------
 # Utilization-based session / weekly limits (200 + >= 100%)
 # ---------------------------------------------------------------------------
