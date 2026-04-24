@@ -23,11 +23,16 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from filelock import FileLock
-from filelock import Timeout as FileLockTimeout
 
 from . import __version__
 from .models import Profile
+
+# `filelock` is imported lazily (inside refresh_profile) rather than at module
+# load so that a stale editable install — one where `pyproject.toml` declares
+# filelock but the tool venv hasn't been re-synced to pick it up — degrades
+# gracefully. Every other subcommand keeps working; only `refresh` fails,
+# and with a clean MISSING_DEPENDENCY message instead of a ModuleNotFoundError
+# traceback. See tests/test_refresh.py::test_refresh_missing_filelock_dependency.
 
 log = logging.getLogger(__name__)
 
@@ -184,6 +189,25 @@ async def refresh_profile(
     against the same profile serialize. Parallel refreshes of DIFFERENT
     profiles still fan out concurrently — each profile has its own lock file.
     """
+    # Lazy-import filelock here so that a stale install (pyproject declares
+    # the dep but tool venv hasn't been re-synced) fails with a clean
+    # RefreshResult instead of a ModuleNotFoundError traceback, and every
+    # other subcommand keeps working.
+    try:
+        from filelock import FileLock
+        from filelock import Timeout as FileLockTimeout
+    except ImportError as exc:
+        return RefreshResult(
+            name=profile.name,
+            refreshed=False,
+            previous_expires_at=profile.access_token_expires_at,
+            error_code="MISSING_DEPENDENCY",
+            error_message=(
+                f"refresh requires the `filelock` package ({exc}). "
+                f"Reinstall with: uv tool install --reinstall --editable <repo-path>"
+            ),
+        )
+
     path = Path(profile.credentials_path)
     lock_file = _lock_path(path)
     try:

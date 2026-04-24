@@ -66,6 +66,38 @@ def test_skip_network_omits_reachability_check(profile_factory) -> None:
     assert "anthropic_reachable" not in names
 
 
+def test_subcommand_imports_check_passes_on_healthy_install(profile_factory) -> None:
+    profile_factory("account-a")
+    report = doctor_mod.run_doctor(skip_network=True)
+    check = next(c for c in report.checks if c.name == "subcommand_imports")
+    assert check.passed is True
+    # At least the critical modules are verified
+    assert any(m in check.detail for m in ("refresh", "modules load"))
+
+
+def test_subcommand_imports_check_surfaces_failures(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulate a stale editable install by making one module's import fail."""
+    import builtins
+
+    profile_factory("account-a")
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "claude_lb.refresh":
+            raise ImportError("simulated stale install")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    report = doctor_mod.run_doctor(skip_network=True)
+    check = next(c for c in report.checks if c.name == "subcommand_imports")
+    assert check.passed is False
+    assert "refresh" in check.detail
+    assert "reinstall" in check.detail.lower()
+    assert report.all_passed is False
+
+
 def test_credentials_parseable_reports_token_source_distribution(profile_factory) -> None:
     profile_factory("account-a", shape="modern")
     profile_factory("legacy1", shape="legacy_oauth")

@@ -44,6 +44,42 @@ class DoctorReport:
         return all(c.passed for c in self.checks)
 
 
+def _check_subcommand_imports() -> CheckResult:
+    """Verify every subcommand module loads without ImportError.
+
+    Specifically catches the "stale editable install" failure mode: the
+    pyproject declares a dep that landed in a newer version, but the tool
+    venv hasn't been re-synced, so one subcommand crashes at load time
+    while every other command keeps working. Doctor surfaces this as a
+    fleet-wide problem instead of waiting for the user to trip over it.
+    """
+    checked = ["cache", "cli", "discovery", "models", "output", "paths",
+               "pick", "probe", "refresh", "taxonomy", "updater"]
+    failures: list[str] = []
+    for name in checked:
+        try:
+            __import__(f"claude_lb.{name}")
+        except Exception as exc:  # pragma: no cover - exercised via stale-install test
+            failures.append(f"{name}: {type(exc).__name__}: {exc}")
+    if failures:
+        return CheckResult(
+            name="subcommand_imports",
+            passed=False,
+            detail=(
+                "Stale install? Some subcommand modules failed to import. "
+                "Reinstall with: uv tool install --reinstall --editable <repo>. "
+                + " | ".join(failures)
+            ),
+            extra={"failures": failures},
+        )
+    return CheckResult(
+        name="subcommand_imports",
+        passed=True,
+        detail=f"{len(checked)} modules load cleanly",
+        extra={"checked": checked},
+    )
+
+
 def _check_config_dir_writable() -> CheckResult:
     d = config_dir()
     try:
@@ -189,6 +225,7 @@ def _check_anthropic_reachable(timeout_s: float = 3.0) -> CheckResult:
 def run_doctor(*, skip_network: bool = False) -> DoctorReport:
     """Run all diagnostic checks and return a structured report."""
     checks: list[CheckResult] = [
+        _check_subcommand_imports(),
         _check_config_dir_writable(),
         _check_profiles_discoverable(),
         _check_credentials_parseable(),

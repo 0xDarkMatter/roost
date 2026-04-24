@@ -261,6 +261,44 @@ async def test_refresh_releases_lock_on_rejection(
 
 
 @pytest.mark.asyncio
+async def test_refresh_missing_filelock_dependency(
+    tmp_path: Path,
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stale editable install: pyproject declares filelock but the tool venv
+    lacks it. refresh_profile must return MISSING_DEPENDENCY cleanly instead
+    of bubbling a ModuleNotFoundError traceback.
+
+    Simulates the failure by hiding `filelock` from the import machinery.
+    """
+    import builtins
+
+    cred = tmp_path / "account-a" / ".credentials.json"
+    _write_credentials(cred)
+
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "filelock":
+            raise ImportError("No module named 'filelock'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+    result = await refresh_profile(_profile(cred))
+    assert result.refreshed is False
+    assert result.error_code == "MISSING_DEPENDENCY"
+    assert "filelock" in (result.error_message or "")
+    assert "reinstall" in (result.error_message or "").lower()
+    # Credentials must be left untouched (we never got to the write step).
+    data = json.loads(cred.read_text())
+    assert data["claudeAiOauth"]["accessToken"] == "old-access"
+    # No network attempted.
+    assert not respx_mock.calls.called
+
+
+@pytest.mark.asyncio
 async def test_refresh_sends_client_id_and_beta_header(
     tmp_path: Path, respx_mock: respx.MockRouter
 ) -> None:

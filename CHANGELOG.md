@@ -5,12 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-04-25
+
+### Fixed
+
+- **`refresh` no longer crashes with `ModuleNotFoundError` on stale editable installs** ([pigeon#47 from Axiom](docs/findings.md)). `filelock` is now lazy-imported inside `refresh_profile`; if the tool venv is missing the dep (typical: `uv tool install` done at v0.3.0, `pyproject.toml` bumped to require filelock at v0.4.0, source drift picked up but venv not re-synced), refresh returns a clean `RefreshResult(error_code="MISSING_DEPENDENCY", ...)` with a concrete reinstall command instead of a traceback. Maps to `EXIT_ERROR`.
+
 ### Added
+
+- **`claude-lb doctor` verifies subcommand imports** — loads every `claude_lb.*` module and reports per-module ImportError. Catches stale-install drift *before* the user trips over it by running a failing subcommand.
+- **`claude-lb update --apply`** — actually performs the upgrade in-place (was previously status-only). Runs `git pull --ff-only` followed by `uv tool install --reinstall --editable <dir>`. `--no-pull` skips the git step and just re-syncs deps. Idempotent.
+- `MISSING_DEPENDENCY` refresh error code, mapped to the refresh → exit-code table.
+
+### Added (from [Unreleased] buffer)
 
 - **`Plan` column in the status table** — surfaces `claudeAiOauth.subscriptionType` (e.g. `max`, `team`, `pro`) from the credentials file. Only rendered when at least one profile has the data, so older credential shapes aren't affected.
 - `subscription_type` field on `Profile`, `ProfileHealth`, and `list`/`show`/`status` JSON payloads. Normalised to lowercase defensively.
 
-### Changed
+### Changed (from [Unreleased] buffer)
 
 - **Status table reset columns split** — a single `Resets (S/W)` cell with `S 34m · W 1d 4h` was hard to scan; now rendered as two right-justified columns `Session in` and `Weekly in` so durations line up vertically across profiles. Broken states (`auth_*`, `rate_limited`) place the remediation in `Session in` and leave `Weekly in` as `—`. The "in " prefix is stripped from cell values since it now lives in the column header.
 

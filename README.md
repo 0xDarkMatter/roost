@@ -3,7 +3,7 @@
 [![Forma](https://img.shields.io/badge/forma-experimental-orange.svg)](https://github.com/forma-tools/forma)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.1-blue.svg)](CHANGELOG.md)
 
 > Pick the healthiest Claude Code Max profile — health taxonomy + load balancer for local OAuth profiles.
 
@@ -174,6 +174,8 @@ claude-lb doctor --json          # Machine-readable
 
 claude-lb update                 # Version + git-upstream ahead/behind check
 claude-lb update --json          # meta.update_available tells you if behind
+claude-lb update --apply         # git pull --ff-only + uv tool install --reinstall --editable
+claude-lb update --apply --no-pull  # Just re-sync deps (useful when a new dep was added locally)
 ```
 
 ## Cache & Filesystem

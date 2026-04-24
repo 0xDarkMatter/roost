@@ -64,7 +64,7 @@ def test_version() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert "claude-lb" in result.stdout
-    assert "0.4.0" in result.stdout
+    assert "0.4.1" in result.stdout
 
 
 def test_help_exits_zero() -> None:

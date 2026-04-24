@@ -30,7 +30,7 @@ from .pick import (
     write_last_pick,
 )
 from .probe import probe_many_sync
-from .updater import check_for_update, status_to_dict
+from .updater import apply_result_to_dict, apply_update, check_for_update, status_to_dict
 
 app = typer.Typer(
     name="claude-lb",
@@ -65,6 +65,11 @@ REFRESH_ERROR_TO_EXIT: dict[str, int] = {
     "UNEXPECTED_RESPONSE": EXIT_ERROR,
     "WRITE_FAILED": EXIT_ERROR,
     "LOCK_HELD": EXIT_CONFLICT,
+    # Stale editable install: pyproject declares the dep but tool venv
+    # never got re-synced. Reusing EXIT_ERROR so scripts just see
+    # "something went wrong"; the error_message/error_code tells the user
+    # exactly how to fix it.
+    "MISSING_DEPENDENCY": EXIT_ERROR,
 }
 
 REASON_TO_EXIT: dict[PickFailureReason, int] = {
@@ -869,21 +874,54 @@ def doctor(
 
 @app.command("update")
 def update(
-    check_only: Annotated[
+    apply: Annotated[
         bool,
-        typer.Option("--check", help="Check for updates without applying."),
-    ] = True,  # check-only is the only supported mode in v0.1
+        typer.Option(
+            "--apply",
+            help=(
+                "Actually perform the upgrade in-place: `git pull --ff-only` "
+                "(if the install is a git working copy) then "
+                "`uv tool install --reinstall --editable <install-dir>`. "
+                "Without this flag, `update` only reports status."
+            ),
+        ),
+    ] = False,
+    no_pull: Annotated[
+        bool,
+        typer.Option(
+            "--no-pull",
+            help="With --apply, skip `git pull` and just re-sync deps.",
+        ),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    """Check whether a newer version is available upstream.
+    """Check for or apply an in-place upgrade.
 
-    v0.1 only supports `--check`. When an actual upgrade command is needed,
-    follow the printed upgrade hint (typically `git pull && uv tool install
-    --editable .`).
+    Default is status-only. Pass `--apply` to run `git pull --ff-only` and
+    `uv tool install --reinstall --editable`. Useful after a dep has been
+    added to `pyproject.toml` but the tool venv hasn't been re-synced —
+    editable-install drift is the single most common support issue.
     """
-    # check_only is currently forced to True; the flag exists so future
-    # versions can add an in-place upgrade mode without breaking scripts.
-    _ = check_only
+    if apply:
+        result = apply_update(pull=not no_pull)
+        if json_output:
+            emit_json(apply_result_to_dict(result))
+            if not result.applied:
+                raise typer.Exit(EXIT_ERROR)
+            return
+        if result.error:
+            stderr.print(f"[red]Update failed:[/red] {result.error}")
+            if result.stdout:
+                stderr.print(result.stdout)
+            raise typer.Exit(EXIT_ERROR)
+        stderr.print(
+            f"[green]Update applied[/green] — "
+            f"pulled={result.pulled}, reinstalled={result.reinstalled}"
+        )
+        if result.stdout:
+            stderr.print(result.stdout)
+        return
+
     status = check_for_update()
     if json_output:
         emit_json(status_to_dict(status))
@@ -902,6 +940,7 @@ def update(
                     f"{status.behind} behind[/yellow]"
                 )
     stderr.print(f"  hint:    {status.upgrade_hint}")
+    stderr.print("  [dim](run with --apply to reinstall in-place)[/dim]")
 
 
 # ---------------------------------------------------------------------------

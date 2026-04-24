@@ -37,6 +37,19 @@ class UpdateStatus:
     upgrade_hint: str
 
 
+@dataclass
+class UpdateApplyResult:
+    """Outcome of `claude-lb update --apply`."""
+
+    current_version: str
+    install_dir: str | None
+    applied: bool
+    pulled: bool
+    reinstalled: bool
+    error: str | None = None
+    stdout: str = ""
+
+
 def _package_install_dir() -> Path | None:
     spec = importlib.util.find_spec("claude_lb")
     if spec is None or spec.origin is None:
@@ -165,4 +178,83 @@ def status_to_dict(status: UpdateStatus) -> dict[str, Any]:
         "meta": {
             "update_available": status.behind is not None and status.behind > 0,
         },
+    }
+
+
+def apply_update(*, pull: bool = True) -> UpdateApplyResult:
+    """Apply an in-place update: `git pull` (if available) + `uv tool install --reinstall --editable`.
+
+    Idempotent — running with no changes upstream is a no-op that still
+    re-syncs the tool venv's deps, which is the common reason a user invokes
+    this (stale editable install missing a new dep).
+    """
+    install_dir = _package_install_dir()
+    if install_dir is None:
+        return UpdateApplyResult(
+            current_version=__version__,
+            install_dir=None,
+            applied=False,
+            pulled=False,
+            reinstalled=False,
+            error="Could not locate install dir; manual reinstall required.",
+        )
+
+    stdout_parts: list[str] = []
+    pulled = False
+    if pull and shutil.which("git") is not None and (install_dir / ".git").exists():
+        rc, out = _run(["git", "pull", "--ff-only"], install_dir)
+        stdout_parts.append(f"git pull: rc={rc}\n{out}")
+        if rc == 0:
+            pulled = True
+        elif "Already up to date" not in out:
+            return UpdateApplyResult(
+                current_version=__version__,
+                install_dir=str(install_dir),
+                applied=False,
+                pulled=False,
+                reinstalled=False,
+                error=f"git pull failed (rc={rc}): {out}",
+                stdout="\n".join(stdout_parts),
+            )
+
+    if shutil.which("uv") is None:
+        return UpdateApplyResult(
+            current_version=__version__,
+            install_dir=str(install_dir),
+            applied=False,
+            pulled=pulled,
+            reinstalled=False,
+            error="`uv` not found on PATH; manual reinstall required.",
+            stdout="\n".join(stdout_parts),
+        )
+
+    rc, out = _run(
+        ["uv", "tool", "install", "--reinstall", "--editable", str(install_dir)],
+        install_dir,
+    )
+    stdout_parts.append(f"uv tool install: rc={rc}\n{out}")
+    if rc != 0:
+        return UpdateApplyResult(
+            current_version=__version__,
+            install_dir=str(install_dir),
+            applied=False,
+            pulled=pulled,
+            reinstalled=False,
+            error=f"uv tool install failed (rc={rc}): {out}",
+            stdout="\n".join(stdout_parts),
+        )
+    return UpdateApplyResult(
+        current_version=__version__,
+        install_dir=str(install_dir),
+        applied=True,
+        pulled=pulled,
+        reinstalled=True,
+        stdout="\n".join(stdout_parts),
+    )
+
+
+def apply_result_to_dict(result: UpdateApplyResult) -> dict[str, Any]:
+    return {
+        "data": asdict(result),
+        "meta": {"applied": result.applied},
     }
