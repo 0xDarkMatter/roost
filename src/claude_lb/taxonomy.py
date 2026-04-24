@@ -1,36 +1,33 @@
 """Seven-state health classifier (SPEC §6).
 
-This module is the heart of claude-lb. Every probe response from the Anthropic
-API is funnelled through `classify()`, which returns one of seven `Health`
-states plus supporting metadata (retry-after, reset timestamps, error detail).
+Every probe response from Anthropic's `/api/oauth/usage` endpoint is funnelled
+through `classify()`, which returns one of seven `Health` states plus the
+supporting usage metadata (`session_pct`, `weekly_pct`, reset timestamps).
 
 Classification order (first match wins):
 
-    1. Network-level exception              → NETWORK_ERROR
-    2. HTTP 200                              → OK
-    3. HTTP 401                              → AUTH_DEAD
-    4. HTTP 429
-         body.error.type == rate_limit_error
-         + weekly keywords                   → WEEKLY_LIMIT
-         + session keywords                  → SESSION_LIMIT
-         else / retry-after present          → RATE_LIMITED
-    5. HTTP 403                              → WEEKLY_LIMIT (plan-quota guess)
-                                               otherwise UNKNOWN
-    6. Anything else                         → UNKNOWN
+    1. Network-level exception                 → NETWORK_ERROR
+    2. HTTP 200
+         seven_day.utilization >= 100          → WEEKLY_LIMIT
+         five_hour.utilization >= 100          → SESSION_LIMIT
+         else                                  → OK
+    3. HTTP 401                                → AUTH_DEAD
+    4. HTTP 403 with "scope requirement"       → OK (usage: null)
+       HTTP 403 other                          → UNKNOWN
+    5. HTTP 429                                → RATE_LIMITED
+    6. Anything else                           → UNKNOWN
 
-The input is a normalised `ProbeInput` dataclass rather than a raw httpx
-Response so the classifier is trivially unit-testable from JSON fixtures.
+Usage numbers come straight from the `/api/oauth/usage` response — no 429
+keyword matching, no "next Sunday" heuristics.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .models import ClassificationResult, ErrorInfo, Health
-from .patterns import SESSION_KEYWORDS, WEEKLY_KEYWORDS, contains_any
+from .models import ClassificationResult, ErrorInfo, Health, Usage
 
 
 @dataclass
@@ -46,13 +43,6 @@ class ProbeInput:
     headers: dict[str, str] | None = None
     exception_kind: str | None = None  # "timeout" | "dns" | "tls" | "refused" | "other"
     exception_message: str = ""
-
-
-# Regex for ISO-ish timestamps embedded in rate-limit messages.
-# Example: "resets at 2026-04-26T16:00:00Z"
-ISO_TS_RE = re.compile(
-    r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)"
-)
 
 
 def _now() -> datetime:
@@ -83,14 +73,11 @@ def _extract_error(body: dict[str, Any] | None) -> ErrorInfo:
     return ErrorInfo(type="unknown", message=str(body.get("message", "")))
 
 
-def _try_parse_reset_timestamp(message: str) -> datetime | None:
-    """Extract an ISO 8601 timestamp from a rate-limit message, if present."""
-    if not message:
+def _parse_iso(value: Any) -> datetime | None:
+    """Parse an ISO 8601 timestamp (with timezone) from the response body."""
+    if not isinstance(value, str) or not value:
         return None
-    m = ISO_TS_RE.search(message)
-    if not m:
-        return None
-    raw = m.group(1).replace(" ", "T")
+    raw = value
     if raw.endswith("Z"):
         raw = raw[:-1] + "+00:00"
     try:
@@ -102,58 +89,93 @@ def _try_parse_reset_timestamp(message: str) -> datetime | None:
     return parsed
 
 
+def _utilization_to_pct(value: Any) -> int | None:
+    """Convert a float 0.0–100.0 utilization to a rounded int percent."""
+    if not isinstance(value, (int, float)):
+        return None
+    return max(0, min(100, int(round(float(value)))))
+
+
+def _window(body: dict[str, Any] | None, key: str) -> dict[str, Any] | None:
+    """Extract a usage window dict from the response body, if present."""
+    if not isinstance(body, dict):
+        return None
+    window = body.get(key)
+    return window if isinstance(window, dict) else None
+
+
+def _build_usage(body: dict[str, Any] | None) -> Usage:
+    """Assemble a Usage model from the /api/oauth/usage response body."""
+    five_hour = _window(body, "five_hour") or {}
+    seven_day = _window(body, "seven_day") or {}
+    sonnet = _window(body, "seven_day_sonnet") or {}
+    opus = _window(body, "seven_day_opus") or {}
+    return Usage(
+        session_pct=_utilization_to_pct(five_hour.get("utilization")),
+        weekly_pct=_utilization_to_pct(seven_day.get("utilization")),
+        sonnet_pct=_utilization_to_pct(sonnet.get("utilization")),
+        opus_pct=_utilization_to_pct(opus.get("utilization")),
+    )
+
+
+def _is_scope_missing_403(body: dict[str, Any] | None) -> bool:
+    """Detect a 403 caused by a setup-token lacking user:profile scope.
+
+    The token is still valid for inference — we just can't read usage.
+    """
+    err = _extract_error(body)
+    msg = (err.message or "").lower()
+    return "scope" in msg and ("user:profile" in msg or "user_profile" in msg)
+
+
 def _default_session_reset(probed_at: datetime) -> datetime:
-    """Session windows are 5h. Default reset = probed_at + 5h."""
+    """Fallback when the body omits five_hour.resets_at. 5-hour session window."""
     return probed_at + timedelta(hours=5)
 
 
 def _default_weekly_reset(probed_at: datetime) -> datetime:
-    """Weekly windows reset on Sunday. Default = next Sunday 02:00 UTC."""
-    days_until_sunday = (6 - probed_at.weekday()) % 7
-    if days_until_sunday == 0:
-        days_until_sunday = 7
-    base = probed_at + timedelta(days=days_until_sunday)
-    return base.replace(hour=2, minute=0, second=0, microsecond=0)
+    """Fallback when the body omits seven_day.resets_at. 7 days from probe."""
+    return probed_at + timedelta(days=7)
 
 
-def _classify_429(
+def _classify_200(
     body: dict[str, Any] | None,
-    headers: dict[str, str] | None,
     probed_at: datetime,
 ) -> ClassificationResult:
-    """Classify a 429 response into rate_limited / session_limit / weekly_limit."""
-    err = _extract_error(body)
-    msg = err.message or ""
+    """Classify a 200 usage response.
 
-    retry_after = None
-    if headers:
-        retry_after = _parse_retry_after(headers.get("retry-after") or headers.get("Retry-After"))
+    Reads `five_hour.utilization` / `seven_day.utilization` and derives
+    SESSION_LIMIT / WEEKLY_LIMIT from utilization >= 100, else OK.
+    """
+    usage = _build_usage(body)
+    five_hour = _window(body, "five_hour") or {}
+    seven_day = _window(body, "seven_day") or {}
+    session_reset = _parse_iso(five_hour.get("resets_at"))
+    weekly_reset = _parse_iso(seven_day.get("resets_at"))
 
-    # Only use the rate_limit_error type as a signal to look for keywords.
-    is_rl_type = err.type == "rate_limit_error"
-
-    if is_rl_type and contains_any(msg, WEEKLY_KEYWORDS):
-        reset = _try_parse_reset_timestamp(msg) or _default_weekly_reset(probed_at)
+    weekly_util = seven_day.get("utilization")
+    if isinstance(weekly_util, (int, float)) and weekly_util >= 100:
         return ClassificationResult(
             health=Health.WEEKLY_LIMIT,
-            error=err,
-            retry_after_s=retry_after,
-            weekly_reset_at=reset,
+            usage=usage,
+            session_reset_at=session_reset,
+            weekly_reset_at=weekly_reset or _default_weekly_reset(probed_at),
         )
 
-    if is_rl_type and contains_any(msg, SESSION_KEYWORDS):
-        reset = _try_parse_reset_timestamp(msg) or _default_session_reset(probed_at)
+    session_util = five_hour.get("utilization")
+    if isinstance(session_util, (int, float)) and session_util >= 100:
         return ClassificationResult(
             health=Health.SESSION_LIMIT,
-            error=err,
-            retry_after_s=retry_after,
-            session_reset_at=reset,
+            usage=usage,
+            session_reset_at=session_reset or _default_session_reset(probed_at),
+            weekly_reset_at=weekly_reset,
         )
 
     return ClassificationResult(
-        health=Health.RATE_LIMITED,
-        error=err,
-        retry_after_s=retry_after,
+        health=Health.OK,
+        usage=usage,
+        session_reset_at=session_reset,
+        weekly_reset_at=weekly_reset,
     )
 
 
@@ -164,14 +186,11 @@ def classify(
 ) -> ClassificationResult:
     """Classify a probe outcome into one of seven Health states.
 
-    Args:
-        probe: the normalised probe outcome.
-        probed_at: when the probe occurred (default: now, UTC).
-        prev_health: previously-cached health for this profile. Used only to
-            promote 403 from UNKNOWN to WEEKLY_LIMIT when the prior state was
-            OK (the heuristic is that a previously-healthy profile returning
-            403 is almost certainly plan-quota-exhausted).
+    `prev_health` is accepted for call-site stability but no longer used —
+    the /api/oauth/usage endpoint provides real utilization numbers, so the
+    "403 on a previously-ok profile means weekly_limit" heuristic is retired.
     """
+    del prev_health
     probed_at = probed_at or _now()
 
     # 1. Network-level failures
@@ -188,31 +207,39 @@ def classify(
             error=ErrorInfo(type="no_response", message="Probe returned no status code"),
         )
 
-    # 2. Happy path
+    # 2. Happy path — parse usage and maybe promote to session/weekly limit
     if status == 200:
-        return ClassificationResult(health=Health.OK)
+        return _classify_200(probe.body, probed_at)
 
-    # 3. Auth
+    # 3. Auth dead
     if status == 401:
         err = _extract_error(probe.body)
         if not err.message:
             err = ErrorInfo(type=err.type or "authentication_error", message="Unauthorized")
         return ClassificationResult(health=Health.AUTH_DEAD, error=err)
 
-    # 4. Rate limiting
-    if status == 429:
-        return _classify_429(probe.body, probe.headers, probed_at)
-
-    # 5. Forbidden — heuristic: previously-OK profile returning 403 is plan-exhausted
+    # 4. Forbidden — scope-missing 403 means the token works for inference
+    #    but lacks user:profile, so we can't read usage. Classify as OK.
     if status == 403:
-        if prev_health is Health.OK:
-            reset = _default_weekly_reset(probed_at)
+        if _is_scope_missing_403(probe.body):
             return ClassificationResult(
-                health=Health.WEEKLY_LIMIT,
+                health=Health.OK,
                 error=_extract_error(probe.body),
-                weekly_reset_at=reset,
             )
         return ClassificationResult(health=Health.UNKNOWN, error=_extract_error(probe.body))
+
+    # 5. Rate limited (usage endpoint itself — rare)
+    if status == 429:
+        retry_after = None
+        if probe.headers:
+            retry_after = _parse_retry_after(
+                probe.headers.get("retry-after") or probe.headers.get("Retry-After")
+            )
+        return ClassificationResult(
+            health=Health.RATE_LIMITED,
+            error=_extract_error(probe.body),
+            retry_after_s=retry_after,
+        )
 
     # 6. Everything else
     return ClassificationResult(
@@ -237,12 +264,7 @@ def compute_expires_at(
     result: ClassificationResult,
     probed_at: datetime,
 ) -> datetime | None:
-    """Compute the cache expiry timestamp for a classification result.
-
-    Returns None for states that never expire (AUTH_DEAD) — these are
-    invalidated manually via `claude-lb invalidate <name>` or by a mtime
-    bump on the profile's credentials.json.
-    """
+    """Compute the cache expiry timestamp for a classification result."""
     h = result.health
     if h is Health.AUTH_DEAD:
         return None
@@ -251,9 +273,7 @@ def compute_expires_at(
     if h is Health.SESSION_LIMIT:
         return result.session_reset_at or _default_session_reset(probed_at)
     if h is Health.RATE_LIMITED:
-        # `retry_after_s is None` means server didn't tell us — default 60s.
-        # Explicit 0 means "retry now" and must not fall through to the default.
-        retry_seconds = result.retry_after_s if result.retry_after_s is not None else 60
+        retry_seconds: int = result.retry_after_s or 60
         return probed_at + timedelta(seconds=retry_seconds)
     ttl = DEFAULT_TTL_SECONDS.get(h)
     if ttl is None:

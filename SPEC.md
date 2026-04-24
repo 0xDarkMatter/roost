@@ -240,51 +240,51 @@ Always: data-structured JSON to stdout when `--json`, human message to stderr, s
 
 ## 6. Health Taxonomy
 
-**The heart of the tool.** Seven states, each with a distinct signal source, TTL, and next-action.
+**The heart of the tool.** Seven states, each with a distinct signal source, TTL, and next-action. All signals come from a single probe against `/api/oauth/usage` (see §7).
 
 | State | Detection | TTL in cache | Next-action hint |
 |---|---|---|---|
-| `ok` | HTTP 200 from `/v1/models` | 5 min | — |
-| `rate_limited` | HTTP 429, `retry-after` header present and < 3600s | `retry-after` seconds | Retry in N seconds |
-| `session_limit` | HTTP 429, body `error.type == rate_limit_error`, message contains `"session"` / `"5-hour"` / `"hourly"` | until `session_reset_at` (parsed from body, or +5h from probe time) | Skip until session reset |
-| `weekly_limit` | HTTP 429, body matches `"weekly"` / `"plan"` / `"7-day"` / `"Sunday"` patterns | until `weekly_reset_at` (parsed from body if available, else next Sunday 02:00 local time) | Skip until weekly reset; operator tier upgrade may be needed |
+| `ok` | HTTP 200 with `seven_day.utilization < 100` and `five_hour.utilization < 100`. Also: HTTP 403 with `"scope requirement user:profile"` (setup-token — valid for inference, can't read usage) | 5 min | — |
+| `rate_limited` | HTTP 429 on the usage endpoint itself (rare) | `retry-after` seconds, else 60 s | Retry in N seconds |
+| `session_limit` | HTTP 200 with `five_hour.utilization >= 100` | until `five_hour.resets_at` (parsed from body, else +5 h from probe) | Skip until session reset |
+| `weekly_limit` | HTTP 200 with `seven_day.utilization >= 100` | until `seven_day.resets_at` (parsed from body, else +7 days from probe) | Skip until weekly reset; operator tier upgrade may be needed |
 | `auth_dead` | HTTP 401, body `error.type == authentication_error` | infinite (manual invalidation only) | `claude login --profile <name>` |
 | `network_error` | timeout / DNS / TLS / refused | 30 sec | Transient; retry |
-| `unknown` | any other response (5xx, unexpected 4xx, malformed body) | 60 sec | Logged for operator review |
+| `unknown` | any other response (5xx, non-scope 403, malformed body) | 60 sec | Logged for operator review |
 
 ### Classification order (first match wins)
 
 ```
 1. if exception (timeout, DNS, TLS):        network_error
-2. if HTTP 200:                              ok
+2. if HTTP 200:
+     if seven_day.utilization >= 100:        weekly_limit
+     elif five_hour.utilization >= 100:      session_limit
+     else:                                    ok
 3. if HTTP 401:                              auth_dead
-4. if HTTP 429:
-     body classification:
-       if error.type == rate_limit_error AND weekly_keywords in message: weekly_limit
-       elif error.type == rate_limit_error AND session_keywords in message: session_limit
-       elif retry-after header present: rate_limited
-       else: rate_limited
-5. if HTTP 403:                              if prev-known-ok for profile, treat as plan-quota-exhausted → map to weekly_limit; else unknown
+4. if HTTP 403:
+     if message contains "scope" + "user:profile":   ok (usage: null)
+     else:                                            unknown
+5. if HTTP 429:                              rate_limited (with retry-after if present)
 6. otherwise:                                unknown
 ```
 
-### Keyword matching (string-contains, case-insensitive)
+**No keyword matching.** Utilization numbers are the direct signal; the 429 keyword lists from v0.1 (`patterns.py`) are retired.
 
-- Session keywords: `"session"`, `"5-hour"`, `"5 hour"`, `"hourly"`, `"current session"`
-- Weekly keywords: `"weekly"`, `"week"`, `"plan"`, `"7-day"`, `"7 day"`, `"sunday"`, `"resets sun"`
+### Usage stats (always populated on a healthy probe)
 
-Anthropic's rate-limit error messages are not a stable contract. The keyword list MUST be easy to extend without code changes — externalise to `claude_lb/patterns.py` or similar.
+Fields on `data[].usage` — all integers 0–100 (or `null` when unavailable):
 
-### Usage stats (optional enrichment)
+- `session_pct` ← `five_hour.utilization`
+- `weekly_pct`  ← `seven_day.utilization`
+- `sonnet_pct`  ← `seven_day_sonnet.utilization`
+- `opus_pct`    ← `seven_day_opus.utilization`
 
-If Anthropic exposes a usage endpoint (TBD — probe during implementation), enrich `data[].usage`:
+Reset timestamps on `data[]`:
 
-- `session_pct` — current session % used
-- `weekly_pct` — current weekly % used
-- `session_reset_at` — when session limit resets (ISO UTC)
-- `weekly_reset_at` — when weekly limit resets (ISO UTC)
+- `session_reset_at` ← `five_hour.resets_at`
+- `weekly_reset_at`  ← `seven_day.resets_at`
 
-If no such endpoint exists, leave `usage: null`. The taxonomy works without usage stats — they're nice-to-have.
+For setup-tokens (403 scope-missing fallback), `usage` is `null` because the profile cannot read these numbers — but the token itself is still valid for inference, so the profile classifies as `ok` with the next-probe TTL treated as `auth_dead`-like (manual invalidate only) until a fresh `claude login --profile <name>` swaps in a user:profile-scoped token.
 
 ---
 
@@ -293,26 +293,40 @@ If no such endpoint exists, leave `usage: null`. The taxonomy works without usag
 ### Endpoint
 
 ```
-GET https://api.anthropic.com/v1/models
+GET https://api.anthropic.com/api/oauth/usage
 ```
 
-**Why `/v1/models`:** cheapest idempotent endpoint that requires auth. Returns a list of available models. Does not count against message quotas. Verified behavior during implementation (may change — document any findings).
+**Why `/api/oauth/usage`:** it is the only Anthropic endpoint that (a) accepts Claude Code Max OAuth tokens and (b) returns the utilization numbers the Max dashboard uses. The public `/v1/*` endpoints require an API key and respond with 401 "OAuth authentication is currently not supported" for Max OAuth bearers.
 
-**Alternatives considered:**
-- `POST /v1/messages` with a 1-token request — works but costs tokens
-- `GET /v1/organizations` — may not exist or require different scope
+**Key detail:** the endpoint is gated by the `anthropic-beta: oauth-2025-04-20` header. Without that header, the same request returns 401.
 
 ### Request
 
 ```http
-GET /v1/models HTTP/1.1
+GET /api/oauth/usage HTTP/1.1
 Host: api.anthropic.com
 Authorization: Bearer <oauth-access-token>
 anthropic-version: 2023-06-01
-User-Agent: claude-lb/0.1
+anthropic-beta: oauth-2025-04-20
+Accept: application/json
+User-Agent: claude-lb/<version>
 ```
 
 The OAuth access token is read from `~/.claude-profiles/<name>/.credentials.json` (see §10).
+
+### Response shape (HTTP 200)
+
+```json
+{
+  "five_hour":  {"utilization": 9.0, "resets_at": "2026-04-24T14:00:00.019+00:00"},
+  "seven_day":  {"utilization": 6.0, "resets_at": "2026-04-25T04:00:00.019+00:00"},
+  "seven_day_sonnet": {"utilization": 0.0, "resets_at": null},
+  "seven_day_opus":   null,
+  "extra_usage": {"is_enabled": true, "monthly_limit": 100000, "used_credits": 10649, "utilization": 10.6, "currency": "AUD"}
+}
+```
+
+Only `five_hour`, `seven_day`, `seven_day_sonnet`, and `seven_day_opus` are consumed by the classifier. `extra_usage` (pay-per-use pool) is recorded but does not influence health state in v0.2.
 
 ### Response classification
 
@@ -324,7 +338,7 @@ Default 10 seconds per probe (configurable via `--timeout`). Concurrent probes a
 
 ### Rate limit for the probe itself
 
-One probe per profile per invocation unless `--all` is used with `invalidate`. Cache-first read path means routine `status` / `pick` never probes unless cache is stale.
+One probe per profile per invocation unless `--all` is used with `invalidate`. Cache-first read path means routine `status` / `pick` never probes unless cache is stale. The usage endpoint is not known to be rate-limited under normal use, but if it returns 429, the classifier maps it to `rate_limited` with `retry-after` honoured.
 
 ---
 
@@ -503,9 +517,43 @@ Token extraction order (first match wins, to be robust against format drift):
 
 If none present → classify profile as `auth_dead` with `error.type = "missing_token"`.
 
-### Token refresh
+### Token refresh (v0.3+)
 
-**Out of scope for v0.1.** We don't refresh expired OAuth tokens; we report `auth_dead` and tell the operator to `claude login --profile <name>`. Token refresh may be added later, borrowing patterns from [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) (MIT).
+Max plan OAuth access tokens live ~5 hours. When `.claudeAiOauth.expiresAt` is past, the stored refresh token can be exchanged for a new access token without re-authenticating interactively.
+
+**Local detection (no network):** `discovery.py` records `access_token_expires_at` and `refresh_token_present` on every `Profile`. `probe.py` short-circuits to `AUTH_EXPIRED` (health state) when the stored token is already past its expiry — no round-trip needed.
+
+**Explicit refresh:** `claude-lb refresh <name> | --all | --expired` POSTs to `https://api.anthropic.com/v1/oauth/token`:
+
+```http
+POST /v1/oauth/token HTTP/1.1
+Host: api.anthropic.com
+Content-Type: application/json
+anthropic-beta: oauth-2025-04-20
+
+{
+  "grant_type":    "refresh_token",
+  "refresh_token": "<stored refresh token>",
+  "client_id":     "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+}
+```
+
+**Response (200):**
+
+```json
+{"access_token": "...", "refresh_token": "...", "token_type": "Bearer", "expires_in": 28800}
+```
+
+On success, `.credentials.json` is atomically rewritten (tempfile + `os.replace`) with the new `accessToken`, `refreshToken` (refresh tokens rotate), and `expiresAt = now_ms + expires_in*1000`. All non-oauth fields in the file are preserved. The health cache entry for the refreshed profile is invalidated so the next `status`/`pick` probes with the new token.
+
+**Failure modes:**
+- HTTP 400/401 → `REFRESH_REJECTED` (refresh token dead — run `claude login --profile <name>`). Credentials file is not touched.
+- Network error → `NETWORK_ERROR` (transient — retry)
+- No refresh token in file → `NO_REFRESH_TOKEN` (fail fast, no network call)
+
+**Out of scope:**
+- Auto-refresh on probe (deferred to v0.4+ — requires cross-process locking to avoid two parallel `pick` invocations both consuming the same refresh token).
+- Browser-based OAuth flow. `claude-lb` cannot create a profile from scratch; use `claude login --profile <name>` for that.
 
 ### Never touch
 

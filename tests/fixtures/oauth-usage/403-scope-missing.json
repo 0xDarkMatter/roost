@@ -1,0 +1,7 @@
+{
+  "type": "error",
+  "error": {
+    "type": "permission_error",
+    "message": "This endpoint requires the scope requirement user:profile which is not granted to this token."
+  }
+}

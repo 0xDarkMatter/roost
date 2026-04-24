@@ -1,7 +1,12 @@
-"""Async probe of Anthropic /v1/models (SPEC §7).
+"""Async probe of Anthropic /api/oauth/usage (SPEC §7).
 
 One `probe_profile()` per profile. `probe_many()` runs them concurrently
 with a single `httpx.AsyncClient`.
+
+The probe endpoint accepts Claude Code Max OAuth tokens (unlike /v1/* which
+requires an API key) when the `anthropic-beta: oauth-2025-04-20` header is
+set. The response body contains live utilization percentages and real reset
+timestamps — no keyword scraping of 429 error messages required.
 """
 
 from __future__ import annotations
@@ -19,8 +24,9 @@ from .taxonomy import ProbeInput, classify, compute_expires_at
 
 log = logging.getLogger(__name__)
 
-API_URL = "https://api.anthropic.com/v1/models"
+API_URL = "https://api.anthropic.com/api/oauth/usage"
 ANTHROPIC_VERSION = "2023-06-01"
+ANTHROPIC_BETA = "oauth-2025-04-20"
 DEFAULT_TIMEOUT_S = 10.0
 
 
@@ -32,6 +38,7 @@ def _headers(token: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
         "anthropic-version": ANTHROPIC_VERSION,
+        "anthropic-beta": ANTHROPIC_BETA,
         "accept": "application/json",
         "user-agent": f"claude-lb/{__version__}",
     }
@@ -105,7 +112,39 @@ def _classification_to_health(
         retry_after_s=result.retry_after_s,
         session_reset_at=result.session_reset_at,
         weekly_reset_at=result.weekly_reset_at,
+        usage=result.usage,
         probe_latency_ms=latency_ms,
+        credentials_mtime=profile.credentials_mtime,
+    )
+
+
+def _local_auth_expired(profile: Profile) -> ProfileHealth | None:
+    """Return an AUTH_EXPIRED record without hitting the network when the
+    stored access token has already expired. Saves a round-trip and gives
+    the caller a distinct signal from AUTH_DEAD (refresh token still valid).
+    """
+    exp = profile.access_token_expires_at
+    if exp is None or exp > _now():
+        return None
+    from .models import ErrorInfo  # local to avoid cycle pressure
+    probed_at = _now()
+    delta_s = int((probed_at - exp).total_seconds())
+    return ProfileHealth(
+        name=profile.name,
+        health=Health.AUTH_EXPIRED,
+        probed_at=probed_at,
+        expires_at=None,  # mtime bump on refresh invalidates it
+        error=ErrorInfo(
+            type="token_expired",
+            message=(
+                f"OAuth access token expired {delta_s}s ago. "
+                f"Run: claude-lb refresh {profile.name}"
+                if profile.refresh_token_present
+                else f"OAuth access token expired {delta_s}s ago and no refresh "
+                f"token is stored. Run: claude login --profile {profile.name}"
+            ),
+        ),
+        probe_latency_ms=0,
         credentials_mtime=profile.credentials_mtime,
     )
 
@@ -118,6 +157,9 @@ async def probe_profile(
     client: httpx.AsyncClient | None = None,
 ) -> ProfileHealth:
     """Probe a single profile, returning a ProfileHealth record."""
+    expired = _local_auth_expired(profile)
+    if expired is not None:
+        return expired
     if client is not None:
         probe, latency_ms = await _probe_once(client, profile, timeout)
     else:
@@ -132,26 +174,41 @@ async def probe_many(
     prev_health: dict[str, Health] | None = None,
     timeout: float = DEFAULT_TIMEOUT_S,
 ) -> list[ProfileHealth]:
-    """Probe all profiles concurrently; returns results in input order."""
+    """Probe all profiles concurrently; returns results in input order.
+
+    Profiles whose stored access token has already expired are classified
+    as AUTH_EXPIRED locally, without a network round-trip.
+    """
     prev_health = prev_health or {}
     if not profiles:
         return []
-    async with httpx.AsyncClient() as client:
-        tasks = [
-            _probe_once(client, p, timeout) for p in profiles
-        ]
-        pairs = await asyncio.gather(*tasks, return_exceptions=False)
-    out: list[ProfileHealth] = []
-    for profile, (probe, latency_ms) in zip(profiles, pairs):
-        out.append(
-            _classification_to_health(
+
+    expired_results: dict[str, ProfileHealth] = {}
+    to_probe: list[Profile] = []
+    for p in profiles:
+        expired = _local_auth_expired(p)
+        if expired is not None:
+            expired_results[p.name] = expired
+        else:
+            to_probe.append(p)
+
+    network_results: dict[str, ProfileHealth] = {}
+    if to_probe:
+        async with httpx.AsyncClient() as client:
+            tasks = [_probe_once(client, p, timeout) for p in to_probe]
+            pairs = await asyncio.gather(*tasks, return_exceptions=False)
+        for profile, (probe, latency_ms) in zip(to_probe, pairs):
+            network_results[profile.name] = _classification_to_health(
                 profile,
                 probe,
                 latency_ms,
                 prev_health.get(profile.name),
             )
-        )
-    return out
+
+    return [
+        expired_results.get(p.name) or network_results[p.name]
+        for p in profiles
+    ]
 
 
 def probe_many_sync(

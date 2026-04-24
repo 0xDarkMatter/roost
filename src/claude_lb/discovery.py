@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,29 @@ def _read_credentials(path: Path) -> dict[str, Any] | None:
     return data
 
 
+def _expires_at_from(payload: dict[str, Any]) -> datetime | None:
+    """Read `.claudeAiOauth.expiresAt` (unix ms) → UTC datetime, or None."""
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    value = oauth.get("expiresAt")
+    if not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(float(value) / 1000.0, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _has_refresh_token(payload: dict[str, Any]) -> bool:
+    """Detect a usable refresh token in the modern credentials shape."""
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return False
+    rt = oauth.get("refreshToken")
+    return isinstance(rt, str) and bool(rt.strip())
+
+
 def _make_profile(name: str, cred_path: Path) -> Profile | None:
     """Build a Profile from a credentials file, or return None if unusable."""
     payload = _read_credentials(cred_path)
@@ -80,6 +104,8 @@ def _make_profile(name: str, cred_path: Path) -> Profile | None:
         credentials_path=str(cred_path),
         credentials_mtime=mtime,
         token_source=source,
+        access_token_expires_at=_expires_at_from(payload),
+        refresh_token_present=_has_refresh_token(payload),
     )
 
 

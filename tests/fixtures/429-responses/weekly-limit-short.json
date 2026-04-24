@@ -1,7 +1,0 @@
-{
-  "type": "error",
-  "error": {
-    "type": "rate_limit_error",
-    "message": "Your plan quota is exhausted. Resets Sun 02:00 UTC."
-  }
-}

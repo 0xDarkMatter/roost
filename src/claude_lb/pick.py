@@ -35,6 +35,7 @@ class Strategy(str, Enum):
 class PickFailureReason(str, Enum):
     NO_PROFILES = "no_profiles"
     ALL_AUTH_DEAD = "all_auth_dead"
+    ALL_AUTH_EXPIRED = "all_auth_expired"
     ALL_WEEKLY = "all_weekly_limit"
     ALL_THROTTLED = "all_throttled"
     ALL_TERMINAL = "all_terminal"
@@ -185,6 +186,8 @@ def _is_selectable(entry: ProfileHealth, now: datetime, require_ok: bool) -> boo
     """Apply the filter ladder (SPEC §9). Returns True if the profile is
     still in play after dropping auth_dead / exhausted / throttled entries."""
     if entry.health is Health.AUTH_DEAD:
+        return False
+    if entry.health is Health.AUTH_EXPIRED:
         return False
     if entry.health is Health.WEEKLY_LIMIT:
         reset = entry.weekly_reset_at
@@ -363,6 +366,10 @@ def _diagnose_failure(
         )
     if all(e.health is Health.AUTH_DEAD for e in entries):
         return PickOutcome(reason=PickFailureReason.ALL_AUTH_DEAD)
+    if all(e.health is Health.AUTH_EXPIRED for e in entries):
+        return PickOutcome(reason=PickFailureReason.ALL_AUTH_EXPIRED)
+    if all(e.health in (Health.AUTH_DEAD, Health.AUTH_EXPIRED) for e in entries):
+        return PickOutcome(reason=PickFailureReason.ALL_AUTH_EXPIRED)
     if all(e.health is Health.WEEKLY_LIMIT for e in entries):
         return PickOutcome(
             reason=PickFailureReason.ALL_WEEKLY,

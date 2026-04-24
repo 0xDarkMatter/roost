@@ -80,6 +80,7 @@ def _health_style(health: str) -> str:
         "rate_limited": "yellow",
         "session_limit": "yellow",
         "weekly_limit": "red",
+        "auth_expired": "yellow",
         "auth_dead": "red",
         "network_error": "magenta",
         "unknown": "dim",
@@ -108,6 +109,8 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
             retry = e.session_reset_at.strftime("%Y-%m-%d %H:%M UTC")
         elif e.weekly_reset_at:
             retry = e.weekly_reset_at.strftime("%Y-%m-%d %H:%M UTC")
+        elif e.health.value == "auth_expired":
+            retry = f"claude-lb refresh {e.name}"
         elif e.health.value == "auth_dead":
             retry = "claude login"
         weekly = (
@@ -138,6 +141,7 @@ def build_status_payload(cache: HealthCache, discovered_names: list[str]) -> dic
         "rate_limited": 0,
         "session_limit": 0,
         "weekly_limit": 0,
+        "auth_expired": 0,
         "auth_dead": 0,
         "network_error": 0,
         "unknown": 0,

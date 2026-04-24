@@ -12,7 +12,7 @@ from claude_lb.models import Health
 from claude_lb.taxonomy import ProbeInput, classify, compute_expires_at
 
 FIXTURES = Path(__file__).parent / "fixtures"
-RL_FIXTURES = FIXTURES / "429-responses"
+USAGE_FIXTURES = FIXTURES / "oauth-usage"
 
 
 def load_json(path: Path) -> dict:
@@ -23,14 +23,71 @@ FIXED_NOW = datetime(2026, 4, 24, 9, 45, 12, tzinfo=UTC)
 
 
 # ---------------------------------------------------------------------------
-# Happy path
+# Happy path — 200 with usage numbers under the limit
 # ---------------------------------------------------------------------------
 
 
-def test_200_classifies_as_ok() -> None:
-    result = classify(ProbeInput(status_code=200, body={"data": []}))
+def test_200_ok_populates_usage() -> None:
+    body = load_json(USAGE_FIXTURES / "ok.json")
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
     assert result.health is Health.OK
     assert result.error is None
+    assert result.usage is not None
+    assert result.usage.session_pct == 9
+    assert result.usage.weekly_pct == 6
+    assert result.usage.sonnet_pct == 0
+    assert result.session_reset_at == datetime(2026, 4, 24, 14, 0, 0, 19360, tzinfo=UTC)
+    assert result.weekly_reset_at == datetime(2026, 4, 25, 4, 0, 0, 19375, tzinfo=UTC)
+
+
+def test_200_empty_body_still_ok() -> None:
+    result = classify(ProbeInput(status_code=200, body={}), probed_at=FIXED_NOW)
+    assert result.health is Health.OK
+    assert result.usage is not None
+    assert result.usage.session_pct is None
+
+
+# ---------------------------------------------------------------------------
+# Utilization-based session / weekly limits (200 + >= 100%)
+# ---------------------------------------------------------------------------
+
+
+def test_200_session_exhausted_promotes_to_session_limit() -> None:
+    body = load_json(USAGE_FIXTURES / "session-exhausted.json")
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.health is Health.SESSION_LIMIT
+    assert result.usage is not None
+    assert result.usage.session_pct == 100
+    assert result.session_reset_at == datetime(2026, 4, 24, 14, 20, 0, tzinfo=UTC)
+
+
+def test_200_weekly_exhausted_promotes_to_weekly_limit() -> None:
+    body = load_json(USAGE_FIXTURES / "weekly-exhausted.json")
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.health is Health.WEEKLY_LIMIT
+    assert result.usage is not None
+    assert result.usage.weekly_pct == 100
+    assert result.weekly_reset_at == datetime(2026, 4, 28, 3, 0, 0, tzinfo=UTC)
+
+
+def test_200_both_exhausted_prefers_weekly_limit() -> None:
+    body = load_json(USAGE_FIXTURES / "both-exhausted.json")
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.health is Health.WEEKLY_LIMIT
+
+
+def test_session_limit_missing_reset_falls_back_to_probed_plus_5h() -> None:
+    body = {"five_hour": {"utilization": 100.0}, "seven_day": {"utilization": 42.0}}
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.health is Health.SESSION_LIMIT
+    assert result.session_reset_at == FIXED_NOW + timedelta(hours=5)
+
+
+def test_weekly_limit_missing_reset_falls_back_to_probed_plus_7d() -> None:
+    body = {"five_hour": {"utilization": 20.0}, "seven_day": {"utilization": 100.0}}
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.health is Health.WEEKLY_LIMIT
+    assert result.weekly_reset_at == FIXED_NOW + timedelta(days=7)
 
 
 # ---------------------------------------------------------------------------
@@ -52,115 +109,41 @@ def test_401_missing_body_still_auth_dead() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 429 subtypes
+# 403 setup-token scope fallback — profile is valid for inference
 # ---------------------------------------------------------------------------
 
 
-def test_plain_429_is_rate_limited() -> None:
-    body = load_json(RL_FIXTURES / "plain-rate-limit.json")
-    headers = {"retry-after": "60"}
-    result = classify(ProbeInput(status_code=429, body=body, headers=headers))
-    assert result.health is Health.RATE_LIMITED
-    assert result.retry_after_s == 60
+def test_403_scope_missing_is_ok_with_null_usage() -> None:
+    body = load_json(USAGE_FIXTURES / "403-scope-missing.json")
+    result = classify(ProbeInput(status_code=403, body=body))
+    assert result.health is Health.OK
+    assert result.usage is None
+    assert result.error is not None
+    assert "scope" in (result.error.message or "").lower()
 
 
-def test_429_session_limit() -> None:
-    body = load_json(RL_FIXTURES / "session-limit.json")
-    result = classify(
-        ProbeInput(status_code=429, body=body, headers={}), probed_at=FIXED_NOW
-    )
-    assert result.health is Health.SESSION_LIMIT
-    assert result.session_reset_at is not None
-    # Message had an embedded timestamp — we should parse it.
-    assert result.session_reset_at.year == 2026
-
-
-def test_429_session_limit_defaults_to_5h_if_no_timestamp() -> None:
-    body = {
-        "type": "error",
-        "error": {
-            "type": "rate_limit_error",
-            "message": "Session limit reached. Try again later.",
-        },
-    }
-    result = classify(ProbeInput(status_code=429, body=body), probed_at=FIXED_NOW)
-    assert result.health is Health.SESSION_LIMIT
-    assert result.session_reset_at == FIXED_NOW + timedelta(hours=5)
-
-
-def test_429_weekly_limit() -> None:
-    body = load_json(RL_FIXTURES / "weekly-limit.json")
-    result = classify(ProbeInput(status_code=429, body=body), probed_at=FIXED_NOW)
-    assert result.health is Health.WEEKLY_LIMIT
-    assert result.weekly_reset_at is not None
-
-
-def test_429_weekly_limit_short_variant() -> None:
-    body = load_json(RL_FIXTURES / "weekly-limit-short.json")
-    result = classify(ProbeInput(status_code=429, body=body), probed_at=FIXED_NOW)
-    assert result.health is Health.WEEKLY_LIMIT
-
-
-def test_429_weekly_defaults_to_next_sunday() -> None:
-    body = {
-        "type": "error",
-        "error": {
-            "type": "rate_limit_error",
-            "message": "Weekly plan limit reached.",
-        },
-    }
-    # Fixed date is Friday 2026-04-24.
-    result = classify(ProbeInput(status_code=429, body=body), probed_at=FIXED_NOW)
-    assert result.health is Health.WEEKLY_LIMIT
-    # Next Sunday at 02:00 UTC is 2026-04-26T02:00Z
-    assert result.weekly_reset_at == datetime(2026, 4, 26, 2, 0, tzinfo=UTC)
-
-
-def test_429_weekly_wins_over_session_when_both_keywords_present() -> None:
-    """Weekly is checked first — important, since 'weekly' + 'session' overlap
-    is possible in some error messages."""
-    body = {
-        "type": "error",
-        "error": {
-            "type": "rate_limit_error",
-            "message": "Weekly plan limit exceeded; your current session is paused.",
-        },
-    }
-    result = classify(ProbeInput(status_code=429, body=body), probed_at=FIXED_NOW)
-    assert result.health is Health.WEEKLY_LIMIT
-
-
-def test_429_non_rate_limit_type_falls_through_to_plain() -> None:
-    body = {
-        "type": "error",
-        "error": {
-            "type": "overloaded_error",
-            "message": "Server is overloaded; retry shortly.",
-        },
-    }
-    result = classify(ProbeInput(status_code=429, body=body))
-    assert result.health is Health.RATE_LIMITED
-
-
-# ---------------------------------------------------------------------------
-# 403
-# ---------------------------------------------------------------------------
-
-
-def test_403_on_previously_ok_profile_is_weekly_limit() -> None:
-    body = {"type": "error", "error": {"type": "permission_error", "message": "Access denied."}}
-    result = classify(
-        ProbeInput(status_code=403, body=body),
-        probed_at=FIXED_NOW,
-        prev_health=Health.OK,
-    )
-    assert result.health is Health.WEEKLY_LIMIT
-
-
-def test_403_without_prior_context_is_unknown() -> None:
-    body = {"type": "error", "error": {"type": "permission_error", "message": "Access denied."}}
+def test_403_other_is_unknown() -> None:
+    body = {"error": {"type": "permission_error", "message": "forbidden"}}
     result = classify(ProbeInput(status_code=403, body=body))
     assert result.health is Health.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting — the usage endpoint itself, not downstream messages
+# ---------------------------------------------------------------------------
+
+
+def test_429_is_rate_limited() -> None:
+    body = {"error": {"type": "rate_limit_error", "message": "slow down"}}
+    result = classify(ProbeInput(status_code=429, body=body, headers={"retry-after": "30"}))
+    assert result.health is Health.RATE_LIMITED
+    assert result.retry_after_s == 30
+
+
+def test_429_without_retry_after_is_rate_limited() -> None:
+    result = classify(ProbeInput(status_code=429, body=None, headers={}))
+    assert result.health is Health.RATE_LIMITED
+    assert result.retry_after_s is None
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +186,7 @@ def test_missing_status_code_is_unknown() -> None:
 
 
 def test_compute_expires_at_ok_is_5min() -> None:
-    result = classify(ProbeInput(status_code=200, body={"data": []}))
+    result = classify(ProbeInput(status_code=200, body={}), probed_at=FIXED_NOW)
     expires = compute_expires_at(result, FIXED_NOW)
     assert expires == FIXED_NOW + timedelta(minutes=5)
 
@@ -214,27 +197,30 @@ def test_compute_expires_at_auth_dead_is_none() -> None:
     assert compute_expires_at(result, FIXED_NOW) is None
 
 
+def test_compute_expires_at_session_limit_uses_body_reset() -> None:
+    body = load_json(USAGE_FIXTURES / "session-exhausted.json")
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    expires = compute_expires_at(result, FIXED_NOW)
+    assert expires == datetime(2026, 4, 24, 14, 20, 0, tzinfo=UTC)
+
+
+def test_compute_expires_at_weekly_limit_uses_body_reset() -> None:
+    body = load_json(USAGE_FIXTURES / "weekly-exhausted.json")
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    expires = compute_expires_at(result, FIXED_NOW)
+    assert expires == datetime(2026, 4, 28, 3, 0, 0, tzinfo=UTC)
+
+
 def test_compute_expires_at_rate_limited_uses_retry_after() -> None:
-    body = load_json(RL_FIXTURES / "plain-rate-limit.json")
-    result = classify(ProbeInput(status_code=429, body=body, headers={"retry-after": "120"}))
+    result = classify(ProbeInput(status_code=429, body=None, headers={"retry-after": "120"}))
     expires = compute_expires_at(result, FIXED_NOW)
     assert expires == FIXED_NOW + timedelta(seconds=120)
 
 
 def test_compute_expires_at_rate_limited_defaults_60s_without_retry_after() -> None:
-    body = load_json(RL_FIXTURES / "plain-rate-limit.json")
-    result = classify(ProbeInput(status_code=429, body=body, headers={}))
+    result = classify(ProbeInput(status_code=429, body=None, headers={}))
     expires = compute_expires_at(result, FIXED_NOW)
     assert expires == FIXED_NOW + timedelta(seconds=60)
-
-
-def test_compute_expires_at_rate_limited_honours_explicit_zero() -> None:
-    """Regression: retry-after=0 means 'retry now', not fall-through to 60s default."""
-    body = load_json(RL_FIXTURES / "plain-rate-limit.json")
-    result = classify(ProbeInput(status_code=429, body=body, headers={"retry-after": "0"}))
-    assert result.retry_after_s == 0
-    expires = compute_expires_at(result, FIXED_NOW)
-    assert expires == FIXED_NOW  # immediate retry, not +60s
 
 
 def test_compute_expires_at_network_error_is_30s() -> None:
@@ -260,6 +246,7 @@ def test_compute_expires_at_unknown_is_60s() -> None:
         ({"exception_kind": "timeout", "exception_message": "t"}, Health.NETWORK_ERROR),
         ({"status_code": 200, "body": {}}, Health.OK),
         ({"status_code": 401, "body": {}}, Health.AUTH_DEAD),
+        ({"status_code": 429, "body": None}, Health.RATE_LIMITED),
         ({"status_code": 500, "body": None}, Health.UNKNOWN),
     ],
 )

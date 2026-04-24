@@ -59,6 +59,7 @@ EXIT_UNAVAILABLE = 9
 REASON_TO_EXIT: dict[PickFailureReason, int] = {
     PickFailureReason.NO_PROFILES: EXIT_UNAVAILABLE,
     PickFailureReason.ALL_AUTH_DEAD: EXIT_AUTH_REQUIRED,
+    PickFailureReason.ALL_AUTH_EXPIRED: EXIT_AUTH_REQUIRED,
     PickFailureReason.ALL_WEEKLY: EXIT_UNAVAILABLE,
     PickFailureReason.ALL_THROTTLED: EXIT_RATE_LIMITED,
     PickFailureReason.ALL_TERMINAL: EXIT_UNAVAILABLE,
@@ -71,6 +72,9 @@ REASON_MESSAGES: dict[PickFailureReason, str] = {
     ),
     PickFailureReason.ALL_AUTH_DEAD: (
         "No authenticated profiles. Run: claude login --profile <name>"
+    ),
+    PickFailureReason.ALL_AUTH_EXPIRED: (
+        "All access tokens expired. Run: claude-lb refresh --expired"
     ),
     PickFailureReason.ALL_WEEKLY: "All profiles weekly-exhausted.",
     PickFailureReason.ALL_THROTTLED: "All profiles throttled.",
@@ -551,6 +555,196 @@ def top_invalidate(
 
 
 # ---------------------------------------------------------------------------
+# profiles refresh (alias: refresh)
+# ---------------------------------------------------------------------------
+
+
+def _run_refresh(
+    names: list[str],
+    *,
+    all_profiles: bool,
+    expired_only: bool,
+    timeout: float,
+    json_output: bool,
+) -> None:
+    from datetime import UTC, datetime
+
+    from .refresh import refresh_many_sync
+
+    discovered = discover_profiles()
+    if not discovered:
+        if json_output:
+            emit_error_json("NOT_FOUND", "No profiles discovered.")
+        stderr.print("[yellow]No profiles discovered.[/yellow]")
+        raise typer.Exit(EXIT_UNAVAILABLE)
+
+    by_name = {p.name: p for p in discovered}
+
+    if names and (all_profiles or expired_only):
+        if json_output:
+            emit_error_json(
+                "VALIDATION_ERROR",
+                "Pass either <name>... or --all/--expired, not both.",
+            )
+        stderr.print("[red]Pass either <name>... or --all/--expired, not both.[/red]")
+        raise typer.Exit(EXIT_VALIDATION)
+    if not names and not all_profiles and not expired_only:
+        if json_output:
+            emit_error_json(
+                "VALIDATION_ERROR",
+                "Specify one or more profile names, --all, or --expired.",
+            )
+        stderr.print(
+            "[red]Specify one or more profile names, --all, or --expired.[/red]"
+        )
+        raise typer.Exit(EXIT_VALIDATION)
+
+    if names:
+        missing = [n for n in names if n not in by_name]
+        if missing:
+            if json_output:
+                emit_error_json(
+                    "NOT_FOUND",
+                    f"No such profile(s): {', '.join(missing)}",
+                )
+            stderr.print(f"[red]No such profile(s):[/red] {', '.join(missing)}")
+            raise typer.Exit(EXIT_NOT_FOUND)
+        targets = [by_name[n] for n in names]
+    elif expired_only:
+        now = datetime.now(UTC)
+        targets = [
+            p
+            for p in discovered
+            if p.access_token_expires_at is not None and p.access_token_expires_at <= now
+        ]
+    else:
+        targets = list(discovered)
+
+    if not targets:
+        if json_output:
+            emit_json({"data": [], "meta": {"count": 0, "refreshed": 0, "failed": 0}})
+            return
+        stderr.print("[green]Nothing to refresh.[/green]")
+        return
+
+    results = refresh_many_sync(targets, timeout=timeout)
+    refreshed_count = sum(1 for r in results if r.refreshed)
+    failed_count = len(results) - refreshed_count
+
+    # Invalidate cache entries for successfully refreshed profiles so the
+    # next status/pick call probes with the new accessToken.
+    for r in results:
+        if r.refreshed:
+            remove_profile(r.name)
+
+    if json_output:
+        emit_json(
+            {
+                "data": [
+                    {
+                        "name": r.name,
+                        "refreshed": r.refreshed,
+                        "previous_expires_at": (
+                            r.previous_expires_at.isoformat().replace("+00:00", "Z")
+                            if r.previous_expires_at
+                            else None
+                        ),
+                        "new_expires_at": (
+                            r.new_expires_at.isoformat().replace("+00:00", "Z")
+                            if r.new_expires_at
+                            else None
+                        ),
+                        "error": (
+                            None
+                            if r.refreshed
+                            else {"code": r.error_code, "message": r.error_message}
+                        ),
+                    }
+                    for r in results
+                ],
+                "meta": {
+                    "count": len(results),
+                    "refreshed": refreshed_count,
+                    "failed": failed_count,
+                },
+            }
+        )
+        if failed_count and not refreshed_count:
+            raise typer.Exit(EXIT_AUTH_REQUIRED)
+        if failed_count:
+            raise typer.Exit(EXIT_ERROR)
+        return
+
+    for r in results:
+        if r.refreshed:
+            when = (
+                r.new_expires_at.isoformat().replace("+00:00", "Z")
+                if r.new_expires_at
+                else "(unknown)"
+            )
+            stderr.print(f"[green]Refreshed[/green] {r.name} — new expiry: {when}")
+        else:
+            stderr.print(
+                f"[red]Failed[/red] {r.name}: "
+                f"{r.error_code or 'ERROR'} — {r.error_message or ''}"
+            )
+
+    if failed_count and not refreshed_count:
+        raise typer.Exit(EXIT_AUTH_REQUIRED)
+    if failed_count:
+        raise typer.Exit(EXIT_ERROR)
+
+
+@profiles_app.command("refresh")
+def profiles_refresh(
+    names: Annotated[
+        list[str] | None,
+        typer.Argument(help="Profile name(s) to refresh. Omit with --all or --expired."),
+    ] = None,
+    all_profiles: Annotated[
+        bool, typer.Option("--all", help="Refresh every discovered profile.")
+    ] = False,
+    expired_only: Annotated[
+        bool,
+        typer.Option(
+            "--expired",
+            help="Refresh only profiles whose access token is already expired.",
+        ),
+    ] = False,
+    timeout: Annotated[
+        float, typer.Option("--timeout", help="HTTP timeout per refresh, seconds.")
+    ] = 10.0,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Exchange stored refresh tokens for fresh access tokens (SPEC §10)."""
+    _run_refresh(
+        list(names or []),
+        all_profiles=all_profiles,
+        expired_only=expired_only,
+        timeout=timeout,
+        json_output=json_output,
+    )
+
+
+@app.command("refresh")
+def top_refresh(
+    names: Annotated[list[str] | None, typer.Argument()] = None,
+    all_profiles: Annotated[bool, typer.Option("--all")] = False,
+    expired_only: Annotated[bool, typer.Option("--expired")] = False,
+    timeout: Annotated[float, typer.Option("--timeout")] = 10.0,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Alias for `profiles refresh`."""
+    _run_refresh(
+        list(names or []),
+        all_profiles=all_profiles,
+        expired_only=expired_only,
+        timeout=timeout,
+        json_output=json_output,
+    )
+
+
+# ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
 
@@ -637,7 +831,7 @@ def _summary_line(cache: HealthCache, names: list[str]) -> str:
         counts[key] = counts.get(key, 0) + 1
     total = len(names)
     parts = [f"{total} profile{'s' if total != 1 else ''}"]
-    for k in ("ok", "rate_limited", "session_limit", "weekly_limit", "auth_dead", "network_error", "unknown"):
+    for k in ("ok", "rate_limited", "session_limit", "weekly_limit", "auth_expired", "auth_dead", "network_error", "unknown"):
         if counts.get(k, 0):
             parts.append(f"{counts[k]} {k}")
     return " · ".join(parts)

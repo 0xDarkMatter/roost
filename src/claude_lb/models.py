@@ -9,12 +9,13 @@ from pydantic import BaseModel, Field
 
 
 class Health(str, Enum):
-    """Seven-state health taxonomy (SPEC §6)."""
+    """Eight-state health taxonomy (SPEC §6)."""
 
     OK = "ok"
     RATE_LIMITED = "rate_limited"
     SESSION_LIMIT = "session_limit"
     WEEKLY_LIMIT = "weekly_limit"
+    AUTH_EXPIRED = "auth_expired"
     AUTH_DEAD = "auth_dead"
     NETWORK_ERROR = "network_error"
     UNKNOWN = "unknown"
@@ -34,6 +35,7 @@ class Health(str, Enum):
         return self in (
             Health.RATE_LIMITED,
             Health.SESSION_LIMIT,
+            Health.AUTH_EXPIRED,
             Health.NETWORK_ERROR,
             Health.UNKNOWN,
         )
@@ -47,10 +49,17 @@ class ErrorInfo(BaseModel):
 
 
 class Usage(BaseModel):
-    """Optional usage enrichment (may be None if no API available)."""
+    """Usage percentages sourced from /api/oauth/usage (SPEC §7).
+
+    All fields are 0-100 integers, rounded from the upstream float.
+    `None` means the corresponding window was absent or the probe could not
+    read it (e.g. 403 scope-missing fallback).
+    """
 
     session_pct: int | None = None
     weekly_pct: int | None = None
+    sonnet_pct: int | None = None
+    opus_pct: int | None = None
 
 
 class ProfileHealth(BaseModel):
@@ -85,6 +94,8 @@ class Profile(BaseModel):
     credentials_path: str
     credentials_mtime: float
     token_source: str = "claudeAiOauth.accessToken"
+    access_token_expires_at: datetime | None = None
+    refresh_token_present: bool = False
 
 
 class ClassificationResult(BaseModel):
@@ -95,3 +106,4 @@ class ClassificationResult(BaseModel):
     retry_after_s: int | None = None
     session_reset_at: datetime | None = None
     weekly_reset_at: datetime | None = None
+    usage: Usage | None = None
