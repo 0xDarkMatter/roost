@@ -1,0 +1,7 @@
+{
+  "type": "error",
+  "error": {
+    "type": "rate_limit_error",
+    "message": "You have reached your weekly plan limit. Your 7-day limit resets Sunday at 02:00 UTC. Consider upgrading your plan."
+  }
+}

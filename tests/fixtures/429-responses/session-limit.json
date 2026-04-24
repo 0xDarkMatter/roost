@@ -1,0 +1,7 @@
+{
+  "type": "error",
+  "error": {
+    "type": "rate_limit_error",
+    "message": "You have reached the current session limit. Your 5-hour session will reset at 2026-04-24T14:45:00Z."
+  }
+}

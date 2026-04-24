@@ -1,0 +1,696 @@
+# claude-lb Specification
+
+> Version 0.1 · 2026-04-24
+> CLI shape adapted from [Forma Protocol](file:///X:/Forma/00_forma/docs/protocol/) v1.4 · domain-specific content is claude-lb's own.
+
+---
+
+## Contents
+
+| § | Title |
+|---|---|
+| 1 | [Philosophy](#1-philosophy) |
+| 2 | [Command Architecture](#2-command-architecture) |
+| 3 | [Output Specification](#3-output-specification) |
+| 4 | [Exit Codes](#4-exit-codes) |
+| 5 | [Error Handling](#5-error-handling) |
+| 6 | **[Health Taxonomy](#6-health-taxonomy)** |
+| 7 | **[Probe Protocol](#7-probe-protocol)** |
+| 8 | **[Cache Protocol](#8-cache-protocol)** |
+| 9 | **[Pick Algorithm](#9-pick-algorithm)** |
+| 10 | [Credential Discovery](#10-credential-discovery) |
+| 11 | [Shell Integration](#11-shell-integration) |
+| 12 | [Project Structure](#12-project-structure) |
+| 13 | [Compliance Checklist](#13-compliance-checklist) |
+
+Sections **6–9 are the core of claude-lb**. Everything else is boilerplate Forma-protocol compliance.
+
+---
+
+## 1. Philosophy
+
+Built as a Forma CLI — agentic-first, composable, parseable, quiet-by-default.
+
+| Principle | Meaning |
+|---|---|
+| **Stateless, single-shot** | No daemon. Every invocation returns a result and exits. |
+| **Cache is best-effort** | If the cache is missing or stale, probe. Never fail because cache is unreadable. |
+| **Local credentials only** | Never transmits tokens. Only reads `~/.claude-profiles/*/.credentials.json` that the `claude` CLI already placed on disk. |
+| **Fail open, report honestly** | On network error, classify as `network-error` and move on. Don't crash the calling script. |
+| **Taxonomy is the value** | Four distinct 429 states, three distinct auth states. The lazy tool rotates on any non-200. The right tool distinguishes. |
+
+### Design axioms (Forma §1)
+
+1. `stdout` is sacred — only data, never progress.
+2. `stderr` is for humans — tables, colors, warnings.
+3. Exit codes have meaning — scripts branch on failure mode.
+4. `--help` is comprehensive and current.
+5. JSON shape is predictable — same `{data, meta}` envelope as every other Forma CLI.
+
+---
+
+## 2. Command Architecture
+
+### Structural pattern (Forma §2)
+
+```
+claude-lb [global-opts] <resource> <action> [opts]
+```
+
+Single resource: `profiles`. For convenience, top-level aliases collapse the resource word.
+
+### Commands
+
+| Command | Alias | Description |
+|---|---|---|
+| `claude-lb profiles list` | `claude-lb list` | List discovered profiles (no probe) |
+| `claude-lb profiles status` | `claude-lb status` | Show cached health + usage per profile |
+| `claude-lb profiles show <name>` | `claude-lb show <name>` | One profile's full health detail |
+| `claude-lb profiles probe [<name>]` | `claude-lb probe` | Live-probe (all or one); update cache |
+| `claude-lb profiles pick [--strategy <s>]` | `claude-lb pick` | Return the best healthy profile name |
+| `claude-lb profiles invalidate <name>` | `claude-lb invalidate <name>` | Drop cache for a profile; forces re-probe |
+| `claude-lb --version` | — | Print semver, exit 0 |
+| `claude-lb --help` | — | Show help, exit 0 |
+
+### Naming conventions (Forma §2)
+
+| Element | Convention |
+|---|---|
+| Tool name | `claude-lb` (lowercase, 9 chars, one hyphen — kept under 12 per Forma) |
+| Resource | `profiles` (plural noun) |
+| Actions | lowercase verbs (`list`, `probe`, `pick`) |
+| Long flags | kebab-case (`--strategy`, `--no-cache`, `--json`) |
+| Short flags | single letter where standard (`-n` count, `-q` quiet, `-v` verbose) |
+
+---
+
+## 3. Output Specification
+
+### Stream separation (Forma §4)
+
+| Stream | Content |
+|---|---|
+| **stdout** | Data only — JSON if `--json`, text columns otherwise |
+| **stderr** | Progress, tables, colors, warnings, debug |
+
+### `profiles status` — default (interactive TTY)
+
+```
+Profile       Health          Retry             Weekly   Probed
+────────      ──────          ─────             ──────   ──────
+account-a        ok              —                 9%       38s ago
+account-b    ok              —                 9%       12m ago  (cache)
+account-c        auth-dead       claude login      —        1m ago
+```
+
+Table to stderr, status summary to stdout:
+
+```
+3 profiles · 2 ok · 1 auth-dead
+```
+
+### `profiles status --json`
+
+```json
+{
+  "data": [
+    {
+      "name": "account-a",
+      "health": "ok",
+      "probed_at": "2026-04-24T09:45:12Z",
+      "usage": {"weekly_pct": 9, "session_pct": 0},
+      "retry_after_s": null,
+      "weekly_reset_at": "2026-04-26T16:00:00Z",
+      "error": null
+    },
+    {
+      "name": "account-c",
+      "health": "auth-dead",
+      "probed_at": "2026-04-24T09:45:12Z",
+      "usage": null,
+      "retry_after_s": null,
+      "weekly_reset_at": null,
+      "error": {"type": "authentication_error", "message": "Invalid authentication credentials"}
+    }
+  ],
+  "meta": {
+    "count": 3,
+    "ok": 2,
+    "rate_limited": 0,
+    "session_limit": 0,
+    "weekly_limit": 0,
+    "auth_dead": 1,
+    "network_error": 0,
+    "cache_source": "mixed"
+  }
+}
+```
+
+### `profiles pick` — plain output
+
+```
+account-a
+```
+
+**One profile name, newline-terminated, nothing else.** This is the scripting contract. Break this and every downstream shell script breaks.
+
+### `profiles pick --export`
+
+```
+AXIOM_CLAUDE_PROFILE=account-a
+```
+
+Shell-sourceable via `eval $(claude-lb pick --export)`. No quoting — profile names are guaranteed `[a-zA-Z0-9_-]+` (same constraint as directory names under `~/.claude-profiles/`).
+
+### `profiles pick --json`
+
+```json
+{
+  "data": {
+    "name": "account-a",
+    "health": "ok",
+    "score": 0.91,
+    "rationale": "lowest weekly usage among healthy"
+  }
+}
+```
+
+### Field conventions (Forma §4)
+
+| Type | JSON type | Example |
+|---|---|---|
+| Timestamps | ISO 8601 UTC | `"2026-04-24T09:45:12Z"` |
+| Durations | integer seconds | `"retry_after_s": 60` |
+| Usage fractions | integer % (0–100) | `"weekly_pct": 9` |
+| Enums | lower_snake_case | `"health": "rate_limited"` |
+| Nulls | explicit | `"error": null` |
+
+**Deviation from Forma:** enum values use `lower_snake_case` rather than `UPPER_SNAKE_CASE` because these map 1:1 to Anthropic's `error.type` values (which are lowercase). Consistency with the upstream API wins.
+
+---
+
+## 4. Exit Codes
+
+Standard Forma (§5) mapping:
+
+| Code | Name | When |
+|---|---|---|
+| 0 | SUCCESS | Picked a healthy profile, or status rendered cleanly |
+| 1 | ERROR | Unexpected failure |
+| 2 | AUTH_REQUIRED | `pick` found zero profiles with `auth-dead` across the board — operator must `claude login` |
+| 3 | NOT_FOUND | `show <name>` / `probe <name>` given unknown profile |
+| 4 | VALIDATION | Bad flag combination (e.g. `--strategy unknown`) |
+| 5 | FORBIDDEN | `pick --require=ok` but no profile currently `ok` |
+| 6 | RATE_LIMITED | All healthy profiles are `rate_limited` or `session_limit`; no pick available |
+| 8 | TIMEOUT | Probe timed out (uses `--timeout`, default 10s) |
+| 9 | UNAVAILABLE | All profiles in terminal-bad states (`weekly_limit` / `auth_dead`) |
+
+### Scripting example
+
+```bash
+profile=$(claude-lb pick 2>/dev/null)
+case $? in
+  0) export AXIOM_CLAUDE_PROFILE="$profile" ;;
+  5) echo "no ok profiles; sleeping 60s then retrying with rate-limited allowed" >&2; sleep 60 ;;
+  6) echo "all profiles throttled; backing off" >&2; sleep 300 ;;
+  9) echo "all profiles exhausted or dead; operator intervention required" >&2; exit 1 ;;
+  *) exit 1 ;;
+esac
+```
+
+---
+
+## 5. Error Handling
+
+Forma §6 error envelope:
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Unknown strategy 'frobulate'",
+    "details": {"allowed": ["round-robin", "least-used", "weighted"]}
+  }
+}
+```
+
+Always: data-structured JSON to stdout when `--json`, human message to stderr, semantic exit code.
+
+---
+
+## 6. Health Taxonomy
+
+**The heart of the tool.** Seven states, each with a distinct signal source, TTL, and next-action.
+
+| State | Detection | TTL in cache | Next-action hint |
+|---|---|---|---|
+| `ok` | HTTP 200 from `/v1/models` | 5 min | — |
+| `rate_limited` | HTTP 429, `retry-after` header present and < 3600s | `retry-after` seconds | Retry in N seconds |
+| `session_limit` | HTTP 429, body `error.type == rate_limit_error`, message contains `"session"` / `"5-hour"` / `"hourly"` | until `session_reset_at` (parsed from body, or +5h from probe time) | Skip until session reset |
+| `weekly_limit` | HTTP 429, body matches `"weekly"` / `"plan"` / `"7-day"` / `"Sunday"` patterns | until `weekly_reset_at` (parsed from body if available, else next Sunday 02:00 local time) | Skip until weekly reset; operator tier upgrade may be needed |
+| `auth_dead` | HTTP 401, body `error.type == authentication_error` | infinite (manual invalidation only) | `claude login --profile <name>` |
+| `network_error` | timeout / DNS / TLS / refused | 30 sec | Transient; retry |
+| `unknown` | any other response (5xx, unexpected 4xx, malformed body) | 60 sec | Logged for operator review |
+
+### Classification order (first match wins)
+
+```
+1. if exception (timeout, DNS, TLS):        network_error
+2. if HTTP 200:                              ok
+3. if HTTP 401:                              auth_dead
+4. if HTTP 429:
+     body classification:
+       if error.type == rate_limit_error AND weekly_keywords in message: weekly_limit
+       elif error.type == rate_limit_error AND session_keywords in message: session_limit
+       elif retry-after header present: rate_limited
+       else: rate_limited
+5. if HTTP 403:                              if prev-known-ok for profile, treat as plan-quota-exhausted → map to weekly_limit; else unknown
+6. otherwise:                                unknown
+```
+
+### Keyword matching (string-contains, case-insensitive)
+
+- Session keywords: `"session"`, `"5-hour"`, `"5 hour"`, `"hourly"`, `"current session"`
+- Weekly keywords: `"weekly"`, `"week"`, `"plan"`, `"7-day"`, `"7 day"`, `"sunday"`, `"resets sun"`
+
+Anthropic's rate-limit error messages are not a stable contract. The keyword list MUST be easy to extend without code changes — externalise to `claude_lb/patterns.py` or similar.
+
+### Usage stats (optional enrichment)
+
+If Anthropic exposes a usage endpoint (TBD — probe during implementation), enrich `data[].usage`:
+
+- `session_pct` — current session % used
+- `weekly_pct` — current weekly % used
+- `session_reset_at` — when session limit resets (ISO UTC)
+- `weekly_reset_at` — when weekly limit resets (ISO UTC)
+
+If no such endpoint exists, leave `usage: null`. The taxonomy works without usage stats — they're nice-to-have.
+
+---
+
+## 7. Probe Protocol
+
+### Endpoint
+
+```
+GET https://api.anthropic.com/v1/models
+```
+
+**Why `/v1/models`:** cheapest idempotent endpoint that requires auth. Returns a list of available models. Does not count against message quotas. Verified behavior during implementation (may change — document any findings).
+
+**Alternatives considered:**
+- `POST /v1/messages` with a 1-token request — works but costs tokens
+- `GET /v1/organizations` — may not exist or require different scope
+
+### Request
+
+```http
+GET /v1/models HTTP/1.1
+Host: api.anthropic.com
+Authorization: Bearer <oauth-access-token>
+anthropic-version: 2023-06-01
+User-Agent: claude-lb/0.1
+```
+
+The OAuth access token is read from `~/.claude-profiles/<name>/.credentials.json` (see §10).
+
+### Response classification
+
+Per §6 table. Parse body as JSON; gracefully handle non-JSON with `unknown`.
+
+### Timeout
+
+Default 10 seconds per probe (configurable via `--timeout`). Concurrent probes across profiles via `httpx.AsyncClient` + `asyncio.gather` — all profiles probed in parallel.
+
+### Rate limit for the probe itself
+
+One probe per profile per invocation unless `--all` is used with `invalidate`. Cache-first read path means routine `status` / `pick` never probes unless cache is stale.
+
+---
+
+## 8. Cache Protocol
+
+### Location
+
+| Platform | Path |
+|---|---|
+| Linux / macOS | `~/.config/claude-lb/health.json` |
+| Windows | `%APPDATA%\claude-lb\health.json` |
+
+XDG override respected: `$XDG_CONFIG_HOME/claude-lb/health.json`.
+
+### Schema
+
+```json
+{
+  "schema_version": 1,
+  "updated_at": "2026-04-24T09:45:12Z",
+  "profiles": {
+    "account-a": {
+      "health": "ok",
+      "probed_at": "2026-04-24T09:45:12Z",
+      "expires_at": "2026-04-24T09:50:12Z",
+      "error": null,
+      "retry_after_s": null,
+      "session_reset_at": null,
+      "weekly_reset_at": "2026-04-26T16:00:00Z",
+      "usage": {"weekly_pct": 9, "session_pct": 0},
+      "probe_latency_ms": 287
+    },
+    "account-c": {
+      "health": "auth_dead",
+      "probed_at": "2026-04-24T09:45:12Z",
+      "expires_at": null,
+      "error": {
+        "type": "authentication_error",
+        "message": "Invalid authentication credentials"
+      }
+    }
+  }
+}
+```
+
+### Freshness check
+
+A cached entry is **fresh** iff `probed_at <= now() <= expires_at`. Past `expires_at`, the entry is re-probed on next `status`/`pick` call (unless `--no-cache` forces all-probe).
+
+`auth_dead` entries have `expires_at: null` — they never expire until manually invalidated via `claude-lb invalidate <name>` or until the profile's `.credentials.json` mtime changes (treat mtime bump as implicit invalidation).
+
+### Concurrency
+
+Cache writes use **atomic write-rename** (`tempfile` in same dir + `os.replace`). Reads use a brief shared lock. Conflicts are rare; worst case, last-writer-wins is acceptable.
+
+### Cache flags
+
+- `--no-cache` — ignore cache entirely, probe everything
+- `--refresh` — probe everything, write back to cache (same as `probe` action)
+- `--max-age <seconds>` — override default TTLs with a single value
+
+---
+
+## 9. Pick Algorithm
+
+### Inputs
+
+- Discovered profile list (§10)
+- Health cache (§8), refreshed if stale
+
+### Strategies (`--strategy`)
+
+| Strategy | Behavior |
+|---|---|
+| `sticky` | **Default.** Prefer the most-recently-picked profile *if still healthy and within stickiness window*. Else fall back to `least-used`. Maximises prompt-cache locality across back-to-back parcels. |
+| `least-used` | Prefer `ok` profiles, sorted by `usage.weekly_pct` ascending, then by `probed_at` descending (most recently verified) |
+| `round-robin` | Prefer `ok` profiles, sorted by last-picked timestamp from `~/.config/claude-lb/picks.log` ascending. Good when load-spreading beats cache locality. |
+| `weighted` | Like `least-used` but multiplies by `1 / (session_pct + 1)` so a profile with low session usage beats one with low weekly usage |
+| `first-healthy` | Iterate in discovery order; return first `ok`. Deterministic testing. |
+
+### Stickiness
+
+**Why it matters:** Anthropic's prompt cache is **per-account**. Switching profile across back-to-back parcel dispatches invalidates the cache for the new account's first request. For workloads that touch overlapping context (same codebase, same docs), staying on one profile compounds cache hits and reduces both quota burn and latency.
+
+**Configuration:**
+
+```bash
+claude-lb pick --stickiness 300       # Stick for 5 min (default)
+claude-lb pick --stickiness 0         # Disable stickiness entirely
+claude-lb pick --strategy round-robin # Load-spread explicitly (ignores stickiness)
+```
+
+**Algorithm:**
+
+```
+1. Read last-picked entry from ~/.config/claude-lb/picks.log
+2. If last_pick.profile exists in discovered list
+   AND last_pick.profile is currently `ok`
+   AND (now - last_pick.timestamp) < stickiness_seconds:
+      → return last_pick.profile
+3. Else fall through to the configured strategy
+```
+
+**Env var:** `CLAUDE_LB_STICKINESS=<seconds>` (default 300). A stickiness of 0 disables the behaviour and reverts to the configured strategy.
+
+**Max plan note:** on pay-per-token API keys, prompt cache hits cost ~10% of input tokens, saving materially on long contexts. On Max subscriptions the cost model is flat-rate but sessions / weekly budgets are token-counted; whether cache hits count less against Max quotas is undocumented as of 2026-04 — see [HANDOFF.md "open questions"]. Stickiness is beneficial either way: cache hits on Max plans reduce latency even if they don't reduce quota burn.
+
+### Filter ladder
+
+```
+1. Start with all discovered profiles
+2. Drop auth_dead
+3. Drop weekly_limit where weekly_reset_at > now
+4. Drop session_limit where session_reset_at > now
+5. Drop rate_limited where retry_after_s > now (from probed_at)
+6. If --require=ok: drop anything not ok
+7. Sort by strategy
+8. Return top 1 (or all, for `--all`)
+```
+
+### Empty-set behaviour
+
+| Situation | Exit code | stderr message |
+|---|---|---|
+| All `auth_dead` | 2 | `No authenticated profiles. Run: claude login --profile <name>` |
+| All `weekly_limit` | 9 | `All profiles weekly-exhausted. Earliest reset: <timestamp>` |
+| All in any terminal-bad state | 9 | `No profiles available. Run: claude-lb status` |
+| `--require=ok` with no `ok` | 5 | `No profiles currently ok. Run: claude-lb probe` |
+| Some `rate_limited` / `session_limit` still within their TTL | 6 | `All profiles throttled. Earliest retry: <timestamp>` |
+
+### Pick log (audit trail)
+
+Every successful pick appends to `~/.config/claude-lb/picks.log`:
+
+```
+2026-04-24T09:45:12Z	account-a	least-used	score=0.91
+```
+
+Tab-separated, append-only, automatic rotation at 10MB (drop oldest half).
+
+---
+
+## 10. Credential Discovery
+
+### Discovery paths
+
+First hit wins:
+
+1. `$CLAUDE_LB_PROFILES_DIR` — explicit env override, absolute path to a directory containing `<name>/.credentials.json` subtrees
+2. `~/.claude-profiles/` — default, canonical path set by Claude Code CLI's profile system
+3. `$CLAUDE_CONFIG_DIR` — single-profile fallback: if the dir contains `.credentials.json` directly, treat as profile named `default`
+
+Profile name = subdirectory name. Constraint: `[a-zA-Z0-9_-]+`. Dirs not matching are skipped silently.
+
+### Credential extraction
+
+Read `<profile_dir>/.credentials.json`. Shape as of Claude Code 1.x:
+
+```json
+{
+  "claudeAiOauth": {
+    "accessToken": "sk-ant-oat01-...",
+    "refreshToken": "sk-ant-ort01-...",
+    "expiresAt": 1730000000000,
+    "scopes": ["user:inference", "user:profile"],
+    "subscriptionType": "max"
+  }
+}
+```
+
+Token extraction order (first match wins, to be robust against format drift):
+
+1. `.claudeAiOauth.accessToken` (modern)
+2. `.oauthAccessToken` (legacy)
+3. `.accessToken` (plain)
+
+If none present → classify profile as `auth_dead` with `error.type = "missing_token"`.
+
+### Token refresh
+
+**Out of scope for v0.1.** We don't refresh expired OAuth tokens; we report `auth_dead` and tell the operator to `claude login --profile <name>`. Token refresh may be added later, borrowing patterns from [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) (MIT).
+
+### Never touch
+
+- `~/.claude/` (single-profile state — belongs to the main login)
+- `~/.claude-profiles/<name>/projects/` (session state)
+- `~/.claude-profiles/<name>/shell-snapshots/` (shell history)
+- Anything outside `.credentials.json`
+
+---
+
+## 11. Shell Integration
+
+### `pick --export`
+
+```bash
+$ claude-lb pick --export
+AXIOM_CLAUDE_PROFILE=account-a
+```
+
+Output format:
+
+- `<VAR>=<value>` on stdout, nothing else
+- Variable name: `AXIOM_CLAUDE_PROFILE` by default (matches Axiom's var); override with `--var-name <NAME>`
+
+Usage:
+
+```bash
+eval $(claude-lb pick --export)
+# $AXIOM_CLAUDE_PROFILE is now set in current shell
+```
+
+### Shell completion (optional)
+
+Via Typer's `--install-completion`. Bash / Zsh / Fish / PowerShell.
+
+### Exit code scripting
+
+See §4. Every exit code mapped to a concrete operator / retry action.
+
+---
+
+## 12. Project Structure
+
+Standard Forma §16 layout, Python + `uv`:
+
+```
+claude-lb/
+├── README.md                     # This file
+├── SPEC.md                       # This spec
+├── HANDOFF.md                    # For the build agent
+├── LICENSE                       # MIT
+├── pyproject.toml                # Package config + [tool.forma]
+├── docs/
+│   └── references/               # Links to prior art (TeamClaude etc.)
+├── src/claude_lb/
+│   ├── __init__.py               # Version
+│   ├── cli.py                    # Typer CLI entry point
+│   ├── discovery.py              # ~/.claude-profiles/ walk + credentials.json parse
+│   ├── probe.py                  # async httpx probe + classification
+│   ├── taxonomy.py               # Health enum + classifier (the §6 logic)
+│   ├── cache.py                  # Read/write ~/.config/claude-lb/health.json
+│   ├── pick.py                   # Strategies + filter ladder
+│   ├── output.py                 # stdout/stderr separation, JSON envelope
+│   └── patterns.py               # Externalised keyword lists for 429 classification
+└── tests/
+    ├── conftest.py
+    ├── fixtures/
+    │   └── 429-responses/        # Real Anthropic 429 bodies for classification tests
+    ├── test_taxonomy.py          # Classifier must correctly parse each fixture
+    ├── test_discovery.py         # tmp_path + synthetic .credentials.json
+    ├── test_cache.py             # TTL + atomic writes + concurrent access
+    ├── test_pick.py              # Each strategy against fixed fixtures
+    └── test_cli.py               # End-to-end via Typer's test runner
+```
+
+### `pyproject.toml`
+
+```toml
+[project]
+name = "claude-lb"
+version = "0.1.0"
+description = "Claude Code profile health + load balancer"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "httpx>=0.25.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.3",
+    "mypy>=1.8",
+]
+
+[project.scripts]
+claude-lb = "claude_lb.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_lb"]
+
+[tool.forma]
+description = "Pick the healthiest Claude Code Max profile"
+resources = ["profiles"]
+auth = "none"
+status = "experimental"
+origin = "forma"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+```
+
+### Install
+
+```bash
+# From repo root:
+uv tool install --editable .
+
+# Then anywhere:
+claude-lb status
+```
+
+---
+
+## 13. Compliance Checklist
+
+### Minimum viable
+
+- [ ] `claude-lb profiles list` works
+- [ ] `claude-lb profiles probe` live-probes all discovered profiles
+- [ ] `claude-lb profiles status` renders cached health in a rich table (stderr) + JSON summary (stdout)
+- [ ] `claude-lb profiles pick` returns exactly one healthy profile name on stdout, exit 0
+- [ ] All §6 seven states classified correctly from real Anthropic response fixtures
+- [ ] `--json` works on every command
+- [ ] Semantic exit codes (§4)
+- [ ] Cache at `~/.config/claude-lb/health.json` with atomic writes
+- [ ] Cross-platform paths (Linux/macOS/Windows)
+- [ ] 90%+ test coverage on `taxonomy.py`, `discovery.py`, `pick.py`
+
+### Complete
+
+- [ ] `pick --export` emits shell-sourceable `VAR=value`
+- [ ] `pick --strategy round-robin|least-used|weighted|first-healthy`
+- [ ] `invalidate <name>` drops cache entry; mtime bump on credentials.json auto-invalidates
+- [ ] `probe --parallel` concurrent probes via `asyncio.gather`
+- [ ] `--max-age <seconds>` overrides default TTLs
+- [ ] Pick log at `~/.config/claude-lb/picks.log` with 10MB rotation
+- [ ] `--verbose` dumps full probe payloads to stderr for debugging
+- [ ] README includes runnable examples for every command
+- [ ] CI (GitHub Actions): lint + type-check + test on 3.11 / 3.12 / 3.13 across Linux / macOS / Windows
+
+### Stretch
+
+- [ ] Token refresh when Claude Code CLI's own refresh mechanism is documented (borrow from [teamclaude](https://github.com/KarpelesLab/teamclaude))
+- [ ] Shell completion installer
+- [ ] `claude-lb doctor` — diagnose "why is profile X not picked?" with rationale trace
+- [ ] Optional Anthropic usage API integration (if/when endpoint available publicly)
+
+---
+
+## References
+
+- [Forma Protocol v1.4](file:///X:/Forma/00_forma/docs/protocol/) — CLI shape parent
+- [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) — 28k★ transparent HTTP proxy with multi-account rotation
+- [TeamClaude](https://github.com/KarpelesLab/teamclaude) — MIT, Node, closest conceptual prior art; good OAuth refresh logic to borrow
+- [vibeproxy](https://github.com/automazeio/vibeproxy) — macOS menu bar GUI wrapping CLIProxyAPIPlus
+- [CCS / Claude Code Switch](https://github.com/kaitranntt/ccs) — CLI credential swapper
+- [anthropics/claude-code issue #44687](https://github.com/anthropics/claude-code/issues/44687) — open issue: multi-account not built-in
+
+---
+
+*Spec v0.1 · 2026-04-24 · adapted from Forma Protocol v1.4.*
