@@ -532,3 +532,144 @@ def test_count_fails_when_no_candidates_pass_ladder() -> None:
     assert outcome.chosen is None
     assert outcome.chosen_many == []
     assert outcome.reason is PickFailureReason.ALL_AUTH_DEAD
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — _iso / _parse_iso symmetry + degenerate inputs
+# ---------------------------------------------------------------------------
+
+
+def test_pick_iso_handles_none_input() -> None:
+    from claude_lb.pick import _iso
+
+    assert _iso(None) is None
+
+
+def test_pick_iso_assumes_utc_for_naive_datetime() -> None:
+    from datetime import datetime as _dt
+
+    from claude_lb.pick import _iso
+
+    out = _iso(_dt(2026, 4, 25, 10, 30))
+    assert out is not None
+    assert out.endswith("+00:00")
+
+
+def test_pick_parse_iso_handles_none_and_empty() -> None:
+    from claude_lb.pick import _parse_iso
+
+    assert _parse_iso(None) is None
+    assert _parse_iso("") is None
+
+
+def test_pick_parse_iso_handles_z_suffix() -> None:
+    from claude_lb.pick import _parse_iso
+
+    parsed = _parse_iso("2026-04-25T10:30:00Z")
+    assert parsed is not None
+    assert parsed.tzinfo is not None
+
+
+def test_pick_parse_iso_handles_naive_input() -> None:
+    """A timestamp without offset should be parsed and assumed UTC."""
+    from claude_lb.pick import _parse_iso
+
+    parsed = _parse_iso("2026-04-25T10:30:00")
+    assert parsed is not None
+    assert parsed.tzinfo is not None
+
+
+def test_pick_parse_iso_returns_none_for_garbage() -> None:
+    from claude_lb.pick import _parse_iso
+
+    assert _parse_iso("not a timestamp") is None
+
+
+# ---------------------------------------------------------------------------
+# Pick log rotation — exercises the size-check + half-truncate path
+# ---------------------------------------------------------------------------
+
+
+def test_pick_log_rotation_truncates_to_half_when_oversize(tmp_path) -> None:
+    """Once picks.log exceeds PICK_LOG_MAX_BYTES, the oldest half should
+    be dropped on the next rotate. Use a tiny file + monkeypatched limit."""
+    log_path = tmp_path / "picks.log"
+    log_path.write_text("\n".join(f"line-{i}" for i in range(100)) + "\n")
+    original = pick_mod.PICK_LOG_MAX_BYTES
+    pick_mod.PICK_LOG_MAX_BYTES = 100  # tiny
+    try:
+        pick_mod._rotate_pick_log_if_needed(log_path)
+    finally:
+        pick_mod.PICK_LOG_MAX_BYTES = original
+    remaining = log_path.read_text().splitlines()
+    assert len(remaining) == 50  # half of 100
+
+
+def test_pick_log_rotation_skips_when_under_limit(tmp_path) -> None:
+    log_path = tmp_path / "picks.log"
+    log_path.write_text("only one line\n")
+    pick_mod._rotate_pick_log_if_needed(log_path)
+    assert log_path.read_text() == "only one line\n"
+
+
+def test_pick_log_rotation_no_op_when_file_missing(tmp_path) -> None:
+    """A missing file must not crash rotation — just return cleanly."""
+    pick_mod._rotate_pick_log_if_needed(tmp_path / "no-such-file.log")
+
+
+# ---------------------------------------------------------------------------
+# write_last_pick exception cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_write_last_pick_unlinks_tempfile_on_failure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If os.replace fails inside write_last_pick, the tempfile must be
+    cleaned up — otherwise stale .last-pick-*.json.tmp files accumulate."""
+    import os as _os
+
+    from claude_lb.pick import write_last_pick
+
+    target = tmp_path / "last-pick.json"
+    real_replace = _os.replace
+
+    def boom_replace(*a, **kw):
+        raise OSError("simulated")
+
+    monkeypatch.setattr(_os, "replace", boom_replace)
+    with pytest.raises(OSError):
+        write_last_pick("account-a", path=target)
+    monkeypatch.setattr(_os, "replace", real_replace)
+    leftover = list(tmp_path.glob(".last-pick-*.json.tmp"))
+    assert leftover == []
+
+
+# ---------------------------------------------------------------------------
+# read_last_pick — corrupt / missing / wrong-shape
+# ---------------------------------------------------------------------------
+
+
+def test_read_last_pick_returns_none_when_missing(tmp_path) -> None:
+    from claude_lb.pick import read_last_pick
+
+    assert read_last_pick(path=tmp_path / "no-such.json") is None
+
+
+def test_read_last_pick_returns_none_for_corrupt_json(tmp_path) -> None:
+    from claude_lb.pick import read_last_pick
+
+    target = tmp_path / "bad.json"
+    target.write_text("{not json")
+    assert read_last_pick(path=target) is None
+
+
+def test_read_last_pick_returns_none_for_wrong_shape(tmp_path) -> None:
+    """Cache file with valid JSON but missing fields shouldn't crash."""
+    import json as _json
+
+    from claude_lb.pick import read_last_pick
+
+    target = tmp_path / "wrong.json"
+    target.write_text(_json.dumps({"profile": 12345, "timestamp": "x"}))
+    assert read_last_pick(path=target) is None
