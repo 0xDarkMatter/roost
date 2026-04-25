@@ -292,6 +292,20 @@ def test_doctor_config_dir_writable_fails_when_tempfile_write_fails(
 # ---------------------------------------------------------------------------
 
 
+def test_taxonomy_compute_expires_at_returns_none_for_state_without_ttl() -> None:
+    """AUTH_EXPIRED is intentionally absent from DEFAULT_TTL_SECONDS — its
+    cache entry has no expiry because mtime-bump on refresh is the
+    invalidation signal, not a TTL. Hits the `ttl is None: return None`
+    branch in compute_expires_at."""
+    from datetime import UTC, datetime
+
+    from claude_lb.models import Health
+    from claude_lb.taxonomy import ClassificationResult, compute_expires_at
+
+    result = ClassificationResult(health=Health.AUTH_EXPIRED)
+    assert compute_expires_at(result, datetime.now(UTC)) is None
+
+
 def test_doctor_cache_readable_handles_oserror_on_read(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

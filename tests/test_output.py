@@ -610,3 +610,82 @@ def test_discover_in_skips_dirs_with_invalid_names(tmp_path) -> None:
     assert "valid" in names
     assert "has spaces in name" not in names
     assert ".dotfile" not in names
+
+
+def test_discover_in_skips_files_in_profiles_dir(tmp_path) -> None:
+    """A loose file (not directory) in the profiles dir should be skipped
+    silently — covers the `if not entry.is_dir(): continue` guard."""
+    from claude_lb.discovery import _discover_in
+
+    # Mix of one valid profile dir + one stray file
+    (tmp_path / "validprofile").mkdir()
+    (tmp_path / "validprofile" / ".credentials.json").write_text(
+        '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-x"}}'
+    )
+    (tmp_path / "stray-file.txt").write_text("garbage")
+    (tmp_path / ".DS_Store").write_text("mac noise")
+
+    profiles = _discover_in(tmp_path)
+    names = [p.name for p in profiles]
+    assert names == ["validprofile"]
+
+
+# ---------------------------------------------------------------------------
+# output — humanize_until naive datetime + status table auth-state rows
+# ---------------------------------------------------------------------------
+
+
+def test_humanize_until_handles_naive_target_and_naive_now() -> None:
+    """Both `target` and `now` without tzinfo should be coerced to UTC for
+    the delta calculation — covers the two `if .tzinfo is None` guards."""
+    from datetime import datetime as _dt, timedelta
+
+    naive_now = _dt(2026, 4, 25, 10, 0, 0)  # naive
+    naive_target = naive_now + timedelta(minutes=5)  # naive
+    out = output.humanize_until(naive_target, now=naive_now)
+    assert out == "in 5m" or out == "in 4m"  # rounding tolerance
+
+
+def test_status_table_renders_auth_expired_remediation_in_session_column(
+    capsys,
+) -> None:
+    """auth_expired profiles should display `claude-lb refresh <name>` in
+    the session column (the remediation is what operators need to see)."""
+    from datetime import UTC, datetime
+
+    from claude_lb.models import ErrorInfo, Health, ProfileHealth
+
+    entry = ProfileHealth(
+        name="expired-acct",
+        health=Health.AUTH_EXPIRED,
+        probed_at=datetime.now(UTC),
+        error=ErrorInfo(type="token_expired", message="expired"),
+        credentials_mtime=1000.0,
+    )
+    output.render_status_table([entry])
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err
+    flat = " ".join(rendered.split())
+    assert "claude-lb refresh expired-acct" in flat
+
+
+def test_status_table_renders_auth_dead_remediation_in_session_column(
+    capsys,
+) -> None:
+    """auth_dead → `claude login` in the same column slot."""
+    from datetime import UTC, datetime
+
+    from claude_lb.models import ErrorInfo, Health, ProfileHealth
+
+    entry = ProfileHealth(
+        name="dead-acct",
+        health=Health.AUTH_DEAD,
+        probed_at=datetime.now(UTC),
+        error=ErrorInfo(type="auth_error", message="dead"),
+        credentials_mtime=1000.0,
+    )
+    output.render_status_table([entry])
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err
+    flat = " ".join(rendered.split())
+    assert "claude login" in flat

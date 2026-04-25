@@ -333,3 +333,28 @@ async def test_probe_many_skips_network_for_already_expired_profiles(
     assert results[0].health is Health.AUTH_EXPIRED
     assert results[1].health is Health.OK
     assert route.call_count == 1  # only `fresh` hit the network
+
+
+def test_probe_many_sync_wrapper(respx_mock: respx.MockRouter) -> None:
+    """The sync wrapper should round-trip through asyncio.run cleanly."""
+    from claude_lb.probe import probe_many_sync
+
+    respx_mock.get(API_URL).respond(200, json=_ok_body())
+    results = probe_many_sync([_profile("a"), _profile("b")])
+    assert len(results) == 2
+    assert all(r.health is Health.OK for r in results)
+
+
+@pytest.mark.asyncio
+async def test_probe_profile_uses_supplied_client(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """When a client is passed in, probe_profile should reuse it instead of
+    opening a new one. The respx mock is global, so we can't directly observe
+    the client identity — but we can confirm the path runs without error."""
+    from claude_lb.probe import probe_profile
+
+    respx_mock.get(API_URL).respond(200, json=_ok_body())
+    async with httpx.AsyncClient() as client:
+        result = await probe_profile(_profile(), client=client)
+    assert result.health is Health.OK
