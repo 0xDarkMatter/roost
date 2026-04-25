@@ -253,8 +253,18 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
     stderr.print(table)
 
 
-def build_status_payload(cache: HealthCache, discovered_names: list[str]) -> dict[str, Any]:
-    """Produce the --json payload for `profiles status`."""
+def build_status_payload(
+    cache: HealthCache,
+    discovered_names: list[str],
+    *,
+    platform_status_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Produce the --json payload for `profiles status`.
+
+    If `platform_status_meta` is provided (from
+    `platform_status.to_json_meta`), it's folded into `meta.platform_status`
+    so scripts can consume Anthropic's status alongside the per-profile data.
+    """
     now = datetime.now(UTC)
     data: list[dict[str, Any]] = []
     counts: dict[str, int] = {
@@ -298,6 +308,8 @@ def build_status_payload(cache: HealthCache, discovered_names: list[str]) -> dic
             "probe_latency_ms": entry.probe_latency_ms,
         })
     meta: dict[str, Any] = {"count": len(data), **counts}
+    if platform_status_meta is not None:
+        meta["platform_status"] = platform_status_meta
     return {"data": data, "meta": meta}
 
 

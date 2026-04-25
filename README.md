@@ -3,7 +3,7 @@
 [![Forma](https://img.shields.io/badge/forma-experimental-orange.svg)](https://github.com/forma-tools/forma)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.8.0-blue.svg)](CHANGELOG.md)
 
 > Pick the healthiest Claude Code OAuth profile — health taxonomy + load balancer for local OAuth profiles. Works with any plan (Max / Pro / Team), with richer usage data on Max.
 
@@ -38,7 +38,7 @@ git clone https://github.com/0xDarkMatter/claude-lb.git
 cd claude-lb
 uv tool install --editable .
 
-claude-lb --version    # → claude-lb 0.7.0
+claude-lb --version    # → claude-lb 0.8.0
 ```
 
 To upgrade later, pull + reinstall:
@@ -132,8 +132,9 @@ claude-lb list --json                    # {data: [...], meta: {count}}
 ```bash
 claude-lb probe                          # Live-probe all (concurrent)
 claude-lb probe account-a                   # Live-probe one
-claude-lb status                         # Cached table (stderr) + summary (stdout)
-claude-lb status --no-cache              # Ignore cache; full re-probe
+claude-lb status                         # Cached table + Anthropic platform-status header (stderr) + summary (stdout)
+claude-lb status --no-cache              # Ignore cache; full re-probe (incl. status.claude.com)
+claude-lb status --no-platform-status    # Skip the status.claude.com fetch
 claude-lb show account-a                    # Detail for one profile
 claude-lb invalidate account-a              # Drop this profile's cache entry
 ```
@@ -334,8 +335,8 @@ Stickiness window: `--stickiness <s>` or `CLAUDE_LB_STICKINESS=<s>`. Set to `0` 
 ## Diagnostics
 
 ```bash
-claude-lb doctor                 # Check config dir, profiles, credentials, cache, network
-claude-lb doctor --skip-network  # Offline variant
+claude-lb doctor                 # Check config dir, profiles, credentials, cache, network, status.claude.com
+claude-lb doctor --skip-network  # Offline variant (also skips status-page check)
 claude-lb doctor --json          # Machine-readable
 
 claude-lb update                 # Version + git-upstream ahead/behind check
@@ -365,6 +366,7 @@ POSIX platforms (macOS, Linux) are unaffected — inode-swap semantics let
 | Cache (Windows) | `%APPDATA%\claude-lb\health.json` |
 | Pick log | `<config>/picks.log` (tab-separated, 10 MB rotation) |
 | Last-pick state | `<config>/last-pick.json` |
+| Platform-status cache | `<config>/platform-status.json` (60s TTL, used by `status`) |
 | Profiles source | `~/.claude-profiles/<name>/.credentials.json` |
 
 Cache writes are atomic (tempfile + `os.replace`). A credentials file's
@@ -408,10 +410,86 @@ profile has overage enabled.
 > regardless of unit. If you need the displayed dollar amount, divide by 100
 > at the call site.
 
+## Platform status (status.claude.com)
+
+`claude-lb status` consults Anthropic's public status page
+(`https://status.claude.com/api/v2/summary.json`) and renders a one-line
+header above the profile table whenever there's a non-resolved incident
+or a degraded component. When everything's operational the header is
+omitted entirely. The intent is narrow: catch the case where a profile
+*looks* misbehaving but the actual cause is platform-wide.
+
+```text
+· Anthropic: All Systems Operational  incident: 'Elevated errors on Claude Opus 4.7' (monitoring, minor)
+┌──────────────┬──────┬─────────┬─────────┬──────────────┐
+│ Profile      │ Plan │ Health  │ Session │ Weekly       │
+│ ...          │      │         │         │              │
+```
+
+**Caching:** the fetch is cached at `<config>/platform-status.json` with
+a 60s TTL. On cache miss the timeout is 2s. If a fresh fetch fails
+(network down, Statuspage flaky, ...) the stale entry is returned
+anyway — going dark during an actual incident defeats the point.
+
+**JSON consumers:** `status --json` folds the data into
+`meta.platform_status`:
+
+```json
+{
+  "meta": {
+    "count": 3,
+    "ok": 3,
+    "platform_status": {
+      "indicator": "none",
+      "description": "All Systems Operational",
+      "active_incidents": [
+        {
+          "name": "Elevated errors on Claude Opus 4.7",
+          "status": "monitoring",
+          "impact": "minor",
+          "shortlink": "https://stspg.io/..."
+        }
+      ],
+      "degraded_components": [],
+      "fetched_at": "2026-04-25T10:52:11Z",
+      "age_seconds": 0,
+      "fetch_error": null
+    }
+  }
+}
+```
+
+**Opt out:** `--no-platform-status` skips the fetch entirely (useful for
+scripts that don't want any extra HTTP on the hot path). `--no-cache` /
+`--refresh` forces a fresh fetch alongside re-probing profiles.
+
+`claude-lb doctor` runs the same check as a WARN-level diagnostic — see
+[Diagnostics](#diagnostics).
+
 ## Recent updates
 
 [**Releases on GitHub**](https://github.com/0xDarkMatter/claude-lb/releases) ·
 [Full CHANGELOG](CHANGELOG.md)
+
+### v0.8.0 — platform-status awareness
+
+- **`claude-lb status` now surfaces Anthropic-side incidents** above the
+  profile table by polling `https://status.claude.com/api/v2/summary.json`
+  (60s cache at `<config>/platform-status.json`, stale-fallback when the
+  fetch fails). Catches the case where misbehaviour you'd otherwise blame
+  on a profile is actually a platform-wide event — e.g. "Elevated errors
+  on Claude Opus 4.7" while everything else is operational. Silent when
+  all clean. JSON envelope folds the data into `meta.platform_status`.
+  Opt out per-call with `--no-platform-status`; `--no-cache` propagates
+  through.
+- **`claude-lb doctor` adds a status.claude.com check** — same source,
+  always-fresh (no cache), WARN-level. Designed to never fail the doctor
+  run since claude-lb can't *fix* an Anthropic-side incident; it just
+  helps operators distinguish "my setup is broken" from "Anthropic is
+  degraded right now". Skipped under `--skip-network`.
+- Doctor's stale-install check (`subcommand_imports`) now covers
+  `exec_cmd` and `platform_status` — previously absent, would have
+  hidden import-drift in either subcommand.
 
 ### v0.7.0 — onboarding helper
 

@@ -307,3 +307,174 @@ def test_reachability_empty_addrinfo(monkeypatch: pytest.MonkeyPatch) -> None:
     result = doctor_mod._check_anthropic_reachable(timeout_s=1.0)
     assert result.passed is False
     assert "No A/AAAA" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# status.claude.com check — informational, never fails the doctor run
+# ---------------------------------------------------------------------------
+
+
+import httpx
+import respx
+
+
+def test_status_page_clean_passes_without_warning(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get(doctor_mod.STATUS_PAGE_URL).respond(
+        200,
+        json={
+            "page": {"name": "Claude"},
+            "status": {"indicator": "none", "description": "All Systems Operational"},
+            "incidents": [],
+            "components": [
+                {"name": "Claude API", "status": "operational"},
+            ],
+        },
+    )
+    result = doctor_mod._check_claude_status_page(timeout_s=1.0)
+    assert result.passed is True
+    assert result.extra.get("warning") is None  # clean — no warn marker
+    assert "All Systems Operational" in result.detail
+    assert "no active incidents" in result.detail
+
+
+def test_status_page_active_incident_warns_but_passes(respx_mock: respx.MockRouter) -> None:
+    """Indicator can be 'none' while there's an active monitoring-state
+    incident — surface the incident without failing doctor."""
+    respx_mock.get(doctor_mod.STATUS_PAGE_URL).respond(
+        200,
+        json={
+            "status": {"indicator": "none", "description": "All Systems Operational"},
+            "incidents": [
+                {
+                    "name": "Elevated errors on Claude Opus 4.7",
+                    "status": "monitoring",
+                    "impact": "minor",
+                    "shortlink": "https://stspg.io/abc",
+                },
+            ],
+            "components": [],
+        },
+    )
+    result = doctor_mod._check_claude_status_page(timeout_s=1.0)
+    assert result.passed is True
+    assert result.extra["warning"] is True
+    assert "Elevated errors on Claude Opus 4.7" in result.detail
+    assert "monitoring" in result.detail
+    assert "minor" in result.detail
+    assert result.extra["active_incidents"][0]["name"] == "Elevated errors on Claude Opus 4.7"
+
+
+def test_status_page_skips_resolved_incidents(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get(doctor_mod.STATUS_PAGE_URL).respond(
+        200,
+        json={
+            "status": {"indicator": "none", "description": "All Systems Operational"},
+            "incidents": [
+                {"name": "Old issue", "status": "resolved", "impact": "minor"},
+            ],
+            "components": [],
+        },
+    )
+    result = doctor_mod._check_claude_status_page(timeout_s=1.0)
+    assert result.passed is True
+    assert result.extra.get("warning") is None
+    assert "no active incidents" in result.detail
+
+
+def test_status_page_indicator_major_warns(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get(doctor_mod.STATUS_PAGE_URL).respond(
+        200,
+        json={
+            "status": {"indicator": "major", "description": "Major Outage"},
+            "incidents": [
+                {"name": "API down", "status": "investigating", "impact": "major"},
+            ],
+            "components": [
+                {"name": "Claude API", "status": "major_outage"},
+            ],
+        },
+    )
+    result = doctor_mod._check_claude_status_page(timeout_s=1.0)
+    assert result.passed is True  # informational, never fails
+    assert result.extra["warning"] is True
+    assert result.extra["indicator"] == "major"
+    assert "Major Outage" in result.detail
+    assert "API down" in result.detail
+    assert "Claude API" in result.detail
+
+
+def test_status_page_multiple_incidents_summarises(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get(doctor_mod.STATUS_PAGE_URL).respond(
+        200,
+        json={
+            "status": {"indicator": "minor", "description": "Partial Outage"},
+            "incidents": [
+                {"name": "First", "status": "investigating", "impact": "minor"},
+                {"name": "Second", "status": "monitoring", "impact": "minor"},
+                {"name": "Third", "status": "identified", "impact": "minor"},
+            ],
+            "components": [],
+        },
+    )
+    result = doctor_mod._check_claude_status_page(timeout_s=1.0)
+    assert "First" in result.detail  # leading incident shown by name
+    assert "+2 more" in result.detail
+    assert len(result.extra["active_incidents"]) == 3
+
+
+def test_status_page_unreachable_warns_does_not_fail(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get(doctor_mod.STATUS_PAGE_URL).mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    result = doctor_mod._check_claude_status_page(timeout_s=1.0)
+    assert result.passed is True  # don't fail doctor on Statuspage flakiness
+    assert result.extra["warning"] is True
+    assert "Couldn't reach" in result.detail
+    assert "connection refused" in result.detail
+
+
+def test_status_page_malformed_json_warns(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get(doctor_mod.STATUS_PAGE_URL).respond(
+        200, content=b"<html>maintenance</html>"
+    )
+    result = doctor_mod._check_claude_status_page(timeout_s=1.0)
+    assert result.passed is True
+    assert result.extra["warning"] is True
+    assert "Couldn't reach" in result.detail
+
+
+def test_status_page_http_error_warns(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get(doctor_mod.STATUS_PAGE_URL).respond(503, text="upstream dead")
+    result = doctor_mod._check_claude_status_page(timeout_s=1.0)
+    assert result.passed is True
+    assert result.extra["warning"] is True
+
+
+def test_status_page_included_in_run_doctor_when_network_enabled(
+    profile_factory, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wire-up test: status check runs alongside reachability, only with network."""
+    profile_factory("account-a")
+    # Stub the TCP reachability check so the test doesn't hit real DNS.
+    monkeypatch.setattr(
+        doctor_mod, "_check_anthropic_reachable",
+        lambda: doctor_mod.CheckResult(name="anthropic_reachable", passed=True, detail="stub"),
+    )
+    respx_mock.get(doctor_mod.STATUS_PAGE_URL).respond(
+        200,
+        json={
+            "status": {"indicator": "none", "description": "All Systems Operational"},
+            "incidents": [],
+            "components": [],
+        },
+    )
+    report = doctor_mod.run_doctor(skip_network=False)
+    names = [c.name for c in report.checks]
+    assert "claude_status_page" in names
+    assert "anthropic_reachable" in names
+
+    # Skip-network omits both
+    report_offline = doctor_mod.run_doctor(skip_network=True)
+    offline_names = [c.name for c in report_offline.checks]
+    assert "claude_status_page" not in offline_names
+    assert "anthropic_reachable" not in offline_names

@@ -89,6 +89,7 @@ Invariants an agent cannot intuit from `--help`:
 17. **Multi-pick (`pick --count N`) disables stickiness.** Sticky's "pin to last pick" semantic doesn't compose with "give me N distinct profiles". The first returned profile IS written to `last-pick.json` so a subsequent single-pick call still honours stickiness against the primary. Don't re-enable stickiness for multi-pick without a clear semantic.
 18. **Windows self-upgrade is not possible from within `claude-lb update --apply`.** The running tool has its own `.pyd`/`.dll` files memory-mapped, and Windows refuses to overwrite mapped files (EACCES). `updater._would_self_lock()` detects the condition (`sys.platform == "win32"` + `sys.prefix` under `uv/tools/claude-lb/`) and short-circuits to a copy-pasteable `uv tool install --reinstall --editable <dir>` message. Do NOT add a "force" flag that bypasses this — the reinstall genuinely cannot succeed. POSIX is fine (inode-swap semantics). If you extend the upgrade path, preserve this detection or replace it with a detached-process pattern (spawn a helper that waits for the claude-lb PID to exit, then runs uv) — don't silently drop it.
 19. **NEVER `git push` without explicit operator approval.** Local commits, branches, and tags are fine to create freely. Pushing to `origin` (or any remote) requires the operator to explicitly say so for THIS push — standing prior approval doesn't carry over. The repo is private and the operator wants control over when work becomes visible / immutable on the remote. If unsure whether a prior "go ahead" still applies, ask. Auto-pushing after a green test run, after a release tag, or "to be helpful" is a violation. This rule overrides any habit of pairing commit + push.
+20. **Platform-status fetch is best-effort enrichment, never load-bearing.** `claude-lb status` and `claude-lb doctor` consult `https://status.claude.com/api/v2/summary.json` to surface Anthropic-side incidents — but a failed fetch, unreachable Statuspage, parse error, or even a "major outage" indicator must NEVER fail the calling command, block `pick`, or alter the health taxonomy. The reasoning: claude-lb can't *fix* an Anthropic-side incident, so making the tool unusable when Anthropic is degraded would defeat the entire point. The 60s cache + 2s hot-path timeout + stale-fallback design is deliberate; don't tighten the timeout, don't promote any indicator state into a `pick`-blocking condition, and don't add a `--require-platform-status` flag. If a future feature genuinely needs fresh-and-correct status data, fail closed with a clear message rather than blocking the existing surfaces. The `--no-platform-status` opt-out exists precisely so scripts that don't want any extra HTTP on the hot path can disable it without the feature ever being mandatory. See `src/claude_lb/platform_status.py`.
 
 **Prompt injection:** not applicable. `claude-lb` returns only its own telemetry — profile names, utilization numbers, timestamps — never user-authored content from Anthropic's API.
 
@@ -103,10 +104,12 @@ Invariants an agent cannot intuit from `--help`:
 | `src/claude_lb/refresh.py` | OAuth refresh grant client; atomic credentials rewrite |
 | `src/claude_lb/cache.py` | Atomic read/write of `health.json`, TTL logic |
 | `src/claude_lb/pick.py` | Strategies, stickiness, filter ladder, pick log |
+| `src/claude_lb/exec_cmd.py` | `claude-lb exec` subprocess orchestration (named `_cmd` to avoid shadowing the builtin) |
 | `src/claude_lb/output.py` | JSON envelope, stream separation, status table |
 | `src/claude_lb/doctor.py` | Local-setup diagnostics |
+| `src/claude_lb/platform_status.py` | status.claude.com fetcher + 60s cache + format helpers (shared by `status` and `doctor`) |
 | `src/claude_lb/updater.py` | Version + upstream check |
-| `src/claude_lb/paths.py` | Platform-aware paths (config, cache, pick log) |
+| `src/claude_lb/paths.py` | Platform-aware paths (config, cache, pick log, platform-status cache) |
 | `src/claude_lb/models.py` | Pydantic models shared across modules |
 
 ## Testing
@@ -114,6 +117,7 @@ Invariants an agent cannot intuit from `--help`:
 - `tests/fixtures/oauth-usage/` — captured + synthetic `/api/oauth/usage` bodies (ok, session-exhausted, weekly-exhausted, both-exhausted, 403-scope-missing). Classifier must correctly label each.
 - `tests/fixtures/401-auth-error.json` — auth-dead fixture.
 - `tests/test_refresh.py` — uses `respx` to mock `/v1/oauth/token`, asserts atomic credentials rewrite and preserves non-oauth fields on success; verifies failed refreshes never clobber credentials.
+- `tests/test_platform_status.py` — `respx` mocks `status.claude.com/api/v2/summary.json`; covers parse, cache-hit / stale-fallback / cold-start-fail paths, `format_status_line`, and `to_json_meta`. Default test config in `test_cli.py` stubs `_load_platform_status` to return `None` so unrelated tests don't accidentally hit the real Statuspage.
 - Run: `uv run pytest` (or `pytest` inside the venv).
 - Coverage target: 90%+ on `taxonomy.py`, `discovery.py`, `pick.py`, `refresh.py`.
 

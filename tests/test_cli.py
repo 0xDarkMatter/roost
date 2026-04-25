@@ -43,7 +43,7 @@ def _isolated_home(
 
     # Modules that imported the path helpers at module-top need their local
     # bindings patched too.
-    from claude_lb import cache, doctor, pick
+    from claude_lb import cache, doctor, pick, platform_status
 
     monkeypatch.setattr(cache, "cache_path", lambda: config / "health.json")
     monkeypatch.setattr(cache, "ensure_config_dir", lambda: config)
@@ -51,6 +51,13 @@ def _isolated_home(
     monkeypatch.setattr(pick, "pick_log_path", lambda: config / "picks.log")
     monkeypatch.setattr(doctor, "config_dir", lambda: config)
     monkeypatch.setattr(doctor, "cache_path", lambda: config / "health.json")
+    monkeypatch.setattr(platform_status, "config_dir", lambda: config)
+    monkeypatch.setattr(platform_status, "ensure_config_dir", lambda: config)
+
+    # Default: short-circuit the platform-status fetch so existing tests don't
+    # accidentally hit status.claude.com. Tests that exercise the new header
+    # behaviour override this with a respx mock or a dedicated stub.
+    monkeypatch.setattr(cli_mod, "_load_platform_status", lambda **kw: None)
 
     yield config
 
@@ -64,7 +71,7 @@ def test_version() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert "claude-lb" in result.stdout
-    assert "0.7.0" in result.stdout
+    assert "0.8.0" in result.stdout
 
 
 def test_help_exits_zero() -> None:
@@ -1705,3 +1712,149 @@ def test_exec_auto_refresh_is_honored(profile_factory, _isolated_home: Path) -> 
         result = runner.invoke(app, ["exec", "--auto-refresh", "claude-bin"])
     assert result.exit_code == 0
     assert stub_run.calls[0]["profile_name"] == "account-a"
+
+
+# ---------------------------------------------------------------------------
+# Platform-status header on `status`
+# ---------------------------------------------------------------------------
+
+
+def _stub_platform_status(
+    *,
+    indicator: str = "none",
+    description: str = "All Systems Operational",
+    incidents: list | None = None,
+    components: list | None = None,
+    fetch_error: str | None = None,
+):
+    """Build a PlatformStatus and return a callable suitable for patching
+    `cli_mod._load_platform_status`."""
+    from claude_lb.platform_status import PlatformStatus
+
+    status = PlatformStatus(
+        indicator=indicator,
+        description=description,
+        active_incidents=[
+            {
+                "name": i.get("name"),
+                "status": i.get("status"),
+                "impact": i.get("impact"),
+                "shortlink": i.get("shortlink"),
+            }
+            for i in (incidents or [])
+        ],
+        degraded_components=[
+            {"name": c.get("name"), "status": c.get("status")}
+            for c in (components or [])
+        ],
+        fetch_error=fetch_error,
+    )
+
+    def _loader(**kwargs):
+        _loader.called_with = kwargs  # type: ignore[attr-defined]
+        return status
+
+    _loader.called_with = None  # type: ignore[attr-defined]
+    return _loader
+
+
+def test_status_renders_platform_header_when_incident(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A monitoring-state incident from status.claude.com surfaces as a
+    stderr header above the profile table."""
+    profile_factory("account-a")
+    loader = _stub_platform_status(incidents=[
+        {"name": "Elevated errors on Claude Opus 4.7", "status": "monitoring", "impact": "minor"},
+    ])
+    monkeypatch.setattr(cli_mod, "_load_platform_status", loader)
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    # Rich wraps narrow output, so collapse whitespace before substring checks.
+    flat = " ".join(result.stderr.split())
+    assert "Elevated errors on Claude Opus 4.7" in flat
+    assert "Anthropic" in flat  # the leading label
+    assert "monitoring" in flat
+    assert "minor" in flat
+
+
+def test_status_omits_platform_header_when_clean(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No header noise when everything is operational."""
+    profile_factory("account-a")
+    loader = _stub_platform_status()  # clean by default
+    monkeypatch.setattr(cli_mod, "_load_platform_status", loader)
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    assert "Anthropic" not in result.stderr
+    assert "incident" not in result.stderr.lower()
+
+
+def test_status_no_platform_status_flag_skips_loader(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--no-platform-status` should mean we don't even call the loader."""
+    profile_factory("account-a")
+    called = {"n": 0}
+
+    def _should_not_be_called(**kwargs):
+        called["n"] += 1
+        return None
+
+    monkeypatch.setattr(cli_mod, "_load_platform_status", _should_not_be_called)
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["status", "--no-platform-status"])
+    assert result.exit_code == 0
+    assert called["n"] == 0
+
+
+def test_status_json_includes_platform_status_in_meta(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The structured envelope folds platform_status into meta so scripts
+    can react to incidents without parsing the human header."""
+    profile_factory("account-a")
+    loader = _stub_platform_status(
+        indicator="minor",
+        description="Partial Outage",
+        incidents=[{"name": "X", "status": "investigating", "impact": "minor"}],
+    )
+    monkeypatch.setattr(cli_mod, "_load_platform_status", loader)
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["status", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert "platform_status" in payload["meta"]
+    assert payload["meta"]["platform_status"]["indicator"] == "minor"
+    assert payload["meta"]["platform_status"]["active_incidents"][0]["name"] == "X"
+
+
+def test_status_json_omits_platform_status_when_flag_set(
+    profile_factory,
+) -> None:
+    """`--no-platform-status` keeps `meta.platform_status` out of the envelope."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["status", "--json", "--no-platform-status"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert "platform_status" not in payload["meta"]
+
+
+def test_status_force_refresh_propagates_to_loader(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--no-cache` / `--refresh` should bypass the platform-status cache too,
+    so 'force re-probe' really means everything."""
+    profile_factory("account-a")
+    loader = _stub_platform_status()
+    monkeypatch.setattr(cli_mod, "_load_platform_status", loader)
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["status", "--no-cache"])
+    assert result.exit_code == 0
+    assert loader.called_with is not None
+    assert loader.called_with.get("force_refresh") is True
+

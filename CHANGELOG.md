@@ -5,6 +5,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-25
+
+### Added
+
+- **`claude-lb status` platform-status header** — `status` now fetches
+  `https://status.claude.com` (60s cache at
+  `<config>/platform-status.json`) and renders a one-line stderr header
+  above the profile table whenever Anthropic reports a non-resolved
+  incident or a degraded component. Skipped cleanly when everything's
+  operational. The structured envelope (`status --json`) folds the data
+  into `meta.platform_status` so scripts can react without parsing the
+  human header. Cache TTL is 60s with stale-fallback (a stale entry is
+  returned when a fresh fetch fails — better than going dark during the
+  exact incidents this surfaces). 2s timeout on cache miss to bound the
+  hot-path cost. Opt out per-call with `--no-platform-status`.
+  `--no-cache` / `--refresh` propagates to the platform-status fetch too.
+- **`claude-lb doctor` status.claude.com check** — fetches the same
+  endpoint as a fresh diagnostic check (no cache). Reports the platform
+  status indicator, active incidents (filtered to non-resolved), and any
+  degraded components. Always WARN-level: an Anthropic-side incident or
+  an unreachable Statuspage endpoint never fails the doctor run, but it
+  gives operators consulting `doctor` (because pick is misbehaving) a way
+  to distinguish "my setup is broken" from "Anthropic is degraded right
+  now". Surfaces monitoring-state incidents that don't update the global
+  indicator (e.g. "Elevated errors on Claude Opus 4.7" while everything
+  else is operational). Skipped under `--skip-network`.
+
+### Internal
+
+- New `src/claude_lb/platform_status.py` module — shared fetcher + cache
+  + format helpers used by both `status` and `doctor`. Single source of
+  truth for the Statuspage v2 summary parse.
+- `_check_subcommand_imports` (doctor's stale-install detector) now
+  covers `exec_cmd` and `platform_status` — both modules were absent
+  from the checklist and would have hidden import-drift failures from
+  doctor.
+
 ## [0.7.0] - 2026-04-25
 
 ### Added

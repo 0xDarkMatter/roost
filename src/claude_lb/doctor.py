@@ -10,6 +10,7 @@ Checks:
     - each profile's credentials parseable + has a token
     - cache file readable (or absent — still a pass)
     - outbound HTTPS to api.anthropic.com reachable
+    - status.claude.com platform incidents (warn-only)
 """
 
 from __future__ import annotations
@@ -20,10 +21,13 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+import httpx
+
 from . import __version__
 from .cache import load_cache
 from .discovery import discover_profiles
 from .paths import cache_path, config_dir
+from .platform_status import STATUS_PAGE_URL, fetch_platform_status
 
 
 @dataclass
@@ -53,8 +57,9 @@ def _check_subcommand_imports() -> CheckResult:
     while every other command keeps working. Doctor surfaces this as a
     fleet-wide problem instead of waiting for the user to trip over it.
     """
-    checked = ["cache", "cli", "discovery", "models", "output", "paths",
-               "pick", "probe", "refresh", "taxonomy", "updater"]
+    checked = ["cache", "cli", "discovery", "exec_cmd", "models", "output",
+               "paths", "pick", "platform_status", "probe", "refresh",
+               "taxonomy", "updater"]
     failures: list[str] = []
     for name in checked:
         try:
@@ -285,6 +290,81 @@ def _check_anthropic_reachable(timeout_s: float = 3.0) -> CheckResult:
     )
 
 
+def _check_claude_status_page(timeout_s: float = 3.0) -> CheckResult:
+    """Fetch status.claude.com summary; surface platform incidents as a warning.
+
+    This is informational — claude-lb can't *fix* an Anthropic-side incident,
+    but operators consulting `doctor` because pick is misbehaving deserve to
+    know whether the platform is degraded vs whether their setup is wrong.
+
+    Always WARN-level (passed=True). An Anthropic-side incident or an
+    unreachable Statuspage endpoint should never fail the doctor run — that
+    would mean every operator's CI breaks during every Anthropic blip.
+
+    The summary endpoint returns both an aggregate `status.indicator`
+    (none/minor/major/critical) AND a list of `incidents` whose lifecycle is
+    investigating -> identified -> monitoring -> resolved. A monitoring-state
+    incident often doesn't update the global indicator (e.g. "Elevated errors
+    on Claude Opus 4.7" while everything else is operational), so we report
+    on both signals independently.
+    """
+    try:
+        status = fetch_platform_status(timeout_s=timeout_s)
+    except (httpx.HTTPError, ValueError) as exc:
+        return CheckResult(
+            name="claude_status_page",
+            passed=True,  # warn-level — don't block on Statuspage being flaky
+            detail=f"Couldn't reach {STATUS_PAGE_URL}: {type(exc).__name__}: {exc}",
+            extra={"warning": True, "fetch_error": str(exc)},
+        )
+
+    extra: dict[str, Any] = {
+        "indicator": status.indicator,
+        "description": status.description,
+        "active_incidents": status.active_incidents,
+        "degraded_components": status.degraded_components,
+    }
+
+    if status.is_clean:
+        return CheckResult(
+            name="claude_status_page",
+            passed=True,
+            detail=f"{status.description}, no active incidents",
+            extra=extra,
+        )
+
+    parts: list[str] = [status.description]
+    if status.active_incidents:
+        first = status.active_incidents[0]
+        impact = first.get("impact") or "unknown"
+        i_status = first.get("status") or "unknown"
+        suffix = (
+            f" (+{len(status.active_incidents) - 1} more)"
+            if len(status.active_incidents) > 1
+            else ""
+        )
+        parts.append(
+            f"{len(status.active_incidents)} active incident(s): "
+            f"'{first.get('name')}' [{i_status}, {impact}]{suffix}"
+        )
+    if status.degraded_components:
+        names = ", ".join(str(c.get("name")) for c in status.degraded_components[:3])
+        more = (
+            ""
+            if len(status.degraded_components) <= 3
+            else f" (+{len(status.degraded_components) - 3} more)"
+        )
+        parts.append(f"degraded components: {names}{more}")
+
+    extra["warning"] = True
+    return CheckResult(
+        name="claude_status_page",
+        passed=True,  # WARN, not failure — informational
+        detail="; ".join(parts),
+        extra=extra,
+    )
+
+
 def run_doctor(*, skip_network: bool = False) -> DoctorReport:
     """Run all diagnostic checks and return a structured report."""
     checks: list[CheckResult] = [
@@ -297,6 +377,7 @@ def run_doctor(*, skip_network: bool = False) -> DoctorReport:
     ]
     if not skip_network:
         checks.append(_check_anthropic_reachable())
+        checks.append(_check_claude_status_page())
     return DoctorReport(version=__version__, checks=checks)
 
 

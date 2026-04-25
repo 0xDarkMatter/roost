@@ -10,10 +10,11 @@ Auto-loaded by `/sync`. Notes that should survive across sessions.
 
 ## Current state (last update: 2026-04-25)
 
-- **Version:** v0.6.0 on `main` (commit `a85e262`).
-- **Remote:** `origin` = https://github.com/0xDarkMatter/claude-lb (private). v0.5.0 + v0.6.0 tags pushed.
-- **Tests:** 270 passing (`uv run pytest`).
+- **Version:** v0.8.0 on `main`.
+- **Remote:** `origin` = https://github.com/0xDarkMatter/claude-lb (private). v0.5.0 / v0.6.0 / v0.7.0 / v0.8.0 tags pushed.
+- **Tests:** 328 passing (`uv run pytest`). Doctor now covers `exec_cmd` and `platform_status` in its `subcommand_imports` check.
 - **Live fleet:** 3 profiles under `~/.claude-profiles/` — `account-a`, `account-b`, `account-c`. All `max` plan. Variety of overage/usage states — useful as a real-world testbed.
+- **v0.8.0 highlights:** platform-status awareness — `status` and `doctor` consult `https://status.claude.com/api/v2/summary.json`, surfaced as a one-line stderr header above the `status` table when there's a non-resolved incident. Cache at `<config>/platform-status.json`, 60s TTL with stale-fallback. Shared module `src/claude_lb/platform_status.py`. AGENTS.md rule 20 codifies "best-effort, never load-bearing".
 
 ## Known traps that already cost time
 

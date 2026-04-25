@@ -30,6 +30,11 @@ from .pick import (
     write_last_pick,
 )
 from .exec_cmd import RC_NOT_FOUND, RC_TIMEOUT, ExecResult, run_child
+from .platform_status import (
+    format_status_line as _format_platform_status_line,
+    load_or_fetch as _load_platform_status,
+    to_json_meta as _platform_status_to_meta,
+)
 from .probe import probe_many_sync
 from .refresh import refresh_many_sync
 from .updater import apply_result_to_dict, apply_update, check_for_update, status_to_dict
@@ -486,12 +491,36 @@ def profiles_status(
     max_age: Annotated[
         int | None, typer.Option("--max-age", help="Override TTL, seconds.")
     ] = None,
+    no_platform_status: Annotated[
+        bool,
+        typer.Option(
+            "--no-platform-status",
+            help="Skip the status.claude.com check (no extra fetch on cache miss).",
+        ),
+    ] = False,
 ) -> None:
-    """Show cached health per profile (probes if stale)."""
+    """Show cached health per profile (probes if stale).
+
+    Also fetches https://status.claude.com (60s cache) and surfaces any
+    Anthropic-side incident as a header above the table — useful when a
+    misbehaving profile is actually a platform-wide issue. Disable with
+    `--no-platform-status`.
+    """
     cache, names = _load_or_probe(refresh=(no_cache or refresh), max_age=max_age)
+
+    # Platform status is best-effort enrichment — never fail `status` over it.
+    platform = None if no_platform_status else _load_platform_status(
+        force_refresh=(no_cache or refresh),
+    )
+
     if json_output:
-        emit_json(build_status_payload(cache, names))
+        meta = _platform_status_to_meta(platform) if platform is not None else None
+        emit_json(build_status_payload(cache, names, platform_status_meta=meta))
         return
+    if platform is not None:
+        line = _format_platform_status_line(platform)
+        if line:
+            stderr.print(line)
     entries = [
         cache.profiles[n]
         for n in names
@@ -507,6 +536,7 @@ def top_status(
     no_cache: Annotated[bool, typer.Option("--no-cache")] = False,
     refresh: Annotated[bool, typer.Option("--refresh")] = False,
     max_age: Annotated[int | None, typer.Option("--max-age")] = None,
+    no_platform_status: Annotated[bool, typer.Option("--no-platform-status")] = False,
 ) -> None:
     """Alias for `profiles status`."""
     profiles_status(
@@ -514,6 +544,7 @@ def top_status(
         no_cache=no_cache,
         refresh=refresh,
         max_age=max_age,
+        no_platform_status=no_platform_status,
     )
 
 
