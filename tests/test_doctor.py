@@ -161,6 +161,56 @@ def test_refresh_tokens_check_skipped_with_no_profiles() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cache check — must detect corruption (load_cache silently swallows it)
+# ---------------------------------------------------------------------------
+
+
+def test_cache_readable_check_detects_malformed_json(
+    profile_factory, _isolate: Path
+) -> None:
+    """REGRESSION: load_cache returns an empty cache on bad JSON without
+    raising — to keep the rest of the tool working through cache corruption.
+    But that meant the doctor's cache check could never report corruption,
+    silently passing while load_cache logged a warning. Doctor should now
+    surface the corruption directly."""
+    profile_factory("account-a")
+    # Corrupt the cache file
+    cache_file = _isolate / "health.json"
+    cache_file.write_text("{this is not valid json", encoding="utf-8")
+
+    report = doctor_mod.run_doctor(skip_network=True)
+    check = next(c for c in report.checks if c.name == "cache_readable")
+    assert check.passed is False
+    assert "malformed" in check.detail.lower()
+    assert "delete" in check.detail.lower() or "invalidate" in check.detail.lower()
+
+
+def test_cache_readable_check_passes_with_valid_cache(
+    profile_factory, _isolate: Path
+) -> None:
+    profile_factory("account-a")
+    cache_file = _isolate / "health.json"
+    cache_file.write_text(
+        '{"schema_version": 1, "updated_at": "2026-04-25T00:00:00Z", "profiles": {}}',
+        encoding="utf-8",
+    )
+    report = doctor_mod.run_doctor(skip_network=True)
+    check = next(c for c in report.checks if c.name == "cache_readable")
+    assert check.passed is True
+
+
+def test_cache_readable_check_passes_when_cache_absent(
+    profile_factory,
+) -> None:
+    """Missing cache is fine — first probe will create it."""
+    profile_factory("account-a")
+    report = doctor_mod.run_doctor(skip_network=True)
+    check = next(c for c in report.checks if c.name == "cache_readable")
+    assert check.passed is True
+    assert "no cache yet" in check.detail.lower()
+
+
+# ---------------------------------------------------------------------------
 # Reachability check — iterate all address-family candidates
 # ---------------------------------------------------------------------------
 

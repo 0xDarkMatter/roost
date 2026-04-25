@@ -1319,6 +1319,11 @@ def exec_cmd(
 
     chosen_strategy = _validate_strategy(strategy)
     argv = list(ctx.args or [])
+    # Click sometimes passes the `--` separator through into ctx.args. Strip
+    # a single leading occurrence so `claude-lb exec -- claude foo` and
+    # `claude-lb exec claude foo` produce the same child argv.
+    if argv and argv[0] == "--":
+        argv = argv[1:]
     if not argv:
         stderr.print(
             "[red]exec requires a command.[/red] "

@@ -202,14 +202,33 @@ def _check_cache_readable() -> CheckResult:
             passed=True,
             detail="(no cache yet — first probe will create it)",
         )
+    # `load_cache` is intentionally resilient: it swallows JSON errors and
+    # returns an empty cache so the rest of the tool keeps working on a
+    # corrupt cache (the next probe will rewrite it). For doctor, we want
+    # to surface the corruption explicitly — silently passing this check
+    # while load_cache logs a warning to stderr is the kind of thing that
+    # makes "doctor passes but nothing works" debugging frustrating.
+    import json as _json
     try:
-        cache = load_cache()
-    except Exception as exc:  # pragma: no cover - defensive
+        with target.open("rb") as fh:
+            _json.load(fh)
+    except OSError as exc:
         return CheckResult(
             name="cache_readable",
             passed=False,
             detail=f"Cache exists but cannot be read: {exc}",
         )
+    except _json.JSONDecodeError as exc:
+        return CheckResult(
+            name="cache_readable",
+            passed=False,
+            detail=(
+                f"Cache JSON is malformed at line {exc.lineno} col {exc.colno}: "
+                f"{exc.msg}. Delete {target} or run `claude-lb invalidate "
+                f"<name>` for any profile to reset."
+            ),
+        )
+    cache = load_cache()  # safe — JSON parse already validated above
     return CheckResult(
         name="cache_readable",
         passed=True,

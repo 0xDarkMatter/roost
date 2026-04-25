@@ -1321,6 +1321,239 @@ def test_refresh_soon_and_expired_together_rejected(profile_factory) -> None:
     assert "exactly one" in result.stderr.lower()
 
 
+# ---------------------------------------------------------------------------
+# Edge cases — ferreting out behaviours not covered by the headline tests
+# ---------------------------------------------------------------------------
+
+
+def test_history_handles_empty_log_file(_isolated_home: Path) -> None:
+    """Empty file is different from missing file. Both should produce 0 entries
+    without crashing."""
+    log_path = _isolated_home / "picks.log"
+    log_path.touch()
+    result = runner.invoke(app, ["history", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"] == []
+    assert payload["meta"]["count"] == 0
+    assert payload["meta"]["total_in_log"] == 0
+
+
+def test_history_huge_tail_is_capped_to_total(_isolated_home: Path) -> None:
+    log_path = _isolated_home / "picks.log"
+    _seed_picks_log(log_path, [
+        f"2026-04-25T01:0{i}:00.000000+00:00\taccount-a\tsticky\tscore=1.00"
+        for i in range(3)
+    ])
+    result = runner.invoke(app, ["history", "--tail", "9999", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 3  # capped at what's available
+
+
+def test_history_log_with_only_blank_lines(_isolated_home: Path) -> None:
+    log_path = _isolated_home / "picks.log"
+    log_path.write_text("\n\n   \n\n", encoding="utf-8")
+    result = runner.invoke(app, ["history", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 0
+
+
+def test_exec_separator_only_no_argv_exits_validation(profile_factory) -> None:
+    """`claude-lb exec --` with nothing after the separator must not
+    silently treat `--` as the command."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["exec", "--"])
+    assert result.exit_code == 4
+    assert "requires a command" in result.stderr.lower()
+
+
+def test_exec_separator_is_stripped_when_present(profile_factory) -> None:
+    """`claude-lb exec -- echo hi` and `claude-lb exec echo hi` produce the
+    same child argv (the leading `--` is consumed, not passed to the child)."""
+    profile_factory("account-a")
+    stub_run = _stub_run_child_factory(rc_sequence=[0])
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync), \
+         patch.object(cli_mod, "run_child", stub_run):
+        result = runner.invoke(app, ["exec", "--", "echo", "hi"])
+    assert result.exit_code == 0
+    assert stub_run.calls[0]["argv"] == ["echo", "hi"]
+    assert stub_run.calls[0]["argv"][0] != "--"
+
+
+def test_refresh_soon_excludes_profiles_without_expires_at(
+    profile_factory, credentials_dir: Path
+) -> None:
+    """A profile whose .credentials.json has no `expiresAt` field must be
+    silently excluded from --soon (we have no baseline to compare against)."""
+    import json as _json
+
+    # One profile with future expiresAt (eligible if cutoff is generous)
+    profile_factory("with_expiry")
+    # One profile WITHOUT expiresAt
+    no_exp_dir = credentials_dir / "no_expiry"
+    no_exp_dir.mkdir(parents=True, exist_ok=True)
+    (no_exp_dir / ".credentials.json").write_text(_json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-no-exp",
+            "refreshToken": "sk-ant-ort01-x",
+        }
+    }))
+
+    captured: list[str] = []
+
+    def _stub(profiles, *, timeout=10.0):
+        from claude_lb.refresh import RefreshResult
+        captured.extend(p.name for p in profiles)
+        return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
+
+    with patch.object(cli_mod, "refresh_many_sync", _stub):
+        result = runner.invoke(app, ["refresh", "--soon", "100w"])
+    assert result.exit_code == 0
+    # `with_expiry` had expiresAt: 99999999999999 (year ~5138) — way beyond
+    # any realistic --soon window. So both are excluded:
+    # - no_expiry: no baseline (correctly skipped)
+    # - with_expiry: cutoff < its expiry (not yet "soon")
+    assert captured == []
+
+
+def test_refresh_soon_zero_seconds_acts_like_expired(profile_factory) -> None:
+    """`--soon 0` cutoff = now → only catches already-expired tokens."""
+    from datetime import UTC, datetime, timedelta
+
+    expired = profile_factory("expired")
+    fresh = profile_factory("fresh")
+    past_ms = int((datetime.now(UTC) - timedelta(hours=1)).timestamp() * 1000)
+    future_ms = int((datetime.now(UTC) + timedelta(hours=1)).timestamp() * 1000)
+    for cred, ms in [(expired, past_ms), (fresh, future_ms)]:
+        data = json.loads(cred.read_text())
+        data["claudeAiOauth"]["expiresAt"] = ms
+        cred.write_text(json.dumps(data))
+
+    captured: list[str] = []
+
+    def _stub(profiles, *, timeout=10.0):
+        from claude_lb.refresh import RefreshResult
+        captured.extend(p.name for p in profiles)
+        return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
+
+    with patch.object(cli_mod, "refresh_many_sync", _stub):
+        result = runner.invoke(app, ["refresh", "--soon", "0"])
+    assert result.exit_code == 0
+    assert captured == ["expired"]
+
+
+def test_auto_refresh_mixed_success_and_failure(
+    profile_factory, _isolated_home: Path
+) -> None:
+    """Two AUTH_EXPIRED profiles. Refresh succeeds for one, fails for the
+    other. After: succeeded profile is OK in cache + pickable; failed
+    profile is still AUTH_EXPIRED + filtered out. Pick returns succeeded."""
+    from datetime import datetime
+
+    profile_factory("good_refresh")
+    profile_factory("bad_refresh")
+
+    probe_state = {"count": 0}
+
+    def _probe_stub(profiles, *, prev_health=None, timeout=10.0):
+        probe_state["count"] += 1
+        now = datetime.now(UTC)
+        # First call: both AUTH_EXPIRED (cache seed)
+        if probe_state["count"] == 1:
+            return [
+                ProfileHealth(
+                    name=p.name, health=Health.AUTH_EXPIRED,
+                    probed_at=now, expires_at=None,
+                    credentials_mtime=p.credentials_mtime,
+                    error=ErrorInfo(type="token_expired", message="expired"),
+                )
+                for p in profiles
+            ]
+        # Subsequent calls (re-probe of refreshed profiles): they're OK now
+        return [
+            ProfileHealth(
+                name=p.name, health=Health.OK, probed_at=now,
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    def _refresh_mixed(profiles, *, timeout=10.0):
+        from claude_lb.refresh import RefreshResult
+        return [
+            RefreshResult(
+                name=p.name,
+                refreshed=(p.name == "good_refresh"),
+                error_code=None if p.name == "good_refresh" else "REFRESH_REJECTED",
+                error_message=None if p.name == "good_refresh" else "rejected",
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _probe_stub), \
+         patch.object(cli_mod, "refresh_many_sync", _refresh_mixed):
+        result = runner.invoke(app, ["pick", "--auto-refresh"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "good_refresh"
+    assert "auto-refresh failed" in result.stderr.lower()
+    assert "bad_refresh" in result.stderr.lower()
+
+
+def test_auto_refresh_composes_with_count(profile_factory) -> None:
+    """`pick --auto-refresh --count 2` should auto-refresh expired profiles,
+    then return up to 2 healthy profiles."""
+    from datetime import datetime
+
+    profile_factory("a")
+    profile_factory("b")
+    profile_factory("c")
+
+    probe_state = {"count": 0}
+
+    def _probe_stub(profiles, *, prev_health=None, timeout=10.0):
+        probe_state["count"] += 1
+        now = datetime.now(UTC)
+        if probe_state["count"] == 1:
+            # Initial: a expired, b+c ok
+            return [
+                ProfileHealth(
+                    name=p.name,
+                    health=Health.AUTH_EXPIRED if p.name == "a" else Health.OK,
+                    probed_at=now,
+                    expires_at=None,
+                    credentials_mtime=p.credentials_mtime,
+                    error=(
+                        ErrorInfo(type="token_expired", message="x")
+                        if p.name == "a" else None
+                    ),
+                )
+                for p in profiles
+            ]
+        # Re-probe of refreshed profile a → ok
+        return [
+            ProfileHealth(
+                name=p.name, health=Health.OK, probed_at=now,
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _probe_stub), \
+         patch.object(cli_mod, "refresh_many_sync", _stub_refresh_success):
+        result = runner.invoke(
+            app, ["pick", "--auto-refresh", "--count", "2"]
+        )
+    assert result.exit_code == 0
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 2
+    # All 3 should be selectable now (a was healed); top 2 by strategy.
+    assert set(lines).issubset({"a", "b", "c"})
+
+
 def test_exec_auto_refresh_is_honored(profile_factory, _isolated_home: Path) -> None:
     """exec --auto-refresh refreshes expired profiles before picking."""
     profile_factory("account-a")
