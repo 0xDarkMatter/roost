@@ -538,6 +538,86 @@ def test_auto_refresh_no_refresh_token_is_noop(credentials_dir: Path) -> None:
     assert refresh_call_count["n"] == 0, "refresh must not be attempted without a refresh token"
 
 
+def test_auto_refresh_rediscovers_profile_after_refresh(profile_factory) -> None:
+    """REGRESSION: after refresh succeeds, _attempt_auto_refresh must
+    re-discover the Profile (re-read .credentials.json) before re-probing.
+
+    The bug: refresh mutates `expiresAt` on disk. The Profile objects passed
+    into `refresh_many_sync` were built BEFORE that mutation, so their
+    `access_token_expires_at` still points at the past. If the re-probe is
+    called with those stale Profile objects, `_local_auth_expired` (in the
+    real probe path) short-circuits to AUTH_EXPIRED on the disk-updated
+    profile — silently undoing the whole point of auto-refresh.
+
+    This test verifies the fix by checking that the second probe call
+    receives Profile objects whose `credentials_mtime` reflects the
+    post-refresh disk state, not the pre-refresh snapshot.
+    """
+    from datetime import datetime, timedelta
+
+    cred_path = profile_factory("account-a")
+
+    captured: list[list[tuple[str, float, datetime | None]]] = []
+
+    def _probe_stub(profiles, *, prev_health=None, timeout=10.0):
+        captured.append([
+            (p.name, p.credentials_mtime, p.access_token_expires_at)
+            for p in profiles
+        ])
+        now = datetime.now(UTC)
+        if len(captured) == 1:
+            return [
+                ProfileHealth(
+                    name=p.name, health=Health.AUTH_EXPIRED,
+                    probed_at=now, expires_at=None,
+                    credentials_mtime=p.credentials_mtime,
+                )
+                for p in profiles
+            ]
+        return [
+            ProfileHealth(
+                name=p.name, health=Health.OK,
+                probed_at=now, credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    def _refresh_mutates_disk(profiles, *, timeout=10.0):
+        """Simulate a real refresh: bump expiresAt on disk so re-discovery
+        sees a fresh value. Sleeps briefly to guarantee mtime changes on
+        filesystems with low timestamp resolution (e.g. NTFS = ~10ms)."""
+        import time
+
+        from claude_lb.refresh import RefreshResult
+        future_ms = int((datetime.now(UTC) + timedelta(hours=8)).timestamp() * 1000)
+        time.sleep(0.05)  # ensure mtime ticks past pre-refresh snapshot
+        for p in profiles:
+            data = json.loads(Path(p.credentials_path).read_text())
+            data["claudeAiOauth"]["expiresAt"] = future_ms
+            Path(p.credentials_path).write_text(json.dumps(data))
+        return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
+
+    pre_refresh_mtime = cred_path.stat().st_mtime
+    with patch.object(cli_mod, "probe_many_sync", _probe_stub), \
+         patch.object(cli_mod, "refresh_many_sync", _refresh_mutates_disk):
+        result = runner.invoke(app, ["pick", "--auto-refresh"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "account-a"
+    assert len(captured) == 2
+    first_probe_mtime = captured[0][0][1]
+    second_probe_mtime = captured[1][0][1]
+    # Sanity: first probe ran with pre-refresh credentials.
+    assert first_probe_mtime == pre_refresh_mtime
+    # The fix: second probe must see the post-refresh disk state.
+    # Without re-discovery, both probes would receive the same stale Profile.
+    assert second_probe_mtime > first_probe_mtime, (
+        "regression: re-probe used stale Profile object (mtime unchanged); "
+        "auto-refresh must re-discover the Profile after refresh so the "
+        "post-refresh expiresAt is read from disk"
+    )
+
+
 def test_auto_refresh_last_candidate_falls_through_to_exit_2(profile_factory) -> None:
     """Only one profile, expired. Refresh fails. Exit 2 (AUTH_REQUIRED)."""
     profile_factory("account-a")

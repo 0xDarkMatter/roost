@@ -215,9 +215,24 @@ def _attempt_auto_refresh(cache: HealthCache, names: list[str]) -> HealthCache:
     if not refreshed_profiles:
         return cache
 
-    # Refresh bumped credentials mtime (implicit invalidation). Re-probe the
-    # refreshed profiles so pick() sees the new health state.
-    probed = probe_many_sync(refreshed_profiles)
+    # CRITICAL: re-discover the refreshed profiles. The Profile objects in
+    # `refreshed_profiles` were built BEFORE the refresh, so their
+    # `access_token_expires_at` still points at the past timestamp. If we
+    # probe with those stale objects, `_local_auth_expired` (probe.py)
+    # short-circuits to AUTH_EXPIRED without a network call — ignoring the
+    # newly-refreshed expiresAt on disk. Net effect: refresh succeeds, cache
+    # stays AUTH_EXPIRED, pick fails as if refresh hadn't happened.
+    # Re-discovery re-reads .credentials.json and picks up the new expiresAt.
+    fresh_profiles = []
+    for stale in refreshed_profiles:
+        fresh = get_profile(stale.name)
+        if fresh is not None:
+            fresh_profiles.append(fresh)
+
+    if not fresh_profiles:
+        return cache
+
+    probed = probe_many_sync(fresh_profiles)
     for h in probed:
         cache.profiles[h.name] = h
     save_cache(cache)
