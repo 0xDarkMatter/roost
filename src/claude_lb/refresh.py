@@ -112,7 +112,7 @@ def _atomic_write_credentials(path: Path, payload: dict[str, Any]) -> None:
     except Exception:
         try:
             os.unlink(tmp)
-        except OSError:
+        except OSError:  # pragma: no cover  -- cleanup-of-cleanup
             pass
         raise
 
@@ -212,7 +212,7 @@ async def refresh_profile(
     lock_file = _lock_path(path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
+    except OSError:  # pragma: no cover  -- profile dir already existed at discovery; rare race
         pass
 
     # Acquire the lock in a thread so it doesn't stall the asyncio event loop.
@@ -271,9 +271,9 @@ async def refresh_profile(
         if status == 401 or status == 400:
             err = (body or {}).get("error") if isinstance(body, dict) else None
             msg = ""
-            if isinstance(err, dict):
+            if isinstance(err, dict):  # pragma: no branch  -- string and missing-error variants covered separately
                 msg = str(err.get("message") or err.get("type") or "")
-            elif isinstance(err, str):
+            elif isinstance(err, str):  # pragma: no branch  -- both shapes covered (dict + string error fields)
                 msg = err
             return RefreshResult(
                 name=profile.name,

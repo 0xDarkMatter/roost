@@ -3315,6 +3315,19 @@ def test_show_unprobed_profile_iso_helper_handles_none(profile_factory) -> None:
     assert payload["data"]["session_reset_at"] is None
 
 
+def test_show_probed_profile_json_emits_iso_timestamps(profile_factory) -> None:
+    """A probed profile's `show --json` should pass timestamps through
+    `_iso_or_none` and emit them as Z-suffixed ISO strings."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        runner.invoke(app, ["status"])  # seed cache
+    result = runner.invoke(app, ["show", "account-a", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["probed_at"] is not None
+    assert payload["data"]["probed_at"].endswith("Z")
+
+
 # ---------------------------------------------------------------------------
 # exec — retry-on-429 when no second profile is available (line 1434-1436)
 # ---------------------------------------------------------------------------

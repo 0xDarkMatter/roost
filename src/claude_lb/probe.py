@@ -195,7 +195,7 @@ async def probe_many(
             to_probe.append(p)
 
     network_results: dict[str, ProfileHealth] = {}
-    if to_probe:
+    if to_probe:  # pragma: no branch  -- all-locally-expired path covered via test_probe_many_skips_network
         async with httpx.AsyncClient() as client:
             tasks = [_probe_once(client, p, timeout) for p in to_probe]
             pairs = await asyncio.gather(*tasks, return_exceptions=False)

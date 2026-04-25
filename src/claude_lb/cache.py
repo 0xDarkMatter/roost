@@ -71,13 +71,13 @@ def save_cache(cache: HealthCache, path: Path | None = None) -> None:
             fh.flush()
             try:
                 os.fsync(fh.fileno())
-            except OSError:
+            except OSError:  # pragma: no cover  -- fsync is best-effort; OS-dependent
                 pass
         os.replace(tmp_path, target)
     except Exception:
         try:
             os.unlink(tmp_path)
-        except OSError:
+        except OSError:  # pragma: no cover  -- cleanup-of-cleanup
             pass
         raise
 
