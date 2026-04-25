@@ -318,3 +318,94 @@ def test_to_json_meta_round_trips_fields() -> None:
     assert isinstance(meta["age_seconds"], int)
     assert meta["fetched_at"].endswith("Z")
     assert meta["fetch_error"] is None
+
+
+# ---------------------------------------------------------------------------
+# Corrupt-cache field-mismatch variants — every guard branch in _read_cache
+# ---------------------------------------------------------------------------
+
+
+def test_read_cache_returns_none_when_fetched_at_field_missing(
+    _isolate: Path,
+) -> None:
+    """A cache file with the right schema_version but no fetched_at field
+    should be treated as unreadable (re-fetch path) rather than crashing."""
+    cache_file = _isolate / "platform-status.json"
+    cache_file.write_text(json.dumps({
+        "schema_version": ps._SCHEMA_VERSION,
+        "indicator": "none",
+        "description": "missing fetched_at",
+    }))
+    assert ps._read_cache() is None
+
+
+def test_read_cache_returns_none_when_fetched_at_is_not_string(
+    _isolate: Path,
+) -> None:
+    cache_file = _isolate / "platform-status.json"
+    cache_file.write_text(json.dumps({
+        "schema_version": ps._SCHEMA_VERSION,
+        "fetched_at": 12345,  # int, not iso string
+        "indicator": "none",
+        "description": "wrong type",
+    }))
+    assert ps._read_cache() is None
+
+
+def test_read_cache_returns_none_when_fetched_at_is_unparseable(
+    _isolate: Path,
+) -> None:
+    cache_file = _isolate / "platform-status.json"
+    cache_file.write_text(json.dumps({
+        "schema_version": ps._SCHEMA_VERSION,
+        "fetched_at": "not-a-timestamp",
+        "indicator": "none",
+        "description": "junk ts",
+    }))
+    assert ps._read_cache() is None
+
+
+def test_read_cache_handles_naive_fetched_at_by_assuming_utc(
+    _isolate: Path,
+) -> None:
+    """A naive datetime string (no offset) should be assumed UTC, not crash."""
+    cache_file = _isolate / "platform-status.json"
+    cache_file.write_text(json.dumps({
+        "schema_version": ps._SCHEMA_VERSION,
+        "fetched_at": "2026-04-25T10:00:00",  # no Z, no offset
+        "indicator": "none",
+        "description": "All operational",
+        "active_incidents": [],
+        "degraded_components": [],
+    }))
+    result = ps._read_cache()
+    assert result is not None
+    assert result.fetched_at.tzinfo is not None  # UTC was inferred
+
+
+# ---------------------------------------------------------------------------
+# format_status_line — degraded-components-only path (no incidents)
+# ---------------------------------------------------------------------------
+
+
+def test_format_status_line_renders_degraded_components_alone() -> None:
+    """No incidents but a degraded component should still render a header."""
+    status = ps._parse_summary(_summary(components=[
+        {"name": "Claude API", "status": "degraded_performance"},
+    ]))
+    line = ps.format_status_line(status)
+    assert "Claude API" in line
+    assert "degraded" in line
+
+
+def test_format_status_line_truncates_many_degraded_components() -> None:
+    status = ps._parse_summary(_summary(components=[
+        {"name": f"Comp{i}", "status": "degraded_performance"}
+        for i in range(5)
+    ]))
+    line = ps.format_status_line(status)
+    assert "Comp0" in line
+    assert "Comp1" in line
+    assert "Comp2" in line
+    # 4th and 5th truncated with " (+N more)"
+    assert "+2 more" in line
