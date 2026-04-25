@@ -2584,3 +2584,250 @@ def test_pick_all_auth_dead_returns_auth_required(profile_factory) -> None:
         result = runner.invoke(app, ["pick"])
     assert result.exit_code == 2
 
+
+# ---------------------------------------------------------------------------
+# exec retry-on-429 — child fails, profile flips to throttled, retry runs
+# ---------------------------------------------------------------------------
+
+
+def test_exec_retry_on_429_dispatches_second_profile(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the child exits non-zero AND a re-probe shows the profile flipped
+    OK→RATE_LIMITED, exec should re-pick a different profile and re-run once.
+    Picks.log should record both runs."""
+    from datetime import UTC, datetime
+
+    from claude_lb.exec_cmd import ExecResult
+    from claude_lb.models import ProfileHealth
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    # First child run rc=1; re-probe shows RATE_LIMITED; second run rc=0
+    run_calls: list[str] = []
+
+    def _stub_run(argv, *, env_var_name, profile_name, timeout):
+        run_calls.append(profile_name)
+        rc = 1 if len(run_calls) == 1 else 0
+        return ExecResult(rc=rc, duration_ms=10)
+
+    def _stub_reprobe(cache, name):
+        return ProfileHealth(
+            name=name,
+            health=Health.RATE_LIMITED,
+            probed_at=datetime.now(UTC),
+            credentials_mtime=1000.0,
+        )
+
+    monkeypatch.setattr(cli_mod, "run_child", _stub_run)
+    monkeypatch.setattr(cli_mod, "_reprobe_after_child", _stub_reprobe)
+
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["exec", "--retry-on-429", "1", "claude-bin"])
+    # Final exit = second child's rc (0)
+    assert result.exit_code == 0
+    # Both profiles were tried
+    assert len(run_calls) == 2
+    assert run_calls[0] != run_calls[1]
+
+
+def test_exec_no_retry_when_disabled(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--retry-on-429 0` should never trigger re-pick even if probe shows
+    a flip to throttled."""
+    from datetime import UTC, datetime
+
+    from claude_lb.exec_cmd import ExecResult
+    from claude_lb.models import ProfileHealth
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    run_calls: list[str] = []
+
+    def _stub_run(argv, *, env_var_name, profile_name, timeout):
+        run_calls.append(profile_name)
+        return ExecResult(rc=42, duration_ms=10)
+
+    monkeypatch.setattr(cli_mod, "run_child", _stub_run)
+    # Even if reprobe would say RATE_LIMITED, the retry must not fire when
+    # retry-on-429 is 0.
+    monkeypatch.setattr(
+        cli_mod, "_reprobe_after_child",
+        lambda cache, name: ProfileHealth(
+            name=name, health=Health.RATE_LIMITED,
+            probed_at=datetime.now(UTC), credentials_mtime=1000.0,
+        ),
+    )
+
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(
+            app, ["exec", "--retry-on-429", "0", "claude-bin"]
+        )
+    assert result.exit_code == 42
+    assert len(run_calls) == 1
+
+
+def test_exec_timeout_doesnt_trigger_retry(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Timeout (rc=124) must NOT trigger rate-limit retry — it's a separate
+    failure mode (timeout != throttled), and retrying just times out again."""
+    from claude_lb.exec_cmd import RC_TIMEOUT, ExecResult
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    run_calls: list[str] = []
+
+    def _stub_run(argv, *, env_var_name, profile_name, timeout):
+        run_calls.append(profile_name)
+        return ExecResult(rc=RC_TIMEOUT, duration_ms=10, timed_out=True)
+
+    monkeypatch.setattr(cli_mod, "run_child", _stub_run)
+
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(
+            app, ["exec", "--retry-on-429", "1", "claude-bin"]
+        )
+    assert result.exit_code == RC_TIMEOUT
+    assert len(run_calls) == 1  # no retry — timeout is not a rate-limit symptom
+
+
+# ---------------------------------------------------------------------------
+# status — max-age override forces re-probe even with fresh cache
+# ---------------------------------------------------------------------------
+
+
+def test_status_max_age_zero_forces_reprobe(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--max-age 0` should treat any cached entry as stale and re-probe."""
+    profile_factory("account-a")
+    probe_calls = {"n": 0}
+
+    real_stub = _stub_probe_many_sync
+
+    def _counting_stub(profiles, *, prev_health=None):
+        probe_calls["n"] += 1
+        return real_stub(profiles, prev_health=prev_health)
+
+    with patch.object(cli_mod, "probe_many_sync", _counting_stub):
+        runner.invoke(app, ["status"])  # seed
+        runner.invoke(app, ["status", "--max-age", "0"])  # force re-probe
+    assert probe_calls["n"] == 2
+
+
+def test_status_uses_cache_when_fresh(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh cache should mean a second `status` call doesn't re-probe.
+    The default stub returns expires_at=None so we need a custom variant
+    with a future expires_at to make the cache freshness check pass."""
+    from datetime import timedelta
+
+    from claude_lb.models import ProfileHealth
+
+    profile_factory("account-a")
+    probe_calls = {"n": 0}
+
+    def _counting_stub_with_future_expiry(profiles, *, prev_health=None):
+        probe_calls["n"] += 1
+        from datetime import datetime
+        now = datetime.now(UTC)
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.OK,
+                probed_at=now,
+                expires_at=now + timedelta(minutes=10),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _counting_stub_with_future_expiry):
+        runner.invoke(app, ["status"])  # probe 1: cold cache
+        runner.invoke(app, ["status"])  # probe 2: cache fresh, no re-probe
+    assert probe_calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# history --since filter
+# ---------------------------------------------------------------------------
+
+
+def test_history_since_filter_drops_old_entries(_isolated_home: Path) -> None:
+    """Entries older than `--since N` should be dropped."""
+    from datetime import UTC, datetime, timedelta
+
+    log_path = _isolated_home / "picks.log"
+    now = datetime.now(UTC)
+    old = (now - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    recent = (now - timedelta(seconds=10)).isoformat().replace("+00:00", "Z")
+    log_path.write_text(
+        f"{old}\taccount-a\tsticky\tscore=0.5\n"
+        f"{recent}\taccount-b\tsticky\tscore=0.6\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history", "--since", "30m", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 1
+    assert payload["data"][0]["profile"] == "account-b"
+
+
+# ---------------------------------------------------------------------------
+# update text rendering — up-to-date / ahead+behind branches
+# ---------------------------------------------------------------------------
+
+
+def test_update_text_renders_up_to_date_when_zero_ahead_zero_behind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_lb.updater import UpdateStatus
+
+    def _fake_check():
+        return UpdateStatus(
+            current_version="0.8.0",
+            install_dir="/path",
+            is_git_repo=True,
+            local_commit="abc123def456",
+            upstream_commit="abc123def456",
+            ahead=0,
+            behind=0,
+            upgrade_hint="You're up-to-date.",
+        )
+
+    monkeypatch.setattr(cli_mod, "check_for_update", _fake_check)
+    result = runner.invoke(app, ["update"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split()).lower()
+    assert "up-to-date" in flat
+
+
+def test_update_text_renders_ahead_behind_diff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_lb.updater import UpdateStatus
+
+    def _fake_check():
+        return UpdateStatus(
+            current_version="0.8.0",
+            install_dir="/path",
+            is_git_repo=True,
+            local_commit="abc123def456",
+            upstream_commit="def456abc123",
+            ahead=2,
+            behind=5,
+            upgrade_hint="5 commit(s) behind upstream.",
+        )
+
+    monkeypatch.setattr(cli_mod, "check_for_update", _fake_check)
+    result = runner.invoke(app, ["update"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "2 ahead, 5 behind" in flat
+
