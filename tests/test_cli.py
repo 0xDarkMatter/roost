@@ -3073,6 +3073,147 @@ def test_update_text_renders_when_install_dir_is_not_a_git_repo(
     assert "Reinstall" in flat
 
 
+def test_probe_text_output_renders_status_table(profile_factory) -> None:
+    """`claude-lb probe` without --json should render the status table to
+    stderr and a summary line to stdout — covers the text-output block."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["probe"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "account-a" in flat
+    # Summary on stdout
+    assert "profile" in result.stdout.lower()
+
+
+def test_pick_failure_renders_earliest_recovery_in_message(profile_factory) -> None:
+    """When pick fails AND has an earliest_recovery_at, the rendered error
+    message should include 'Earliest recovery:' so operators know when to
+    retry. Hits the conditional-message block in the failure path."""
+    from datetime import UTC, datetime, timedelta
+
+    from claude_lb.models import ProfileHealth, Usage
+
+    profile_factory("rate-limited")
+
+    def _stub(profiles, *, prev_health=None):
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.RATE_LIMITED,
+                probed_at=datetime.now(UTC),
+                retry_after_s=60,
+                expires_at=datetime.now(UTC) + timedelta(seconds=60),
+                usage=Usage(),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        result = runner.invoke(app, ["pick"])
+    # All rate-limited → exit 6 (RATE_LIMITED), with earliest-recovery in the
+    # rendered message
+    assert result.exit_code == 6
+    flat = " ".join(result.stderr.split())
+    assert "Earliest recovery" in flat or "earliest" in flat.lower()
+
+
+def test_pick_failure_json_includes_earliest_recovery_at(profile_factory) -> None:
+    """JSON failure envelope should carry earliest_recovery_at as a structured
+    field for scripts to consume."""
+    from datetime import UTC, datetime, timedelta
+
+    from claude_lb.models import ProfileHealth, Usage
+
+    profile_factory("rate-limited")
+
+    def _stub(profiles, *, prev_health=None):
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.RATE_LIMITED,
+                probed_at=datetime.now(UTC),
+                retry_after_s=120,
+                expires_at=datetime.now(UTC) + timedelta(seconds=120),
+                usage=Usage(),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        result = runner.invoke(app, ["pick", "--json"])
+    assert result.exit_code == 6
+    payload = json.loads(result.stdout)
+    assert payload["error"]["details"]["earliest_recovery_at"] is not None
+    assert payload["error"]["details"]["earliest_recovery_at"].endswith("Z")
+
+
+def test_exec_timeout_renders_timeout_message(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Timeout child exit should render a yellow `timeout:` stderr line
+    naming the profile and rc."""
+    from claude_lb.exec_cmd import RC_TIMEOUT, ExecResult
+
+    profile_factory("account-a")
+
+    def _stub_run(argv, **kw):
+        return ExecResult(rc=RC_TIMEOUT, duration_ms=10, timed_out=True)
+
+    monkeypatch.setattr(cli_mod, "run_child", _stub_run)
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(
+            app, ["exec", "--timeout", "5", "--retry-on-429", "0", "claude"]
+        )
+    assert result.exit_code == RC_TIMEOUT
+    flat = " ".join(result.stderr.split()).lower()
+    assert "timeout" in flat
+    assert "account-a" in flat
+
+
+def test_exec_not_found_renders_not_found_message(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from claude_lb.exec_cmd import RC_NOT_FOUND, ExecResult
+
+    profile_factory("account-a")
+
+    def _stub_run(argv, **kw):
+        return ExecResult(rc=RC_NOT_FOUND, duration_ms=5, not_found=True)
+
+    monkeypatch.setattr(cli_mod, "run_child", _stub_run)
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(
+            app, ["exec", "--retry-on-429", "0", "missing-bin"]
+        )
+    assert result.exit_code == RC_NOT_FOUND
+    flat = " ".join(result.stderr.split()).lower()
+    assert "not found" in flat
+
+
+def test_refresh_invalid_soon_value_emits_validation_error(
+    profile_factory,
+) -> None:
+    """`refresh --soon garbage` → exit 4 with helpful message."""
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--soon", "not-a-duration"])
+    assert result.exit_code == 4
+    flat = " ".join(result.stderr.split()).lower()
+    assert "soon" in flat
+    assert "30m" in flat or "duration" in flat or "valid" in flat
+
+
+def test_refresh_invalid_soon_value_json_envelope(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--soon", "garbage", "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert "soon" in payload["error"]["message"].lower()
+
+
 def test_pick_warn_at_session_threshold_emits_warning(
     profile_factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
