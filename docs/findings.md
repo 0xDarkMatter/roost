@@ -198,3 +198,49 @@ is the single biggest blocker between v0.1 and v0.1 being *useful*.
   sufficiently atomic on NTFS for our purposes. The rare worst case is
   a reader seeing a slightly-stale snapshot — which triggers exactly the
   re-probe the caller wants. Reads never take a lock.
+
+---
+
+## extra_usage `monthly_limit` / `used_credits` unit (2026-04-25)
+
+**Finding:** Anthropic's `/api/oauth/usage` returns an `extra_usage` block
+on Max plans with the shape:
+
+```json
+{
+  "is_enabled": true,
+  "monthly_limit": 31000,
+  "used_credits": 31280.0,
+  "utilization": 100,
+  "currency": "AUD"
+}
+```
+
+The `currency` field is a real ISO 4217 code (observed: `AUD`, `USD`).
+`utilization` is a 0–100 percentage. But the unit of `monthly_limit` and
+`used_credits` is **undocumented**.
+
+**Empirical interpretation:** the numbers only make sense as **currency
+minor units (×100, i.e. cents)**. Three live profiles observed
+2026-04-25:
+
+| monthly_limit (raw) | currency | Implied $ value | Plausibility |
+|---------------------|----------|-----------------|--------------|
+| 31000 | AUD | $310 AUD | Plausible Max overage cap |
+| 40000 | USD | $400 USD | Plausible |
+| 100000 | AUD | $1000 AUD | Plausible heavy-user cap |
+
+If `monthly_limit` were raw dollars, the implied caps ($31k–$100k AUD/USD
+*per month per profile*) would be ~$360k–$1.2M annually for a single Max
+seat. Implausible.
+
+**Code path:** `src/claude_lb/models.py::ExtraUsage` stores both fields as
+raw `float | None`. `is_exhausted` derives from `utilization >= 100` only,
+which is the unit-safe signal. Tests in `tests/test_taxonomy.py` round-trip
+the raw integers without reinterpreting.
+
+**Action for the future:** if Anthropic ever publishes the unit (or if
+per-token billing changes the meaning), revisit. Don't add a "divided"
+helper field — the operator can divide at the call site, and we can't
+guarantee the unit is stable. README's "Monthly Overage" section now
+documents the empirical finding so users don't read 31000 AUD literally.

@@ -31,10 +31,29 @@ states) but `usage` data is null.
 
 ## Install
 
+Not on PyPI. Install from a local clone:
+
 ```bash
-# From PyPI (when published) or direct from a local clone:
+git clone https://github.com/0xDarkMatter/claude-lb.git
+cd claude-lb
 uv tool install --editable .
+
+claude-lb --version    # → claude-lb 0.7.0
 ```
+
+To upgrade later, pull + reinstall:
+
+```bash
+git -C claude-lb pull && uv tool install --reinstall --editable claude-lb
+```
+
+Or use the built-in `claude-lb update --apply` on POSIX (Windows has a
+[self-upgrade caveat](#diagnostics)).
+
+**Why `--editable`?** It links the install to your clone, so `git pull`
+picks up new code without reinstalling. The downside: deps added in a new
+release require a re-sync (`uv tool install --reinstall --editable .` from
+the clone), which `claude-lb update --apply` handles automatically.
 
 ## Setup
 
@@ -162,7 +181,7 @@ invalidates the health cache. A cron hook like
 ### Running commands
 
 ```bash
-# The north-star idiom: pick + refresh + dispatch in one call.
+# The composed idiom: pick + refresh + dispatch in one call.
 claude-lb exec --auto-refresh -- claude --dangerously-skip-permissions "write fn"
 
 # With explicit strategy, timeout, and retry-on-rate-limit:
@@ -366,6 +385,15 @@ still works but falls back to the hard weekly/session caps until the next
 month. The status table shows an **Overage** column (colour-coded) when any
 profile has overage enabled.
 
+> **Unit caveat:** `monthly_limit` and `used_credits` are integers from
+> Anthropic's API. The unit is undocumented. Empirically, the numbers only
+> make sense as **currency minor units (×100)** — so `monthly_limit: 31000`
+> with `currency: "AUD"` is **$310 AUD**, not $31,000 AUD. `claude-lb`
+> doesn't reinterpret these — it stores them raw and reports `utilization`
+> as a percentage, which is the only field guaranteed to mean the same thing
+> regardless of unit. If you need the displayed dollar amount, divide by 100
+> at the call site.
+
 ## Recent updates
 
 [**Releases on GitHub**](https://github.com/0xDarkMatter/claude-lb/releases) ·
@@ -392,7 +420,7 @@ profile has overage enabled.
 - **doctor refresh-token check** — warns on profiles missing a refreshToken
   (won't auto-heal at expiry).
 
-### v0.5.0 — composing the north-star idiom
+### v0.5.0 — exec, auto-refresh, multi-pick
 
 - **`claude-lb exec <cmd...>`** — pick a profile, set `AXIOM_CLAUDE_PROFILE`,
   exec the command, propagate child rc. With `--auto-refresh` and
