@@ -2974,6 +2974,105 @@ def test_pick_json_failure_emits_envelope_with_reason_code(
 # ---------------------------------------------------------------------------
 
 
+def test_doctor_text_output_renders_check_lines(profile_factory) -> None:
+    """`claude-lb doctor` (no --json) should emit a header + per-check status
+    lines on stderr — covers the text-rendering loop."""
+    profile_factory("account-a")
+    result = runner.invoke(app, ["doctor", "--skip-network"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "claude-lb doctor" in flat
+    assert "OK" in flat or "WARN" in flat
+
+
+def test_doctor_text_output_marks_warning_checks() -> None:
+    """A check that passed but flagged warning=True should render as WARN
+    (yellow) rather than OK."""
+    from claude_lb import doctor as doctor_mod
+
+    def _fake_run_doctor(*, skip_network: bool = False):
+        return doctor_mod.DoctorReport(
+            version="0.8.0",
+            checks=[
+                doctor_mod.CheckResult(name="ok-check", passed=True, detail="fine"),
+                doctor_mod.CheckResult(
+                    name="warn-check",
+                    passed=True,
+                    detail="works but watch out",
+                    extra={"warning": True},
+                ),
+                doctor_mod.CheckResult(
+                    name="fail-check", passed=False, detail="broke"
+                ),
+            ],
+        )
+
+    with patch.object(cli_mod, "run_doctor", _fake_run_doctor):
+        result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 1  # one check failed
+    flat = " ".join(result.stderr.split())
+    assert "WARN" in flat
+    assert "fail-check" in flat
+
+
+def test_history_text_output_renders_table(_isolated_home: Path) -> None:
+    """A non-empty picks.log without --json should render a Rich table on
+    stderr — covers the rich.Table render block."""
+    log_path = _isolated_home / "picks.log"
+    log_path.write_text(
+        "2026-04-25T10:00:00Z\taccount-a\tsticky\tscore=0.50\n"
+        "2026-04-25T10:01:00Z\taccount-b\tsticky\tscore=0.60\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "account-a" in flat
+    assert "account-b" in flat
+
+
+def test_history_text_with_filter_no_matches(_isolated_home: Path) -> None:
+    """`--profile X` with no matching entries should print 'No matching
+    entries' rather than an empty table."""
+    log_path = _isolated_home / "picks.log"
+    log_path.write_text(
+        "2026-04-25T10:00:00Z\taccount-a\tsticky\tscore=0.50\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history", "--profile", "nope"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split()).lower()
+    assert "no matching" in flat
+
+
+def test_update_text_renders_when_install_dir_is_not_a_git_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An install dir that exists but isn't a git repo should still render
+    the version + install path + hint, just without the commit/status lines."""
+    from claude_lb.updater import UpdateStatus
+
+    def _fake_check():
+        return UpdateStatus(
+            current_version="0.8.0",
+            install_dir="/path/to/install",
+            is_git_repo=False,
+            local_commit=None,
+            upstream_commit=None,
+            ahead=None,
+            behind=None,
+            upgrade_hint="Reinstall from upstream.",
+        )
+
+    monkeypatch.setattr(cli_mod, "check_for_update", _fake_check)
+    result = runner.invoke(app, ["update"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "0.8.0" in flat
+    assert "/path/to/install" in flat
+    assert "Reinstall" in flat
+
+
 def test_pick_warn_at_session_threshold_emits_warning(
     profile_factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:

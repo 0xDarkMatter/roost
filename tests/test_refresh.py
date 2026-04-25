@@ -488,3 +488,31 @@ async def test_refresh_profile_500_returns_unexpected_response(
     assert result.refreshed is False
     assert result.error_code == "UNEXPECTED_RESPONSE"
     assert "500" in (result.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_refresh_profile_write_failed_when_atomic_write_raises(
+    tmp_path: Path, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If Anthropic returns a valid 200 but the local atomic-write fails
+    (e.g. disk full), refresh should report WRITE_FAILED rather than
+    pretending the refresh succeeded — otherwise the next call would think
+    the new token is on disk when it isn't."""
+    from claude_lb import refresh as refresh_mod
+    from claude_lb.refresh import refresh_profile
+
+    cred = tmp_path / "p" / ".credentials.json"
+    _write_credentials(cred, refresh="the-rt")
+    respx_mock.post(TOKEN_URL).respond(
+        200,
+        json={"access_token": "new-A", "refresh_token": "new-R", "expires_in": 3600},
+    )
+
+    def _boom_write(path, payload):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(refresh_mod, "_atomic_write_credentials", _boom_write)
+    result = await refresh_profile(_profile(cred), timeout=1.0)
+    assert result.refreshed is False
+    assert result.error_code == "WRITE_FAILED"
+    assert "disk full" in (result.error_message or "")
