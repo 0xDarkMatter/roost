@@ -2831,3 +2831,176 @@ def test_update_text_renders_ahead_behind_diff(
     flat = " ".join(result.stderr.split())
     assert "2 ahead, 5 behind" in flat
 
+
+# ---------------------------------------------------------------------------
+# show — fully-probed profile renders all the optional fields
+# ---------------------------------------------------------------------------
+
+
+def test_show_probed_profile_text_renders_health_and_latency(
+    profile_factory,
+) -> None:
+    """A profile that's been probed should render the full detail block:
+    health, probe_latency_ms, error if present. Hits the entry-not-None branches."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        runner.invoke(app, ["status"])  # seed cache
+    result = runner.invoke(app, ["show", "account-a"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "account-a" in flat
+    assert "health: ok" in flat
+
+
+def test_show_probed_profile_with_error_renders_error_line(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the cached entry has an error attached (auth_dead etc.), `show`
+    should render an `error: type — message` line."""
+    from datetime import UTC, datetime
+
+    from claude_lb.models import ErrorInfo, ProfileHealth
+
+    profile_factory("dead")
+
+    def _stub(profiles, *, prev_health=None):
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.AUTH_DEAD,
+                probed_at=datetime.now(UTC),
+                error=ErrorInfo(type="auth_error", message="token rejected"),
+                credentials_mtime=p.credentials_mtime,
+                probe_latency_ms=42,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        runner.invoke(app, ["status"])  # seed cache with the error
+    result = runner.invoke(app, ["show", "dead"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "auth_error" in flat
+    assert "token rejected" in flat
+    assert "probe_latency_ms" in flat
+
+
+# ---------------------------------------------------------------------------
+# add — copy failure (filesystem error mid-copy)
+# ---------------------------------------------------------------------------
+
+
+def test_add_copy_failure_reports_clear_error(
+    tmp_path: Path, credentials_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If shutil.copy2 raises (e.g. disk full, permission denied) mid-copy,
+    `add` should report an ERROR exit with a useful message — not a traceback."""
+    import shutil as _shutil
+
+    src = tmp_path / "src.json"
+    _write_credentials_file(src)
+
+    def _boom_copy(src, dst, *args, **kwargs):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(_shutil, "copy2", _boom_copy)
+    result = runner.invoke(app, ["add", "willfail", "--from", str(src)])
+    assert result.exit_code == 1
+    flat = " ".join(result.stderr.split()).lower()
+    assert "copy failed" in flat
+    assert "disk full" in flat
+
+
+def test_add_copy_failure_json_emits_error_envelope(
+    tmp_path: Path, credentials_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil as _shutil
+
+    src = tmp_path / "src.json"
+    _write_credentials_file(src)
+
+    def _boom_copy(src, dst, *args, **kwargs):
+        raise OSError("simulated permission denied")
+
+    monkeypatch.setattr(_shutil, "copy2", _boom_copy)
+    result = runner.invoke(app, ["add", "willfail", "--from", str(src), "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "ERROR"
+    assert "permission denied" in payload["error"]["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# pick — JSON failure envelope includes earliest_recovery_at when known
+# ---------------------------------------------------------------------------
+
+
+def test_pick_json_failure_emits_envelope_with_reason_code(
+    profile_factory,
+) -> None:
+    """A failed pick (--json) should yield an error envelope with the SPEC
+    reason code uppercased and the message — covers the JSON-output branch
+    of the failure path."""
+    from datetime import UTC, datetime
+
+    from claude_lb.models import ErrorInfo, ProfileHealth
+
+    profile_factory("dead")
+
+    def _stub(profiles, *, prev_health=None):
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.AUTH_DEAD,
+                probed_at=datetime.now(UTC),
+                error=ErrorInfo(type="auth_error", message="dead"),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        result = runner.invoke(app, ["pick", "--json"])
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert "error" in payload
+    assert payload["error"]["code"]
+    assert payload["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# pick --warn-at — session band warning
+# ---------------------------------------------------------------------------
+
+
+def test_pick_warn_at_session_threshold_emits_warning(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session_pct >= warn-at should print a yellow stderr warning while
+    still returning the profile name on stdout (exit 0)."""
+    from datetime import UTC, datetime
+
+    from claude_lb.models import ProfileHealth, Usage
+
+    profile_factory("hot")
+
+    def _stub(profiles, *, prev_health=None):
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.OK,
+                probed_at=datetime.now(UTC),
+                usage=Usage(session_pct=95, weekly_pct=10),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        result = runner.invoke(app, ["pick", "--warn-at", "80"])
+    assert result.exit_code == 0
+    assert "hot\n" in result.stdout  # profile name still emitted
+    assert "session" in result.stderr.lower()
+    assert "95%" in result.stderr
+
