@@ -49,5 +49,6 @@ Thumbs.db
 
 # Local scratch
 .claude/worktrees/
+.claude/settings.local.json
 docs/screenshots/
 BLOCKERS.md
