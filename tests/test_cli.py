@@ -2195,3 +2195,190 @@ def test_status_force_refresh_propagates_to_loader(
     assert loader.called_with is not None
     assert loader.called_with.get("force_refresh") is True
 
+
+# ---------------------------------------------------------------------------
+# probe command — empty profile list + JSON variants
+# ---------------------------------------------------------------------------
+
+
+def test_probe_no_profiles_returns_unavailable() -> None:
+    """`claude-lb probe` with no profiles on disk should exit 9 (UNAVAILABLE)."""
+    result = runner.invoke(app, ["probe"])
+    assert result.exit_code == 9
+    flat = " ".join(result.stderr.split()).lower()
+    assert "no profiles" in flat
+
+
+def test_probe_no_profiles_json_emits_not_found_envelope() -> None:
+    result = runner.invoke(app, ["probe", "--json"])
+    assert result.exit_code == 9
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+def test_probe_named_unknown_profile_json_emits_not_found(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["probe", "nonexistent", "--json"])
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# show command — JSON-output for unprobed-but-discovered profile
+# ---------------------------------------------------------------------------
+
+
+def test_show_unknown_profile_returns_not_found(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["show", "nonexistent"])
+    assert result.exit_code == 3
+
+
+def test_show_unknown_profile_json_emits_not_found(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["show", "nonexistent", "--json"])
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+def test_show_unprobed_profile_text_output(profile_factory) -> None:
+    """A profile that exists on disk but isn't in the cache yet should still
+    render — printing what we know (credentials path, token source) without
+    the health bits. Hits the entry-is-None branch."""
+    profile_factory("never-probed")
+    result = runner.invoke(app, ["show", "never-probed"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "never-probed" in flat
+    assert "credentials" in flat
+
+
+def test_show_unprobed_profile_json_output(profile_factory) -> None:
+    profile_factory("never-probed")
+    result = runner.invoke(app, ["show", "never-probed", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["name"] == "never-probed"
+    assert payload["data"]["health"] == "unknown"
+    assert payload["data"]["probed_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# list command — JSON output, multiple profiles
+# ---------------------------------------------------------------------------
+
+
+def test_list_json_output(profile_factory) -> None:
+    profile_factory("account-a")
+    profile_factory("account-b")
+    result = runner.invoke(app, ["list", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 2
+    names = [p if isinstance(p, str) else p["name"] for p in payload["data"]]
+    assert set(names) == {"account-a", "account-b"}
+
+
+# ---------------------------------------------------------------------------
+# invalidate command — happy path + unknown profile
+# ---------------------------------------------------------------------------
+
+
+def test_invalidate_unknown_profile_returns_not_found(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["invalidate", "nonexistent"])
+    assert result.exit_code == 3
+
+
+def test_invalidate_removes_cache_entry(profile_factory) -> None:
+    """After invalidate, the cache should no longer have an entry for that
+    profile. Use status with a stub probe to seed the cache first."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        runner.invoke(app, ["status"])  # seeds cache
+    # Now invalidate
+    result = runner.invoke(app, ["invalidate", "account-a"])
+    assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# pick exit-code branches
+# ---------------------------------------------------------------------------
+
+
+def test_pick_no_profiles_returns_unavailable() -> None:
+    result = runner.invoke(app, ["pick"])
+    # No profiles → UNAVAILABLE (9)
+    assert result.exit_code == 9
+
+
+def test_pick_export_with_count_greater_than_one_rejected(profile_factory) -> None:
+    """`pick --export --count 2` is ambiguous (one var, multiple values).
+    Should refuse with VALIDATION exit code."""
+    profile_factory("account-a")
+    profile_factory("account-b")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["pick", "--export", "--count", "2"])
+    assert result.exit_code == 4
+
+
+# ---------------------------------------------------------------------------
+# history command — additional flag combos
+# ---------------------------------------------------------------------------
+
+
+def test_history_with_invalid_since_value_returns_validation_error(
+    _isolated_home: Path,
+) -> None:
+    """`--since` value that doesn't parse should be a clean VALIDATION error,
+    not a crash or a silent no-op."""
+    result = runner.invoke(app, ["history", "--since", "garbage"])
+    assert result.exit_code == 4
+
+
+def test_history_handles_malformed_log_lines_gracefully(
+    _isolated_home: Path,
+) -> None:
+    """Lines that don't parse (rotation can leave partial trailing lines)
+    should be skipped, not crash."""
+    log_path = _isolated_home / "picks.log"
+    log_path.write_text(
+        "this is not\ttab-separated-iso\n"
+        "2026-04-25T10:30:00Z\taccount-a\tsticky\tscore=0.50\n"
+        "another bad line\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    # Only the well-formed line should appear
+    assert payload["meta"]["count"] == 1
+
+
+def test_history_filter_by_profile_returns_only_matching(
+    _isolated_home: Path,
+) -> None:
+    log_path = _isolated_home / "picks.log"
+    log_path.write_text(
+        "2026-04-25T10:00:00Z\taccount-a\tsticky\tscore=0.50\n"
+        "2026-04-25T10:01:00Z\taccount-b\tsticky\tscore=0.60\n"
+        "2026-04-25T10:02:00Z\taccount-a\tsticky\tscore=0.55\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history", "--json", "--profile", "account-a"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 2
+    assert all(e["profile"] == "account-a" for e in payload["data"])
+
+
+def test_history_text_output_when_log_missing(_isolated_home: Path) -> None:
+    """Text output (not --json) with no log file should print a friendly
+    'no history yet' notice — not crash."""
+    result = runner.invoke(app, ["history"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split()).lower()
+    assert "no history" in flat or "no picks" in flat
+
