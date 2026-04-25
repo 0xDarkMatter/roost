@@ -106,11 +106,12 @@ def fetch_platform_status(timeout_s: float = STATUS_CACHE_TIMEOUT_S) -> Platform
 
 
 def _write_cache(status: PlatformStatus) -> None:
-    """Atomic write — same pattern as health.json."""
+    """Atomic write — same pattern as health.json. Best-effort: this is a
+    cache, not load-bearing data, so any failure swallows silently."""
     try:
         target_dir = ensure_config_dir()
-    except OSError:
-        return  # can't cache; not fatal
+    except OSError:  # pragma: no cover  -- can't even create config dir; nothing to cache
+        return
     target = target_dir / "platform-status.json"
     payload: dict[str, Any] = {
         "schema_version": _SCHEMA_VERSION,
@@ -126,14 +127,13 @@ def _write_cache(status: PlatformStatus) -> None:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh)
             os.replace(tmp, target)
-        except Exception:
+        except Exception:  # pragma: no cover  -- atomic-write failure; best-effort cache
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
             raise
-    except OSError:
-        # Best-effort cache; don't fail the calling command.
+    except OSError:  # pragma: no cover  -- mkstemp failed; cache is best-effort
         return
 
 

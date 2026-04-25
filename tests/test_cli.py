@@ -1125,6 +1125,37 @@ def test_parse_duration_rejects_garbage() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _humanize_elapsed — every duration band
+# ---------------------------------------------------------------------------
+
+
+def test_humanize_elapsed_negative_clamps_to_zero() -> None:
+    assert cli_mod._humanize_elapsed(-5) == "0s ago"
+    assert cli_mod._humanize_elapsed(-9999) == "0s ago"
+
+
+def test_humanize_elapsed_seconds_band() -> None:
+    assert cli_mod._humanize_elapsed(0) == "0s ago"
+    assert cli_mod._humanize_elapsed(1) == "1s ago"
+    assert cli_mod._humanize_elapsed(59) == "59s ago"
+
+
+def test_humanize_elapsed_minutes_band() -> None:
+    assert cli_mod._humanize_elapsed(60) == "1m ago"
+    assert cli_mod._humanize_elapsed(3599) == "59m ago"
+
+
+def test_humanize_elapsed_hours_band() -> None:
+    assert cli_mod._humanize_elapsed(3600) == "1h ago"
+    assert cli_mod._humanize_elapsed(86399) == "23h ago"
+
+
+def test_humanize_elapsed_days_band() -> None:
+    assert cli_mod._humanize_elapsed(86400) == "1d ago"
+    assert cli_mod._humanize_elapsed(86400 * 7) == "7d ago"
+
+
+# ---------------------------------------------------------------------------
 # claude-lb history
 # ---------------------------------------------------------------------------
 
@@ -1466,6 +1497,312 @@ def test_add_json_output(tmp_path: Path, credentials_dir: Path) -> None:
     assert payload["data"]["name"] == "newprofile"
     assert payload["data"]["source"] == str(src)
     assert payload["meta"]["action"] == "added"
+
+
+# ---------------------------------------------------------------------------
+# add command — JSON-output error envelopes for every validation path
+# ---------------------------------------------------------------------------
+
+
+def test_add_json_invalid_name_emits_validation_error_envelope(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "src.json"
+    _write_credentials_file(src)
+    result = runner.invoke(app, ["add", "bad name", "--from", str(src), "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert "invalid profile name" in payload["error"]["message"].lower()
+
+
+def test_add_json_missing_source_emits_not_found_envelope(
+    tmp_path: Path,
+) -> None:
+    nonexistent = tmp_path / "nope.json"
+    result = runner.invoke(
+        app, ["add", "x", "--from", str(nonexistent), "--json"]
+    )
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+def test_add_json_malformed_source_emits_validation_error(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "bad.json"
+    src.write_text("{not valid json", encoding="utf-8")
+    result = runner.invoke(app, ["add", "x", "--from", str(src), "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert "parseable" in payload["error"]["message"].lower()
+
+
+def test_add_json_source_is_list_emits_validation_error(
+    tmp_path: Path,
+) -> None:
+    """A JSON list (vs object) at the source path should be rejected with
+    a clear message — covers the `not isinstance(payload, dict)` branch."""
+    src = tmp_path / "list.json"
+    src.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+    result = runner.invoke(app, ["add", "x", "--from", str(src), "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert "object" in payload["error"]["message"].lower()
+
+
+def test_add_json_no_token_emits_validation_error(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "no-token.json"
+    src.write_text(json.dumps({"unrelated": 1}), encoding="utf-8")
+    result = runner.invoke(app, ["add", "x", "--from", str(src), "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert "token" in payload["error"]["message"].lower()
+
+
+def test_add_json_conflict_emits_conflict_envelope(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "src.json"
+    _write_credentials_file(src)
+    runner.invoke(app, ["add", "dup", "--from", str(src)])
+    result = runner.invoke(app, ["add", "dup", "--from", str(src), "--json"])
+    assert result.exit_code == 7
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "CONFLICT"
+    assert "exists" in payload["error"]["message"].lower()
+
+
+def test_add_json_oauth_accessToken_legacy_shape_accepted(
+    tmp_path: Path, credentials_dir: Path
+) -> None:
+    """Legacy `oauthAccessToken` shape should pass token validation
+    (covers the `any(...)` branch in the token-shape check)."""
+    src = tmp_path / "legacy.json"
+    src.write_text(
+        json.dumps({"oauthAccessToken": "sk-ant-oat01-legacy"}),
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app, ["add", "legacy", "--from", str(src), "--json"]
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["name"] == "legacy"
+
+
+# ---------------------------------------------------------------------------
+# refresh command — selector validation envelopes
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_no_selector_returns_validation_error(profile_factory) -> None:
+    """`claude-lb refresh` with no name and no flags should refuse — would
+    otherwise be ambiguous between "all" and "nothing"."""
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh"])
+    assert result.exit_code == 4
+    flat = " ".join(result.stderr.split()).lower()
+    assert "specify" in flat or "one of" in flat
+
+
+def test_refresh_no_selector_json_emits_validation_error_envelope(
+    profile_factory,
+) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_refresh_multiple_selectors_returns_validation_error(
+    profile_factory,
+) -> None:
+    """Combining --all and --expired (or any two selectors) is ambiguous."""
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--all", "--expired"])
+    assert result.exit_code == 4
+    flat = " ".join(result.stderr.split()).lower()
+    assert "exactly one" in flat or "one of" in flat
+
+
+def test_refresh_multiple_selectors_json_emits_validation_envelope(
+    profile_factory,
+) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--all", "--expired", "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_refresh_unknown_profile_name_returns_not_found(
+    profile_factory,
+) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "nonexistent"])
+    assert result.exit_code == 3
+    flat = " ".join(result.stderr.split()).lower()
+    assert "no such profile" in flat
+
+
+def test_refresh_unknown_profile_name_json_emits_not_found_envelope(
+    profile_factory,
+) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "nonexistent", "--json"])
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+def test_refresh_expired_with_no_expired_profiles_succeeds_quietly(
+    profile_factory,
+) -> None:
+    """`refresh --expired` with no eligible profiles should succeed (rc=0)
+    with a "nothing to do" message — not an error."""
+    profile_factory("account-a")  # default has future expiresAt
+    result = runner.invoke(app, ["refresh", "--expired"])
+    assert result.exit_code == 0
+
+
+def test_refresh_expired_with_no_expired_profiles_json_envelope(
+    profile_factory,
+) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--expired", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"] == []
+    assert payload["meta"]["count"] == 0
+    assert payload["meta"]["refreshed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# update --apply CLI surface (the apply_update path is unit-tested separately)
+# ---------------------------------------------------------------------------
+
+
+def test_update_command_renders_status_text() -> None:
+    """`claude-lb update` (no --apply) prints the version + git status."""
+    result = runner.invoke(app, ["update"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    # Always at least mentions the current version + a hint
+    assert "claude-lb" in flat
+    assert "hint" in flat.lower()
+
+
+def test_update_command_json_envelope() -> None:
+    result = runner.invoke(app, ["update", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert "data" in payload
+    assert "meta" in payload
+    assert "current_version" in payload["data"]
+    assert isinstance(payload["meta"]["update_available"], bool)
+
+
+def test_update_apply_happy_path_renders_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When apply_update succeeds, the CLI prints 'Update applied' on stderr
+    and exits 0."""
+    from claude_lb.updater import UpdateApplyResult
+
+    def _fake_apply(*, pull: bool) -> UpdateApplyResult:
+        return UpdateApplyResult(
+            current_version="0.8.0",
+            install_dir="/path",
+            applied=True,
+            pulled=pull,
+            reinstalled=True,
+            stdout="ok",
+        )
+
+    monkeypatch.setattr(cli_mod, "apply_update", _fake_apply)
+    result = runner.invoke(app, ["update", "--apply"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split()).lower()
+    assert "update applied" in flat
+
+
+def test_update_apply_failure_returns_exit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_lb.updater import UpdateApplyResult
+
+    def _fake_apply(*, pull: bool) -> UpdateApplyResult:
+        return UpdateApplyResult(
+            current_version="0.8.0",
+            install_dir="/path",
+            applied=False,
+            pulled=False,
+            reinstalled=False,
+            error="simulated failure",
+            stdout="some details",
+        )
+
+    monkeypatch.setattr(cli_mod, "apply_update", _fake_apply)
+    result = runner.invoke(app, ["update", "--apply"])
+    assert result.exit_code == 1
+    flat = " ".join(result.stderr.split()).lower()
+    assert "update failed" in flat
+    assert "simulated failure" in flat
+
+
+def test_update_apply_json_failure_returns_exit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_lb.updater import UpdateApplyResult
+
+    def _fake_apply(*, pull: bool) -> UpdateApplyResult:
+        return UpdateApplyResult(
+            current_version="0.8.0",
+            install_dir="/path",
+            applied=False,
+            pulled=False,
+            reinstalled=False,
+            error="boom",
+        )
+
+    monkeypatch.setattr(cli_mod, "apply_update", _fake_apply)
+    result = runner.invoke(app, ["update", "--apply", "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["data"]["applied"] is False
+    assert payload["meta"]["applied"] is False
+
+
+def test_update_apply_no_pull_flag_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--no-pull` should pass `pull=False` through to apply_update."""
+    from claude_lb.updater import UpdateApplyResult
+
+    captured: dict = {}
+
+    def _fake_apply(*, pull: bool) -> UpdateApplyResult:
+        captured["pull"] = pull
+        return UpdateApplyResult(
+            current_version="0.8.0",
+            install_dir="/p",
+            applied=True,
+            pulled=False,
+            reinstalled=True,
+        )
+
+    monkeypatch.setattr(cli_mod, "apply_update", _fake_apply)
+    result = runner.invoke(app, ["update", "--apply", "--no-pull"])
+    assert result.exit_code == 0
+    assert captured["pull"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -1857,4 +2194,1378 @@ def test_status_force_refresh_propagates_to_loader(
     assert result.exit_code == 0
     assert loader.called_with is not None
     assert loader.called_with.get("force_refresh") is True
+
+
+# ---------------------------------------------------------------------------
+# probe command — empty profile list + JSON variants
+# ---------------------------------------------------------------------------
+
+
+def test_probe_no_profiles_returns_unavailable() -> None:
+    """`claude-lb probe` with no profiles on disk should exit 9 (UNAVAILABLE)."""
+    result = runner.invoke(app, ["probe"])
+    assert result.exit_code == 9
+    flat = " ".join(result.stderr.split()).lower()
+    assert "no profiles" in flat
+
+
+def test_probe_no_profiles_json_emits_not_found_envelope() -> None:
+    result = runner.invoke(app, ["probe", "--json"])
+    assert result.exit_code == 9
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+def test_probe_named_unknown_profile_json_emits_not_found(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["probe", "nonexistent", "--json"])
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# show command — JSON-output for unprobed-but-discovered profile
+# ---------------------------------------------------------------------------
+
+
+def test_show_unknown_profile_returns_not_found(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["show", "nonexistent"])
+    assert result.exit_code == 3
+
+
+def test_show_unknown_profile_json_emits_not_found(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["show", "nonexistent", "--json"])
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+def test_show_unprobed_profile_text_output(profile_factory) -> None:
+    """A profile that exists on disk but isn't in the cache yet should still
+    render — printing what we know (credentials path, token source) without
+    the health bits. Hits the entry-is-None branch."""
+    profile_factory("never-probed")
+    result = runner.invoke(app, ["show", "never-probed"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "never-probed" in flat
+    assert "credentials" in flat
+
+
+def test_show_unprobed_profile_json_output(profile_factory) -> None:
+    profile_factory("never-probed")
+    result = runner.invoke(app, ["show", "never-probed", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["name"] == "never-probed"
+    assert payload["data"]["health"] == "unknown"
+    assert payload["data"]["probed_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# list command — JSON output, multiple profiles
+# ---------------------------------------------------------------------------
+
+
+def test_list_json_output(profile_factory) -> None:
+    profile_factory("account-a")
+    profile_factory("account-b")
+    result = runner.invoke(app, ["list", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 2
+    names = [p if isinstance(p, str) else p["name"] for p in payload["data"]]
+    assert set(names) == {"account-a", "account-b"}
+
+
+# ---------------------------------------------------------------------------
+# invalidate command — happy path + unknown profile
+# ---------------------------------------------------------------------------
+
+
+def test_invalidate_unknown_profile_returns_not_found(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["invalidate", "nonexistent"])
+    assert result.exit_code == 3
+
+
+def test_invalidate_removes_cache_entry(profile_factory) -> None:
+    """After invalidate, the cache should no longer have an entry for that
+    profile. Use status with a stub probe to seed the cache first."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        runner.invoke(app, ["status"])  # seeds cache
+    # Now invalidate
+    result = runner.invoke(app, ["invalidate", "account-a"])
+    assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# pick exit-code branches
+# ---------------------------------------------------------------------------
+
+
+def test_pick_no_profiles_returns_unavailable() -> None:
+    result = runner.invoke(app, ["pick"])
+    # No profiles → UNAVAILABLE (9)
+    assert result.exit_code == 9
+
+
+def test_pick_export_with_count_greater_than_one_rejected(profile_factory) -> None:
+    """`pick --export --count 2` is ambiguous (one var, multiple values).
+    Should refuse with VALIDATION exit code."""
+    profile_factory("account-a")
+    profile_factory("account-b")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["pick", "--export", "--count", "2"])
+    assert result.exit_code == 4
+
+
+# ---------------------------------------------------------------------------
+# history command — additional flag combos
+# ---------------------------------------------------------------------------
+
+
+def test_history_with_invalid_since_value_returns_validation_error(
+    _isolated_home: Path,
+) -> None:
+    """`--since` value that doesn't parse should be a clean VALIDATION error,
+    not a crash or a silent no-op."""
+    result = runner.invoke(app, ["history", "--since", "garbage"])
+    assert result.exit_code == 4
+
+
+def test_history_handles_malformed_log_lines_gracefully(
+    _isolated_home: Path,
+) -> None:
+    """Lines that don't parse (rotation can leave partial trailing lines)
+    should be skipped, not crash."""
+    log_path = _isolated_home / "picks.log"
+    log_path.write_text(
+        "this is not\ttab-separated-iso\n"
+        "2026-04-25T10:30:00Z\taccount-a\tsticky\tscore=0.50\n"
+        "another bad line\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    # Only the well-formed line should appear
+    assert payload["meta"]["count"] == 1
+
+
+def test_history_filter_by_profile_returns_only_matching(
+    _isolated_home: Path,
+) -> None:
+    log_path = _isolated_home / "picks.log"
+    log_path.write_text(
+        "2026-04-25T10:00:00Z\taccount-a\tsticky\tscore=0.50\n"
+        "2026-04-25T10:01:00Z\taccount-b\tsticky\tscore=0.60\n"
+        "2026-04-25T10:02:00Z\taccount-a\tsticky\tscore=0.55\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history", "--json", "--profile", "account-a"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 2
+    assert all(e["profile"] == "account-a" for e in payload["data"])
+
+
+def test_history_text_output_when_log_missing(_isolated_home: Path) -> None:
+    """Text output (not --json) with no log file should print a friendly
+    'no history yet' notice — not crash."""
+    result = runner.invoke(app, ["history"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split()).lower()
+    assert "no history" in flat or "no picks" in flat
+
+
+# ---------------------------------------------------------------------------
+# refresh — exit-code mapping when failures dominate
+# ---------------------------------------------------------------------------
+
+
+def _stub_refresh_results(profile_names: list[str], *, error_code: str | None):
+    """Build a refresh_many_sync stub returning failures with a specific code."""
+    from claude_lb.refresh import RefreshResult
+
+    def _stub(profiles, *, timeout=10.0):
+        return [
+            RefreshResult(
+                name=p.name,
+                refreshed=False,
+                error_code=error_code,
+                error_message=f"simulated {error_code}",
+            )
+            for p in profiles
+        ]
+
+    return _stub
+
+
+def test_refresh_all_failures_with_lock_held_exits_conflict(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When every profile fails AND any error_code is LOCK_HELD, exit is 7."""
+    profile_factory("account-a")
+    monkeypatch.setattr(
+        cli_mod,
+        "refresh_many_sync",
+        _stub_refresh_results(["account-a"], error_code="LOCK_HELD"),
+    )
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 7
+
+
+def test_refresh_all_failures_refresh_rejected_exits_auth_required(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REFRESH_REJECTED → AUTH_REQUIRED (2)."""
+    profile_factory("account-a")
+    monkeypatch.setattr(
+        cli_mod,
+        "refresh_many_sync",
+        _stub_refresh_results(["account-a"], error_code="REFRESH_REJECTED"),
+    )
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 2
+
+
+def test_refresh_all_failures_unexpected_response_exits_error(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile_factory("account-a")
+    monkeypatch.setattr(
+        cli_mod,
+        "refresh_many_sync",
+        _stub_refresh_results(["account-a"], error_code="UNEXPECTED_RESPONSE"),
+    )
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 1
+
+
+def test_refresh_partial_success_with_lock_exits_conflict(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mixed: one succeeded, one LOCK_HELD → still exit 7 so retries pick up
+    just the conflicted ones."""
+    from claude_lb.refresh import RefreshResult
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    def _mixed(profiles, *, timeout=10.0):
+        return [
+            RefreshResult(name=profiles[0].name, refreshed=True),
+            RefreshResult(name=profiles[1].name, refreshed=False, error_code="LOCK_HELD"),
+        ]
+
+    monkeypatch.setattr(cli_mod, "refresh_many_sync", _mixed)
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 7
+
+
+def test_refresh_partial_success_with_other_error_exits_error(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mixed: one succeeded, one generic failure → exit 1 (ERROR)."""
+    from claude_lb.refresh import RefreshResult
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    def _mixed(profiles, *, timeout=10.0):
+        return [
+            RefreshResult(name=profiles[0].name, refreshed=True),
+            RefreshResult(
+                name=profiles[1].name, refreshed=False, error_code="UNEXPECTED_RESPONSE"
+            ),
+        ]
+
+    monkeypatch.setattr(cli_mod, "refresh_many_sync", _mixed)
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 1
+
+
+def test_refresh_json_aggregate_meta_counts(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`refresh --all --json` should emit aggregate counts in meta even
+    on partial failure."""
+    from claude_lb.refresh import RefreshResult
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    def _mixed(profiles, *, timeout=10.0):
+        return [
+            RefreshResult(name=profiles[0].name, refreshed=True),
+            RefreshResult(name=profiles[1].name, refreshed=False, error_code="REFRESH_REJECTED"),
+        ]
+
+    monkeypatch.setattr(cli_mod, "refresh_many_sync", _mixed)
+    result = runner.invoke(app, ["refresh", "--all", "--json"])
+    # JSON-mode partial failure exits 1 (ERROR) — exit-code escalation to
+    # AUTH_REQUIRED only kicks in when ALL refreshes failed.
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 2
+    assert payload["meta"]["refreshed"] == 1
+    assert payload["meta"]["failed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# doctor — JSON failing-check returns EXIT_ERROR
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_json_returns_exit_error_when_any_check_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a check fails, `doctor --json` should exit 1 even though the JSON
+    envelope still emits cleanly to stdout."""
+    from claude_lb import doctor as doctor_mod
+
+    def _fake_run_doctor(*, skip_network: bool = False):
+        return doctor_mod.DoctorReport(
+            version="0.8.0",
+            checks=[
+                doctor_mod.CheckResult(name="x", passed=True),
+                doctor_mod.CheckResult(name="y", passed=False, detail="boom"),
+            ],
+        )
+
+    monkeypatch.setattr(cli_mod, "run_doctor", _fake_run_doctor)
+    result = runner.invoke(app, ["doctor", "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["all_passed"] is False
+    assert payload["meta"]["failed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# pick — JSON failure envelope path
+# ---------------------------------------------------------------------------
+
+
+def test_pick_no_profiles_json_emits_error_envelope() -> None:
+    """`pick --json` with no profiles should emit an error envelope, not a
+    success-shape with empty data."""
+    result = runner.invoke(app, ["pick", "--json"])
+    assert result.exit_code != 0
+    payload = json.loads(result.stdout)
+    assert "error" in payload
+    assert "code" in payload["error"]
+
+
+def test_pick_all_auth_dead_returns_auth_required(profile_factory) -> None:
+    """All AUTH_DEAD → exit 2 (AUTH_REQUIRED) per the reason mapping."""
+    from claude_lb.models import ErrorInfo, ProfileHealth
+
+    profile_factory("dead-a")
+
+    def _stub(profiles, *, prev_health=None):
+        from datetime import UTC, datetime
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.AUTH_DEAD,
+                probed_at=datetime.now(UTC),
+                error=ErrorInfo(type="auth_error", message="dead"),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        result = runner.invoke(app, ["pick"])
+    assert result.exit_code == 2
+
+
+# ---------------------------------------------------------------------------
+# exec retry-on-429 — child fails, profile flips to throttled, retry runs
+# ---------------------------------------------------------------------------
+
+
+def test_exec_retry_on_429_dispatches_second_profile(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the child exits non-zero AND a re-probe shows the profile flipped
+    OK→RATE_LIMITED, exec should re-pick a different profile and re-run once.
+    Picks.log should record both runs."""
+    from datetime import UTC, datetime
+
+    from claude_lb.exec_cmd import ExecResult
+    from claude_lb.models import ProfileHealth
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    # First child run rc=1; re-probe shows RATE_LIMITED; second run rc=0
+    run_calls: list[str] = []
+
+    def _stub_run(argv, *, env_var_name, profile_name, timeout):
+        run_calls.append(profile_name)
+        rc = 1 if len(run_calls) == 1 else 0
+        return ExecResult(rc=rc, duration_ms=10)
+
+    def _stub_reprobe(cache, name):
+        return ProfileHealth(
+            name=name,
+            health=Health.RATE_LIMITED,
+            probed_at=datetime.now(UTC),
+            credentials_mtime=1000.0,
+        )
+
+    monkeypatch.setattr(cli_mod, "run_child", _stub_run)
+    monkeypatch.setattr(cli_mod, "_reprobe_after_child", _stub_reprobe)
+
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["exec", "--retry-on-429", "1", "claude-bin"])
+    # Final exit = second child's rc (0)
+    assert result.exit_code == 0
+    # Both profiles were tried
+    assert len(run_calls) == 2
+    assert run_calls[0] != run_calls[1]
+
+
+def test_exec_no_retry_when_disabled(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--retry-on-429 0` should never trigger re-pick even if probe shows
+    a flip to throttled."""
+    from datetime import UTC, datetime
+
+    from claude_lb.exec_cmd import ExecResult
+    from claude_lb.models import ProfileHealth
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    run_calls: list[str] = []
+
+    def _stub_run(argv, *, env_var_name, profile_name, timeout):
+        run_calls.append(profile_name)
+        return ExecResult(rc=42, duration_ms=10)
+
+    monkeypatch.setattr(cli_mod, "run_child", _stub_run)
+    # Even if reprobe would say RATE_LIMITED, the retry must not fire when
+    # retry-on-429 is 0.
+    monkeypatch.setattr(
+        cli_mod, "_reprobe_after_child",
+        lambda cache, name: ProfileHealth(
+            name=name, health=Health.RATE_LIMITED,
+            probed_at=datetime.now(UTC), credentials_mtime=1000.0,
+        ),
+    )
+
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(
+            app, ["exec", "--retry-on-429", "0", "claude-bin"]
+        )
+    assert result.exit_code == 42
+    assert len(run_calls) == 1
+
+
+def test_exec_timeout_doesnt_trigger_retry(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Timeout (rc=124) must NOT trigger rate-limit retry — it's a separate
+    failure mode (timeout != throttled), and retrying just times out again."""
+    from claude_lb.exec_cmd import RC_TIMEOUT, ExecResult
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    run_calls: list[str] = []
+
+    def _stub_run(argv, *, env_var_name, profile_name, timeout):
+        run_calls.append(profile_name)
+        return ExecResult(rc=RC_TIMEOUT, duration_ms=10, timed_out=True)
+
+    monkeypatch.setattr(cli_mod, "run_child", _stub_run)
+
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(
+            app, ["exec", "--retry-on-429", "1", "claude-bin"]
+        )
+    assert result.exit_code == RC_TIMEOUT
+    assert len(run_calls) == 1  # no retry — timeout is not a rate-limit symptom
+
+
+# ---------------------------------------------------------------------------
+# status — max-age override forces re-probe even with fresh cache
+# ---------------------------------------------------------------------------
+
+
+def test_status_max_age_zero_forces_reprobe(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--max-age 0` should treat any cached entry as stale and re-probe."""
+    profile_factory("account-a")
+    probe_calls = {"n": 0}
+
+    real_stub = _stub_probe_many_sync
+
+    def _counting_stub(profiles, *, prev_health=None):
+        probe_calls["n"] += 1
+        return real_stub(profiles, prev_health=prev_health)
+
+    with patch.object(cli_mod, "probe_many_sync", _counting_stub):
+        runner.invoke(app, ["status"])  # seed
+        runner.invoke(app, ["status", "--max-age", "0"])  # force re-probe
+    assert probe_calls["n"] == 2
+
+
+def test_status_uses_cache_when_fresh(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh cache should mean a second `status` call doesn't re-probe.
+    The default stub returns expires_at=None so we need a custom variant
+    with a future expires_at to make the cache freshness check pass."""
+    from datetime import timedelta
+
+    from claude_lb.models import ProfileHealth
+
+    profile_factory("account-a")
+    probe_calls = {"n": 0}
+
+    def _counting_stub_with_future_expiry(profiles, *, prev_health=None):
+        probe_calls["n"] += 1
+        from datetime import datetime
+        now = datetime.now(UTC)
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.OK,
+                probed_at=now,
+                expires_at=now + timedelta(minutes=10),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _counting_stub_with_future_expiry):
+        runner.invoke(app, ["status"])  # probe 1: cold cache
+        runner.invoke(app, ["status"])  # probe 2: cache fresh, no re-probe
+    assert probe_calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# history --since filter
+# ---------------------------------------------------------------------------
+
+
+def test_history_since_filter_drops_old_entries(_isolated_home: Path) -> None:
+    """Entries older than `--since N` should be dropped."""
+    from datetime import UTC, datetime, timedelta
+
+    log_path = _isolated_home / "picks.log"
+    now = datetime.now(UTC)
+    old = (now - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    recent = (now - timedelta(seconds=10)).isoformat().replace("+00:00", "Z")
+    log_path.write_text(
+        f"{old}\taccount-a\tsticky\tscore=0.5\n"
+        f"{recent}\taccount-b\tsticky\tscore=0.6\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history", "--since", "30m", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 1
+    assert payload["data"][0]["profile"] == "account-b"
+
+
+# ---------------------------------------------------------------------------
+# update text rendering — up-to-date / ahead+behind branches
+# ---------------------------------------------------------------------------
+
+
+def test_update_text_renders_up_to_date_when_zero_ahead_zero_behind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_lb.updater import UpdateStatus
+
+    def _fake_check():
+        return UpdateStatus(
+            current_version="0.8.0",
+            install_dir="/path",
+            is_git_repo=True,
+            local_commit="abc123def456",
+            upstream_commit="abc123def456",
+            ahead=0,
+            behind=0,
+            upgrade_hint="You're up-to-date.",
+        )
+
+    monkeypatch.setattr(cli_mod, "check_for_update", _fake_check)
+    result = runner.invoke(app, ["update"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split()).lower()
+    assert "up-to-date" in flat
+
+
+def test_update_text_renders_ahead_behind_diff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_lb.updater import UpdateStatus
+
+    def _fake_check():
+        return UpdateStatus(
+            current_version="0.8.0",
+            install_dir="/path",
+            is_git_repo=True,
+            local_commit="abc123def456",
+            upstream_commit="def456abc123",
+            ahead=2,
+            behind=5,
+            upgrade_hint="5 commit(s) behind upstream.",
+        )
+
+    monkeypatch.setattr(cli_mod, "check_for_update", _fake_check)
+    result = runner.invoke(app, ["update"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "2 ahead, 5 behind" in flat
+
+
+# ---------------------------------------------------------------------------
+# show — fully-probed profile renders all the optional fields
+# ---------------------------------------------------------------------------
+
+
+def test_show_probed_profile_text_renders_health_and_latency(
+    profile_factory,
+) -> None:
+    """A profile that's been probed should render the full detail block:
+    health, probe_latency_ms, error if present. Hits the entry-not-None branches."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        runner.invoke(app, ["status"])  # seed cache
+    result = runner.invoke(app, ["show", "account-a"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "account-a" in flat
+    assert "health: ok" in flat
+
+
+def test_show_probed_profile_with_error_renders_error_line(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the cached entry has an error attached (auth_dead etc.), `show`
+    should render an `error: type — message` line."""
+    from datetime import UTC, datetime
+
+    from claude_lb.models import ErrorInfo, ProfileHealth
+
+    profile_factory("dead")
+
+    def _stub(profiles, *, prev_health=None):
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.AUTH_DEAD,
+                probed_at=datetime.now(UTC),
+                error=ErrorInfo(type="auth_error", message="token rejected"),
+                credentials_mtime=p.credentials_mtime,
+                probe_latency_ms=42,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        runner.invoke(app, ["status"])  # seed cache with the error
+    result = runner.invoke(app, ["show", "dead"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "auth_error" in flat
+    assert "token rejected" in flat
+    assert "probe_latency_ms" in flat
+
+
+# ---------------------------------------------------------------------------
+# add — copy failure (filesystem error mid-copy)
+# ---------------------------------------------------------------------------
+
+
+def test_add_copy_failure_reports_clear_error(
+    tmp_path: Path, credentials_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If shutil.copy2 raises (e.g. disk full, permission denied) mid-copy,
+    `add` should report an ERROR exit with a useful message — not a traceback."""
+    import shutil as _shutil
+
+    src = tmp_path / "src.json"
+    _write_credentials_file(src)
+
+    def _boom_copy(src, dst, *args, **kwargs):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(_shutil, "copy2", _boom_copy)
+    result = runner.invoke(app, ["add", "willfail", "--from", str(src)])
+    assert result.exit_code == 1
+    flat = " ".join(result.stderr.split()).lower()
+    assert "copy failed" in flat
+    assert "disk full" in flat
+
+
+def test_add_copy_failure_json_emits_error_envelope(
+    tmp_path: Path, credentials_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil as _shutil
+
+    src = tmp_path / "src.json"
+    _write_credentials_file(src)
+
+    def _boom_copy(src, dst, *args, **kwargs):
+        raise OSError("simulated permission denied")
+
+    monkeypatch.setattr(_shutil, "copy2", _boom_copy)
+    result = runner.invoke(app, ["add", "willfail", "--from", str(src), "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "ERROR"
+    assert "permission denied" in payload["error"]["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# pick — JSON failure envelope includes earliest_recovery_at when known
+# ---------------------------------------------------------------------------
+
+
+def test_pick_json_failure_emits_envelope_with_reason_code(
+    profile_factory,
+) -> None:
+    """A failed pick (--json) should yield an error envelope with the SPEC
+    reason code uppercased and the message — covers the JSON-output branch
+    of the failure path."""
+    from datetime import UTC, datetime
+
+    from claude_lb.models import ErrorInfo, ProfileHealth
+
+    profile_factory("dead")
+
+    def _stub(profiles, *, prev_health=None):
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.AUTH_DEAD,
+                probed_at=datetime.now(UTC),
+                error=ErrorInfo(type="auth_error", message="dead"),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        result = runner.invoke(app, ["pick", "--json"])
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert "error" in payload
+    assert payload["error"]["code"]
+    assert payload["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# pick --warn-at — session band warning
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_text_output_renders_check_lines(profile_factory) -> None:
+    """`claude-lb doctor` (no --json) should emit a header + per-check status
+    lines on stderr — covers the text-rendering loop."""
+    profile_factory("account-a")
+    result = runner.invoke(app, ["doctor", "--skip-network"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "claude-lb doctor" in flat
+    assert "OK" in flat or "WARN" in flat
+
+
+def test_doctor_text_output_marks_warning_checks() -> None:
+    """A check that passed but flagged warning=True should render as WARN
+    (yellow) rather than OK."""
+    from claude_lb import doctor as doctor_mod
+
+    def _fake_run_doctor(*, skip_network: bool = False):
+        return doctor_mod.DoctorReport(
+            version="0.8.0",
+            checks=[
+                doctor_mod.CheckResult(name="ok-check", passed=True, detail="fine"),
+                doctor_mod.CheckResult(
+                    name="warn-check",
+                    passed=True,
+                    detail="works but watch out",
+                    extra={"warning": True},
+                ),
+                doctor_mod.CheckResult(
+                    name="fail-check", passed=False, detail="broke"
+                ),
+            ],
+        )
+
+    with patch.object(cli_mod, "run_doctor", _fake_run_doctor):
+        result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 1  # one check failed
+    flat = " ".join(result.stderr.split())
+    assert "WARN" in flat
+    assert "fail-check" in flat
+
+
+def test_history_text_output_renders_table(_isolated_home: Path) -> None:
+    """A non-empty picks.log without --json should render a Rich table on
+    stderr — covers the rich.Table render block."""
+    log_path = _isolated_home / "picks.log"
+    log_path.write_text(
+        "2026-04-25T10:00:00Z\taccount-a\tsticky\tscore=0.50\n"
+        "2026-04-25T10:01:00Z\taccount-b\tsticky\tscore=0.60\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "account-a" in flat
+    assert "account-b" in flat
+
+
+def test_history_text_with_filter_no_matches(_isolated_home: Path) -> None:
+    """`--profile X` with no matching entries should print 'No matching
+    entries' rather than an empty table."""
+    log_path = _isolated_home / "picks.log"
+    log_path.write_text(
+        "2026-04-25T10:00:00Z\taccount-a\tsticky\tscore=0.50\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history", "--profile", "nope"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split()).lower()
+    assert "no matching" in flat
+
+
+def test_update_text_renders_when_install_dir_is_not_a_git_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An install dir that exists but isn't a git repo should still render
+    the version + install path + hint, just without the commit/status lines."""
+    from claude_lb.updater import UpdateStatus
+
+    def _fake_check():
+        return UpdateStatus(
+            current_version="0.8.0",
+            install_dir="/path/to/install",
+            is_git_repo=False,
+            local_commit=None,
+            upstream_commit=None,
+            ahead=None,
+            behind=None,
+            upgrade_hint="Reinstall from upstream.",
+        )
+
+    monkeypatch.setattr(cli_mod, "check_for_update", _fake_check)
+    result = runner.invoke(app, ["update"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "0.8.0" in flat
+    assert "/path/to/install" in flat
+    assert "Reinstall" in flat
+
+
+def test_probe_text_output_renders_status_table(profile_factory) -> None:
+    """`claude-lb probe` without --json should render the status table to
+    stderr and a summary line to stdout — covers the text-output block."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["probe"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    assert "account-a" in flat
+    # Summary on stdout
+    assert "profile" in result.stdout.lower()
+
+
+def test_pick_failure_renders_earliest_recovery_in_message(profile_factory) -> None:
+    """When pick fails AND has an earliest_recovery_at, the rendered error
+    message should include 'Earliest recovery:' so operators know when to
+    retry. Hits the conditional-message block in the failure path."""
+    from datetime import UTC, datetime, timedelta
+
+    from claude_lb.models import ProfileHealth, Usage
+
+    profile_factory("rate-limited")
+
+    def _stub(profiles, *, prev_health=None):
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.RATE_LIMITED,
+                probed_at=datetime.now(UTC),
+                retry_after_s=60,
+                expires_at=datetime.now(UTC) + timedelta(seconds=60),
+                usage=Usage(),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        result = runner.invoke(app, ["pick"])
+    # All rate-limited → exit 6 (RATE_LIMITED), with earliest-recovery in the
+    # rendered message
+    assert result.exit_code == 6
+    flat = " ".join(result.stderr.split())
+    assert "Earliest recovery" in flat or "earliest" in flat.lower()
+
+
+def test_pick_failure_json_includes_earliest_recovery_at(profile_factory) -> None:
+    """JSON failure envelope should carry earliest_recovery_at as a structured
+    field for scripts to consume."""
+    from datetime import UTC, datetime, timedelta
+
+    from claude_lb.models import ProfileHealth, Usage
+
+    profile_factory("rate-limited")
+
+    def _stub(profiles, *, prev_health=None):
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.RATE_LIMITED,
+                probed_at=datetime.now(UTC),
+                retry_after_s=120,
+                expires_at=datetime.now(UTC) + timedelta(seconds=120),
+                usage=Usage(),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        result = runner.invoke(app, ["pick", "--json"])
+    assert result.exit_code == 6
+    payload = json.loads(result.stdout)
+    assert payload["error"]["details"]["earliest_recovery_at"] is not None
+    assert payload["error"]["details"]["earliest_recovery_at"].endswith("Z")
+
+
+def test_exec_timeout_renders_timeout_message(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Timeout child exit should render a yellow `timeout:` stderr line
+    naming the profile and rc."""
+    from claude_lb.exec_cmd import RC_TIMEOUT, ExecResult
+
+    profile_factory("account-a")
+
+    def _stub_run(argv, **kw):
+        return ExecResult(rc=RC_TIMEOUT, duration_ms=10, timed_out=True)
+
+    monkeypatch.setattr(cli_mod, "run_child", _stub_run)
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(
+            app, ["exec", "--timeout", "5", "--retry-on-429", "0", "claude"]
+        )
+    assert result.exit_code == RC_TIMEOUT
+    flat = " ".join(result.stderr.split()).lower()
+    assert "timeout" in flat
+    assert "account-a" in flat
+
+
+def test_exec_not_found_renders_not_found_message(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from claude_lb.exec_cmd import RC_NOT_FOUND, ExecResult
+
+    profile_factory("account-a")
+
+    def _stub_run(argv, **kw):
+        return ExecResult(rc=RC_NOT_FOUND, duration_ms=5, not_found=True)
+
+    monkeypatch.setattr(cli_mod, "run_child", _stub_run)
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(
+            app, ["exec", "--retry-on-429", "0", "missing-bin"]
+        )
+    assert result.exit_code == RC_NOT_FOUND
+    flat = " ".join(result.stderr.split()).lower()
+    assert "not found" in flat
+
+
+def test_refresh_invalid_soon_value_emits_validation_error(
+    profile_factory,
+) -> None:
+    """`refresh --soon garbage` → exit 4 with helpful message."""
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--soon", "not-a-duration"])
+    assert result.exit_code == 4
+    flat = " ".join(result.stderr.split()).lower()
+    assert "soon" in flat
+    assert "30m" in flat or "duration" in flat or "valid" in flat
+
+
+def test_refresh_invalid_soon_value_json_envelope(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--soon", "garbage", "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert "soon" in payload["error"]["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# invalidate — JSON paths
+# ---------------------------------------------------------------------------
+
+
+def test_invalidate_unknown_profile_json_emits_not_found(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["invalidate", "nonexistent", "--json"])
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+def test_invalidate_known_profile_json_envelope(profile_factory) -> None:
+    """Successful invalidate with --json should emit a structured envelope
+    with action=invalidated."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        runner.invoke(app, ["status"])  # seed cache
+    result = runner.invoke(app, ["invalidate", "account-a", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["name"] == "account-a"
+    assert payload["meta"]["action"] == "invalidated"
+
+
+# ---------------------------------------------------------------------------
+# refresh — no-profiles-discovered (JSON envelope on the empty-discover path)
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_with_no_profiles_discovered_emits_not_found(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`refresh --all` with no profiles on disk → exit 9 (UNAVAILABLE)."""
+    # Override profiles dir to empty
+    empty = tmp_path / "no-profiles"
+    empty.mkdir()
+    monkeypatch.setenv("CLAUDE_LB_PROFILES_DIR", str(empty))
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 9
+    flat = " ".join(result.stderr.split()).lower()
+    assert "no profiles" in flat
+
+
+def test_refresh_with_no_profiles_discovered_json_envelope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    empty = tmp_path / "no-profiles"
+    empty.mkdir()
+    monkeypatch.setenv("CLAUDE_LB_PROFILES_DIR", str(empty))
+    result = runner.invoke(app, ["refresh", "--all", "--json"])
+    assert result.exit_code == 9
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# refresh — by-name targets path (line 952 of cli.py)
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_by_name_dispatches_only_named_profile(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`refresh <name>` should only refresh the named profile, not all."""
+    from claude_lb.refresh import RefreshResult
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    captured: list[str] = []
+
+    def _stub(profiles, *, timeout=10.0):
+        captured.extend(p.name for p in profiles)
+        return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
+
+    monkeypatch.setattr(cli_mod, "refresh_many_sync", _stub)
+    result = runner.invoke(app, ["refresh", "account-b"])
+    assert result.exit_code == 0
+    assert captured == ["account-b"]
+
+
+# ---------------------------------------------------------------------------
+# show — show JSON when entry has no probed_at (entry-None branch
+# is line 579-581: _iso_or_none with None input)
+# ---------------------------------------------------------------------------
+
+
+def test_show_unprobed_profile_iso_helper_handles_none(profile_factory) -> None:
+    """The show command's local _iso_or_none helper returns None for None
+    input — exercised when a discovered-but-unprobed profile is shown."""
+    profile_factory("never-probed")
+    result = runner.invoke(app, ["show", "never-probed", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["probed_at"] is None
+    assert payload["data"]["expires_at"] is None
+    assert payload["data"]["session_reset_at"] is None
+
+
+def test_show_probed_profile_json_emits_iso_timestamps(profile_factory) -> None:
+    """A probed profile's `show --json` should pass timestamps through
+    `_iso_or_none` and emit them as Z-suffixed ISO strings."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        runner.invoke(app, ["status"])  # seed cache
+    result = runner.invoke(app, ["show", "account-a", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["probed_at"] is not None
+    assert payload["data"]["probed_at"].endswith("Z")
+
+
+# ---------------------------------------------------------------------------
+# exec — retry-on-429 when no second profile is available (line 1434-1436)
+# ---------------------------------------------------------------------------
+
+
+def test_exec_retry_falls_back_to_original_rc_when_no_second_profile(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the child failed AND the profile flipped to throttled BUT there's
+    no other profile to retry with, exec should propagate the original rc
+    rather than crashing or returning a different error."""
+    from datetime import UTC, datetime
+
+    from claude_lb.exec_cmd import ExecResult
+    from claude_lb.models import ProfileHealth
+
+    # Single profile only — no second to retry with
+    profile_factory("only-one")
+
+    def _stub_run(argv, **kw):
+        return ExecResult(rc=99, duration_ms=5)
+
+    def _stub_reprobe(cache, name):
+        return ProfileHealth(
+            name=name, health=Health.RATE_LIMITED,
+            probed_at=datetime.now(UTC), credentials_mtime=1000.0,
+        )
+
+    monkeypatch.setattr(cli_mod, "run_child", _stub_run)
+    monkeypatch.setattr(cli_mod, "_reprobe_after_child", _stub_reprobe)
+
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["exec", "--retry-on-429", "1", "claude"])
+    # Should propagate the original child rc (99), not crash
+    assert result.exit_code == 99
+
+
+# ---------------------------------------------------------------------------
+# _reprobe_after_child — None paths (lines 1226-1227 / 1231-1232)
+# ---------------------------------------------------------------------------
+
+
+def test_reprobe_after_child_returns_none_when_profile_disappeared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If get_profile returns None (profile was removed mid-exec), reprobe
+    should return None gracefully — not crash."""
+    from claude_lb.models import HealthCache
+
+    monkeypatch.setattr(cli_mod, "get_profile", lambda name: None)
+    cache = HealthCache(updated_at=__import__("datetime").datetime.now(UTC))
+    result = cli_mod._reprobe_after_child(cache, "vanished")
+    assert result is None
+
+
+def test_reprobe_after_child_returns_none_when_probe_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If probe_many_sync somehow returns empty, reprobe must return None."""
+    from datetime import UTC, datetime
+
+    from claude_lb.models import HealthCache, Profile
+
+    fake_profile = Profile(
+        name="x",
+        access_token="sk-ant-oat01-x",
+        credentials_path="/tmp/x/.credentials.json",
+        credentials_mtime=1000.0,
+    )
+    monkeypatch.setattr(cli_mod, "get_profile", lambda name: fake_profile)
+    monkeypatch.setattr(cli_mod, "probe_many_sync", lambda *a, **kw: [])
+    cache = HealthCache(updated_at=datetime.now(UTC))
+    assert cli_mod._reprobe_after_child(cache, "x") is None
+
+
+# ---------------------------------------------------------------------------
+# pick — diagnose_failure REQUIRE_OK_NONE (line 381 of pick.py)
+# ---------------------------------------------------------------------------
+
+
+def test_pick_require_ok_when_no_profile_is_ok_returns_forbidden(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`pick --require-ok` with all profiles in non-OK states should exit 5
+    (FORBIDDEN) — covers the REQUIRE_OK_NONE diagnose_failure path."""
+    from datetime import UTC, datetime, timedelta
+
+    from claude_lb.models import ProfileHealth
+
+    profile_factory("rate-limited")
+
+    def _stub(profiles, *, prev_health=None):
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.RATE_LIMITED,
+                probed_at=datetime.now(UTC),
+                retry_after_s=30,
+                expires_at=datetime.now(UTC) + timedelta(seconds=30),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        result = runner.invoke(app, ["pick", "--require-ok"])
+    assert result.exit_code == 5  # FORBIDDEN
+
+
+# ---------------------------------------------------------------------------
+# History — file open OSError (lines 1639-1640)
+# ---------------------------------------------------------------------------
+
+
+def test_history_parses_naive_timestamps(_isolated_home: Path) -> None:
+    """Pick log lines with no timezone offset should be assumed UTC and
+    survive the parse. Hits the `if ts.tzinfo is None: replace(tzinfo=UTC)`
+    branch in the history parser."""
+    log_path = _isolated_home / "picks.log"
+    # No Z, no offset — naive
+    log_path.write_text(
+        "2026-04-25T10:00:00\taccount-a\tsticky\tscore=0.50\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 1
+
+
+def test_history_skips_log_chunks_without_equals_sign(_isolated_home: Path) -> None:
+    """Detail chunks without `=` should be silently skipped during parsing,
+    not crash the loop."""
+    log_path = _isolated_home / "picks.log"
+    log_path.write_text(
+        "2026-04-25T10:00:00Z\taccount-a\tsticky\tno-equals-here\tscore=0.50\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 1
+
+
+def test_update_apply_success_with_no_stdout_returns_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful apply with no stdout to print should still exit 0
+    cleanly — covers the early-return at line 1867."""
+    from claude_lb.updater import UpdateApplyResult
+
+    monkeypatch.setattr(
+        cli_mod, "apply_update",
+        lambda *, pull: UpdateApplyResult(
+            current_version="0.8.0",
+            install_dir="/p",
+            applied=True,
+            pulled=True,
+            reinstalled=True,
+            stdout="",  # empty
+        ),
+    )
+    result = runner.invoke(app, ["update", "--apply"])
+    assert result.exit_code == 0
+
+
+def test_update_apply_json_success_returns_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`update --apply --json` with applied=True should exit 0 (not raise
+    EXIT_ERROR) — covers the early-return after emit_json."""
+    from claude_lb.updater import UpdateApplyResult
+
+    monkeypatch.setattr(
+        cli_mod, "apply_update",
+        lambda *, pull: UpdateApplyResult(
+            current_version="0.8.0",
+            install_dir="/p",
+            applied=True,
+            pulled=True,
+            reinstalled=True,
+        ),
+    )
+    result = runner.invoke(app, ["update", "--apply", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["applied"] is True
+
+
+def test_history_handles_oserror_on_log_read(
+    _isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If picks.log exists but read_text raises OSError (locked file, perms),
+    history should still emit cleanly with zero entries — not crash."""
+    log_path = _isolated_home / "picks.log"
+    log_path.write_text("2026-04-25T10:00:00Z\ta\tsticky\tscore=0.5\n")
+
+    real_read_text = Path.read_text
+
+    def _boom_read_text(self, *a, **kw):
+        if self == log_path:
+            raise OSError("locked")
+        return real_read_text(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", _boom_read_text)
+    result = runner.invoke(app, ["history", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 0
+
+
+def test_pick_warn_at_session_threshold_emits_warning(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session_pct >= warn-at should print a yellow stderr warning while
+    still returning the profile name on stdout (exit 0)."""
+    from datetime import UTC, datetime
+
+    from claude_lb.models import ProfileHealth, Usage
+
+    profile_factory("hot")
+
+    def _stub(profiles, *, prev_health=None):
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.OK,
+                probed_at=datetime.now(UTC),
+                usage=Usage(session_pct=95, weekly_pct=10),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        result = runner.invoke(app, ["pick", "--warn-at", "80"])
+    assert result.exit_code == 0
+    assert "hot\n" in result.stdout  # profile name still emitted
+    assert "session" in result.stderr.lower()
+    assert "95%" in result.stderr
 

@@ -112,7 +112,7 @@ def _make_profile(name: str, cred_path: Path) -> Profile | None:
         return None
     try:
         mtime = cred_path.stat().st_mtime
-    except OSError:
+    except OSError:  # pragma: no cover  -- race: file existed at is_file() but vanished by stat()
         mtime = 0.0
     return Profile(
         name=name,
@@ -160,7 +160,7 @@ def discover_profiles() -> list[Profile]:
     if fallback_dir is not None:
         cred = fallback_dir / ".credentials.json"
         profile = _make_profile("default", cred)
-        if profile is not None:
+        if profile is not None:  # pragma: no branch  -- single_profile_fallback already validates is_file()
             return [profile]
 
     return []

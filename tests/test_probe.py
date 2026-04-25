@@ -127,3 +127,250 @@ async def test_probe_sends_required_headers(respx_mock: respx.MockRouter) -> Non
 
 def test_api_url_is_oauth_usage_endpoint() -> None:
     assert API_URL == "https://api.anthropic.com/api/oauth/usage"
+
+
+# ---------------------------------------------------------------------------
+# _classify_exception — every httpx error class maps to the right kind
+# ---------------------------------------------------------------------------
+
+
+def test_classify_exception_timeout() -> None:
+    from claude_lb.probe import _classify_exception
+
+    probe = _classify_exception(httpx.ReadTimeout("read timeout after 10s"))
+    assert probe.exception_kind == "timeout"
+    assert "read timeout" in probe.exception_message.lower()
+
+
+def test_classify_exception_connect_error() -> None:
+    from claude_lb.probe import _classify_exception
+
+    probe = _classify_exception(httpx.ConnectError("refused"))
+    assert probe.exception_kind == "refused"
+    assert probe.exception_message == "refused"
+
+
+def test_classify_exception_generic_network_error() -> None:
+    from claude_lb.probe import _classify_exception
+
+    # NetworkError parent class — covers DNS, transport, etc.
+    probe = _classify_exception(httpx.NetworkError("dns dead"))
+    assert probe.exception_kind == "network"
+
+
+def test_classify_exception_unknown_kind_falls_back_to_other() -> None:
+    from claude_lb.probe import _classify_exception
+
+    # An httpx.HTTPError subclass that's none of the recognised kinds.
+    probe = _classify_exception(httpx.InvalidURL("bad URL"))
+    assert probe.exception_kind == "other"
+
+
+def test_classify_exception_empty_message_uses_class_name() -> None:
+    """An exception with no message should still produce a useful
+    exception_message (the class name) instead of the empty string."""
+    from claude_lb.probe import _classify_exception
+
+    probe = _classify_exception(httpx.ConnectError(""))
+    assert probe.exception_message == "ConnectError"
+
+
+# ---------------------------------------------------------------------------
+# probe_many error paths — request actually times out / connection refused
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_probe_profile_with_timeout_classifies_network_error(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """End-to-end: respx raises a timeout, classifier maps to NETWORK_ERROR."""
+    respx_mock.get(API_URL).mock(side_effect=httpx.ReadTimeout("timeout"))
+    result = await probe_profile(_profile())
+    assert result.health is Health.NETWORK_ERROR
+
+
+@pytest.mark.asyncio
+async def test_probe_profile_with_connect_error_classifies_network_error(
+    respx_mock: respx.MockRouter,
+) -> None:
+    respx_mock.get(API_URL).mock(side_effect=httpx.ConnectError("refused"))
+    result = await probe_profile(_profile())
+    assert result.health is Health.NETWORK_ERROR
+    assert result.error is not None
+
+
+@pytest.mark.asyncio
+async def test_probe_many_empty_returns_empty_list() -> None:
+    """Edge case: empty input should not even open an httpx client."""
+    results = await probe_many([])
+    assert results == []
+
+
+# ---------------------------------------------------------------------------
+# probe_raw_many — the diagnostic surface used by `probe --raw`
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_probe_raw_many_returns_tuples_with_status_body_headers(
+    respx_mock: respx.MockRouter,
+) -> None:
+    from claude_lb.probe import probe_raw_many
+
+    body = _ok_body()
+    respx_mock.get(API_URL).respond(200, json=body, headers={"x-test": "1"})
+    results = await probe_raw_many([_profile("a"), _profile("b")])
+    assert len(results) == 2
+    name, status, returned_body, headers = results[0]
+    assert name == "a"
+    assert status == 200
+    assert returned_body == body
+    assert headers.get("x-test") == "1"
+
+
+@pytest.mark.asyncio
+async def test_probe_raw_many_empty_returns_empty_list() -> None:
+    from claude_lb.probe import probe_raw_many
+
+    assert await probe_raw_many([]) == []
+
+
+def test_probe_raw_many_sync_smoke(respx_mock: respx.MockRouter) -> None:
+    """The sync wrapper should round-trip through asyncio.run cleanly."""
+    from claude_lb.probe import probe_raw_many_sync
+
+    respx_mock.get(API_URL).respond(200, json=_ok_body())
+    results = probe_raw_many_sync([_profile()])
+    assert len(results) == 1
+    assert results[0][1] == 200  # status code
+
+
+# ---------------------------------------------------------------------------
+# _local_auth_expired — short-circuits before network when token is past expiry
+# ---------------------------------------------------------------------------
+
+
+def _expired_profile(*, refresh_present: bool) -> Profile:
+    from datetime import UTC, datetime, timedelta
+
+    return Profile(
+        name="expired-acct",
+        access_token="sk-ant-oat01-stale",
+        credentials_path="/tmp/expired/.credentials.json",
+        credentials_mtime=1000.0,
+        access_token_expires_at=datetime.now(UTC) - timedelta(minutes=10),
+        refresh_token_present=refresh_present,
+    )
+
+
+def test_local_auth_expired_with_refresh_token_suggests_refresh() -> None:
+    from claude_lb.probe import _local_auth_expired
+
+    result = _local_auth_expired(_expired_profile(refresh_present=True))
+    assert result is not None
+    assert result.health is Health.AUTH_EXPIRED
+    assert result.error is not None
+    assert "claude-lb refresh" in result.error.message
+    assert "claude login" not in result.error.message
+    # No network was hit — latency is 0.
+    assert result.probe_latency_ms == 0
+
+
+def test_local_auth_expired_without_refresh_token_suggests_login() -> None:
+    """Profile with no stored refresh token can't be healed by `refresh` —
+    the message should point operators at `claude login --profile` instead."""
+    from claude_lb.probe import _local_auth_expired
+
+    result = _local_auth_expired(_expired_profile(refresh_present=False))
+    assert result is not None
+    assert result.health is Health.AUTH_EXPIRED
+    assert "claude login --profile" in result.error.message
+    assert "no refresh token" in result.error.message.lower()
+
+
+def test_local_auth_expired_returns_none_when_token_still_valid() -> None:
+    """A profile with a future expires_at should fall through to network probe."""
+    from datetime import UTC, datetime, timedelta
+
+    from claude_lb.probe import _local_auth_expired
+
+    fresh = Profile(
+        name="fresh",
+        access_token="sk-ant-oat01-fresh",
+        credentials_path="/tmp/fresh/.credentials.json",
+        credentials_mtime=1000.0,
+        access_token_expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    assert _local_auth_expired(fresh) is None
+
+
+def test_local_auth_expired_returns_none_when_no_expires_at() -> None:
+    """Profiles whose credentials shape doesn't expose expiresAt fall through."""
+    from claude_lb.probe import _local_auth_expired
+
+    no_expires = Profile(
+        name="no-exp",
+        access_token="sk-ant-oat01-x",
+        credentials_path="/tmp/no-exp/.credentials.json",
+        credentials_mtime=1000.0,
+        access_token_expires_at=None,
+    )
+    assert _local_auth_expired(no_expires) is None
+
+
+@pytest.mark.asyncio
+async def test_probe_many_skips_network_for_already_expired_profiles(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """An already-expired profile should be classified locally without
+    consuming a respx call. Mix it with a healthy profile and verify only
+    the healthy one hits the mock."""
+    route = respx_mock.get(API_URL).respond(200, json=_ok_body())
+    expired = _expired_profile(refresh_present=True)
+    fresh = _profile("fresh")
+    results = await probe_many([expired, fresh])
+    assert results[0].health is Health.AUTH_EXPIRED
+    assert results[1].health is Health.OK
+    assert route.call_count == 1  # only `fresh` hit the network
+
+
+def test_probe_many_sync_wrapper(respx_mock: respx.MockRouter) -> None:
+    """The sync wrapper should round-trip through asyncio.run cleanly."""
+    from claude_lb.probe import probe_many_sync
+
+    respx_mock.get(API_URL).respond(200, json=_ok_body())
+    results = probe_many_sync([_profile("a"), _profile("b")])
+    assert len(results) == 2
+    assert all(r.health is Health.OK for r in results)
+
+
+@pytest.mark.asyncio
+async def test_probe_profile_uses_supplied_client(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """When a client is passed in, probe_profile should reuse it instead of
+    opening a new one. The respx mock is global, so we can't directly observe
+    the client identity — but we can confirm the path runs without error."""
+    from claude_lb.probe import probe_profile
+
+    respx_mock.get(API_URL).respond(200, json=_ok_body())
+    async with httpx.AsyncClient() as client:
+        result = await probe_profile(_profile(), client=client)
+    assert result.health is Health.OK
+
+
+@pytest.mark.asyncio
+async def test_probe_profile_short_circuits_on_locally_expired(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """probe_profile should return the AUTH_EXPIRED record without hitting
+    the network when the local expiresAt is past. Hits the early-return at
+    line 164."""
+    from claude_lb.probe import probe_profile
+
+    route = respx_mock.get(API_URL).respond(200, json=_ok_body())
+    expired = _expired_profile(refresh_present=True)
+    result = await probe_profile(expired)
+    assert result.health is Health.AUTH_EXPIRED
+    assert route.call_count == 0  # network not touched

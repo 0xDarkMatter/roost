@@ -316,3 +316,203 @@ async def test_refresh_sends_client_id_and_beta_header(
     assert body["refresh_token"] == "the-rt"
     assert body["client_id"] == "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     assert req.headers.get("anthropic-beta") == "oauth-2025-04-20"
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers — _extract_refresh_token + _apply_token_response edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_extract_refresh_token_returns_none_when_oauth_block_missing() -> None:
+    from claude_lb.refresh import _extract_refresh_token
+
+    assert _extract_refresh_token({}) is None
+    assert _extract_refresh_token({"otherField": 1}) is None
+
+
+def test_extract_refresh_token_returns_none_when_oauth_is_not_dict() -> None:
+    from claude_lb.refresh import _extract_refresh_token
+
+    assert _extract_refresh_token({"claudeAiOauth": "not-a-dict"}) is None
+    assert _extract_refresh_token({"claudeAiOauth": [1, 2, 3]}) is None
+
+
+def test_extract_refresh_token_strips_whitespace_and_rejects_empty() -> None:
+    from claude_lb.refresh import _extract_refresh_token
+
+    assert _extract_refresh_token({"claudeAiOauth": {"refreshToken": "   "}}) is None
+    assert _extract_refresh_token({"claudeAiOauth": {"refreshToken": "  the-rt  "}}) == "the-rt"
+
+
+def test_extract_refresh_token_returns_none_when_value_is_not_string() -> None:
+    from claude_lb.refresh import _extract_refresh_token
+
+    assert _extract_refresh_token({"claudeAiOauth": {"refreshToken": 12345}}) is None
+
+
+def test_apply_token_response_creates_oauth_block_when_missing() -> None:
+    """If the credentials shape lacks claudeAiOauth, _apply_token_response
+    should create it rather than crash — degenerate but not impossible state."""
+    from claude_lb.refresh import _apply_token_response
+
+    payload = {"otherField": "preserved"}
+    new_payload, new_expires = _apply_token_response(
+        payload,
+        {"access_token": "new-A", "refresh_token": "new-R", "expires_in": 3600},
+    )
+    assert new_payload["otherField"] == "preserved"
+    assert new_payload["claudeAiOauth"]["accessToken"] == "new-A"
+    assert new_payload["claudeAiOauth"]["refreshToken"] == "new-R"
+    assert new_expires is not None
+
+
+def test_apply_token_response_skips_fields_that_are_wrong_type() -> None:
+    """A token response with non-string access_token / refresh_token must not
+    poison the credentials — leave the existing values in place."""
+    from claude_lb.refresh import _apply_token_response
+
+    payload = {"claudeAiOauth": {"accessToken": "old-A", "refreshToken": "old-R"}}
+    new_payload, _ = _apply_token_response(
+        payload,
+        {"access_token": None, "refresh_token": 0, "expires_in": "not-a-number"},
+    )
+    assert new_payload["claudeAiOauth"]["accessToken"] == "old-A"
+    assert new_payload["claudeAiOauth"]["refreshToken"] == "old-R"
+
+
+def test_apply_token_response_handles_omitted_refresh_token() -> None:
+    """A token response with access_token but no refresh_token should rotate
+    just the access token — Anthropic doesn't always return a new refresh."""
+    from claude_lb.refresh import _apply_token_response
+
+    payload = {"claudeAiOauth": {"accessToken": "old-A", "refreshToken": "keep-R"}}
+    new_payload, _ = _apply_token_response(
+        payload,
+        {"access_token": "new-A", "expires_in": 3600},
+    )
+    assert new_payload["claudeAiOauth"]["accessToken"] == "new-A"
+    assert new_payload["claudeAiOauth"]["refreshToken"] == "keep-R"
+
+
+# ---------------------------------------------------------------------------
+# _atomic_write_credentials — failure cleans up tempfile
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_write_credentials_unlinks_tempfile_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the inner replace() fails (or json.dump raises), the tempfile must
+    be cleaned up — otherwise stale .credentials-*.json.tmp files accumulate."""
+    import os as _os
+
+    from claude_lb.refresh import _atomic_write_credentials
+
+    target = tmp_path / "x" / ".credentials.json"
+
+    real_replace = _os.replace
+
+    def boom_replace(*args, **kwargs):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(_os, "replace", boom_replace)
+
+    with pytest.raises(OSError):
+        _atomic_write_credentials(target, {"k": "v"})
+
+    monkeypatch.setattr(_os, "replace", real_replace)
+    leftover = list((target.parent).glob(".credentials-*.json.tmp"))
+    assert leftover == []  # tempfile was cleaned up
+
+
+# ---------------------------------------------------------------------------
+# refresh_many_sync — sync wrapper smoke
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_many_sync_with_empty_input_returns_empty(
+    respx_mock: respx.MockRouter,
+) -> None:
+    from claude_lb.refresh import refresh_many_sync
+
+    assert refresh_many_sync([]) == []
+
+
+# ---------------------------------------------------------------------------
+# refresh_profile — error.message as string vs dict
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refresh_profile_handles_error_as_plain_string(
+    tmp_path: Path, respx_mock: respx.MockRouter
+) -> None:
+    """Some Anthropic 401 bodies have `error: "auth failed"` rather than
+    `error: {message: ...}`. Both shapes must yield REFRESH_REJECTED with
+    a useful message — not crash on .get()."""
+    from claude_lb.refresh import refresh_profile
+
+    cred = tmp_path / "p" / ".credentials.json"
+    _write_credentials(cred, refresh="the-rt")
+    respx_mock.post(TOKEN_URL).respond(401, json={"error": "auth failed"})
+    result = await refresh_profile(_profile(cred), timeout=1.0)
+    assert result.refreshed is False
+    assert result.error_code == "REFRESH_REJECTED"
+    assert "auth failed" in (result.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_refresh_profile_network_timeout_returns_network_error(
+    tmp_path: Path, respx_mock: respx.MockRouter
+) -> None:
+    from claude_lb.refresh import refresh_profile
+
+    cred = tmp_path / "p" / ".credentials.json"
+    _write_credentials(cred, refresh="the-rt")
+    respx_mock.post(TOKEN_URL).mock(side_effect=httpx.ReadTimeout("timed out"))
+    result = await refresh_profile(_profile(cred), timeout=1.0)
+    assert result.refreshed is False
+    assert result.error_code == "NETWORK_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_refresh_profile_500_returns_unexpected_response(
+    tmp_path: Path, respx_mock: respx.MockRouter
+) -> None:
+    from claude_lb.refresh import refresh_profile
+
+    cred = tmp_path / "p" / ".credentials.json"
+    _write_credentials(cred, refresh="the-rt")
+    respx_mock.post(TOKEN_URL).respond(500, text="upstream dead")
+    result = await refresh_profile(_profile(cred), timeout=1.0)
+    assert result.refreshed is False
+    assert result.error_code == "UNEXPECTED_RESPONSE"
+    assert "500" in (result.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_refresh_profile_write_failed_when_atomic_write_raises(
+    tmp_path: Path, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If Anthropic returns a valid 200 but the local atomic-write fails
+    (e.g. disk full), refresh should report WRITE_FAILED rather than
+    pretending the refresh succeeded — otherwise the next call would think
+    the new token is on disk when it isn't."""
+    from claude_lb import refresh as refresh_mod
+    from claude_lb.refresh import refresh_profile
+
+    cred = tmp_path / "p" / ".credentials.json"
+    _write_credentials(cred, refresh="the-rt")
+    respx_mock.post(TOKEN_URL).respond(
+        200,
+        json={"access_token": "new-A", "refresh_token": "new-R", "expires_in": 3600},
+    )
+
+    def _boom_write(path, payload):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(refresh_mod, "_atomic_write_credentials", _boom_write)
+    result = await refresh_profile(_profile(cred), timeout=1.0)
+    assert result.refreshed is False
+    assert result.error_code == "WRITE_FAILED"
+    assert "disk full" in (result.error_message or "")

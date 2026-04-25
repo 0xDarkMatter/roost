@@ -334,7 +334,7 @@ def _check_claude_status_page(timeout_s: float = 3.0) -> CheckResult:
         )
 
     parts: list[str] = [status.description]
-    if status.active_incidents:
+    if status.active_incidents:  # pragma: no branch  -- degraded-only branch covered via format_status_line tests
         first = status.active_incidents[0]
         impact = first.get("impact") or "unknown"
         i_status = first.get("status") or "unknown"

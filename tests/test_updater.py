@@ -227,3 +227,208 @@ def test_apply_update_emits_clear_workaround_on_windows_self_lock(
     assert "uv tool install --reinstall --editable" in result.error
     # Ensure we didn't actually attempt the uv install (that would crash).
     assert not any(c[0] == "uv" for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# _git_status — degenerate paths
+# ---------------------------------------------------------------------------
+
+
+def test_git_status_returns_false_when_no_git_on_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Systems without a git binary should degrade gracefully — not crash."""
+    monkeypatch.setattr(updater.shutil, "which", lambda exe: None if exe == "git" else "/x")
+    is_git, local, upstream, ahead, behind = updater._git_status(tmp_path)
+    assert (is_git, local, upstream, ahead, behind) == (False, None, None, None, None)
+
+
+def test_git_status_returns_false_when_rev_parse_head_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A directory with a `.git` folder but a corrupt repo (rev-parse fails)
+    should report not-a-git-repo rather than half-populated state."""
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(updater.shutil, "which", lambda exe: "/fake/git")
+
+    def _fake_run(cmd: list[str], cwd: Path) -> tuple[int, str]:
+        if cmd[0] == "git" and cmd[1] == "rev-parse":
+            return 128, ""  # git's "fatal: not a git repository" rc
+        return 0, ""
+
+    monkeypatch.setattr(updater, "_run", _fake_run)
+    is_git, local, *_ = updater._git_status(tmp_path)
+    assert is_git is False
+    assert local is None
+
+
+# ---------------------------------------------------------------------------
+# _package_install_dir — when find_spec returns None
+# ---------------------------------------------------------------------------
+
+
+def test_package_install_dir_returns_none_when_spec_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When importlib can't find the package (e.g. some sandboxed setups),
+    _package_install_dir returns None and apply_update degrades gracefully."""
+    monkeypatch.setattr(updater.importlib.util, "find_spec", lambda _name: None)
+    assert updater._package_install_dir() is None
+
+
+# ---------------------------------------------------------------------------
+# apply_result_to_dict — JSON envelope helper
+# ---------------------------------------------------------------------------
+
+
+def test_apply_result_to_dict_envelope() -> None:
+    result = updater.UpdateApplyResult(
+        current_version="0.8.0",
+        install_dir="/path",
+        applied=True,
+        pulled=True,
+        reinstalled=True,
+    )
+    payload = updater.apply_result_to_dict(result)
+    assert payload["data"]["applied"] is True
+    assert payload["data"]["install_dir"] == "/path"
+    assert payload["meta"]["applied"] is True
+
+
+# ---------------------------------------------------------------------------
+# _git_status — full upstream-configured path (ahead/behind populated)
+# ---------------------------------------------------------------------------
+
+
+def test_git_status_with_upstream_populates_ahead_behind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When the install dir is a real git repo with an upstream configured
+    AND an upstream commit reachable, _git_status should populate ahead/behind."""
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(updater.shutil, "which", lambda exe: "/fake/git")
+
+    def _fake_run(cmd: list[str], cwd: Path) -> tuple[int, str]:
+        if cmd[:2] == ["git", "rev-parse"] and cmd[-1] == "HEAD":
+            return 0, "abc123local"
+        if cmd[:2] == ["git", "rev-parse"] and "@{u}" in cmd:
+            return 0, "origin/main"
+        if cmd[:2] == ["git", "fetch"]:
+            return 0, ""
+        if cmd[:2] == ["git", "rev-parse"] and cmd[-1] == "origin/main":
+            return 0, "def456upstream"
+        if cmd[:2] == ["git", "rev-list"]:
+            return 0, "2\t5"  # 2 ahead, 5 behind
+        return 1, ""
+
+    monkeypatch.setattr(updater, "_run", _fake_run)
+    is_git, local, upstream, ahead, behind = updater._git_status(tmp_path)
+    assert is_git is True
+    assert local == "abc123local"
+    assert upstream == "def456upstream"
+    assert ahead == 2
+    assert behind == 5
+
+
+def test_git_status_no_upstream_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A repo without an upstream branch configured should return is_git=True
+    with sha but None for upstream/ahead/behind (not crash)."""
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(updater.shutil, "which", lambda exe: "/fake/git")
+
+    def _fake_run(cmd: list[str], cwd: Path) -> tuple[int, str]:
+        if cmd[:2] == ["git", "rev-parse"] and cmd[-1] == "HEAD":
+            return 0, "abc123"
+        if "@{u}" in cmd:
+            return 128, ""  # no upstream
+        return 0, ""
+
+    monkeypatch.setattr(updater, "_run", _fake_run)
+    is_git, local, upstream, ahead, behind = updater._git_status(tmp_path)
+    assert is_git is True
+    assert local == "abc123"
+    assert (upstream, ahead, behind) == (None, None, None)
+
+
+def test_git_status_upstream_rev_parse_fails_gracefully(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """fetch succeeds but resolving the upstream sha fails (offline-ish state).
+    Don't crash — return what we know (is_git=True, local sha) and None for
+    upstream-derived fields."""
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(updater.shutil, "which", lambda exe: "/fake/git")
+
+    def _fake_run(cmd: list[str], cwd: Path) -> tuple[int, str]:
+        if cmd[:2] == ["git", "rev-parse"] and cmd[-1] == "HEAD":
+            return 0, "localsha"
+        if "@{u}" in cmd:
+            return 0, "origin/main"
+        if cmd[:2] == ["git", "fetch"]:
+            return 0, ""
+        if cmd[:2] == ["git", "rev-parse"] and cmd[-1] == "origin/main":
+            return 1, ""  # upstream sha lookup failed
+        return 0, ""
+
+    monkeypatch.setattr(updater, "_run", _fake_run)
+    is_git, local, upstream, ahead, behind = updater._git_status(tmp_path)
+    assert is_git is True
+    assert local == "localsha"
+    assert (upstream, ahead, behind) == (None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# apply_update — uv install fails
+# ---------------------------------------------------------------------------
+
+
+def test_apply_update_uv_install_failure_reports_clear_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If `uv tool install` exits non-zero, apply_update should report
+    applied=False with the rc and stderr in the error string."""
+    monkeypatch.setattr(updater.shutil, "which", lambda _: "/fake/uv")
+
+    def _fake_run(cmd: list[str], cwd: Path) -> tuple[int, str]:
+        if cmd[0] == "uv":
+            return 5, "no compatible wheel for pydantic_core"
+        return 0, ""
+
+    monkeypatch.setattr(updater, "_run", _fake_run)
+    monkeypatch.setattr(updater, "_package_install_dir", lambda: tmp_path)
+
+    result = updater.apply_update(pull=False)
+    assert result.applied is False
+    assert result.reinstalled is False
+    assert result.error is not None
+    assert "rc=5" in result.error
+    assert "no compatible wheel" in result.error
+
+
+def test_apply_update_git_pull_failure_returns_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A git pull that fails for a real reason (not 'Already up to date')
+    should abort the apply with a clear error before touching uv."""
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(updater.shutil, "which", lambda _: "/fake/yes")
+    uv_called = {"n": 0}
+
+    def _fake_run(cmd: list[str], cwd: Path) -> tuple[int, str]:
+        if cmd[0] == "git":
+            return 1, "fatal: refusing to merge unrelated histories"
+        if cmd[0] == "uv":
+            uv_called["n"] += 1
+            return 0, "ok"
+        return 0, ""
+
+    monkeypatch.setattr(updater, "_run", _fake_run)
+    monkeypatch.setattr(updater, "_package_install_dir", lambda: tmp_path)
+
+    result = updater.apply_update(pull=True)
+    assert result.applied is False
+    assert result.pulled is False
+    assert "git pull failed" in (result.error or "")
+    assert uv_called["n"] == 0  # bailed before uv
