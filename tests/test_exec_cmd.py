@@ -70,6 +70,20 @@ def test_run_child_records_duration() -> None:
     assert result.duration_ms >= 90  # 100ms ± jitter
 
 
+def test_run_child_not_found_returns_rc_127() -> None:
+    """Unknown executable → FileNotFoundError → rc=127 (shell convention),
+    not_found=True. Use a name no platform will resolve."""
+    result = run_child(
+        ["claude-lb-this-binary-does-not-exist-xyz123"],
+        env_var_name="AXIOM_CLAUDE_PROFILE",
+        profile_name="account-a",
+        timeout=10.0,
+    )
+    assert result.rc == RC_NOT_FOUND
+    assert result.not_found is True
+    assert result.timed_out is False
+
+
 def test_run_child_timeout_returns_rc_124() -> None:
     """Child that runs past the timeout should be killed and report
     rc=124 (GNU `timeout` convention) with timed_out=True."""
