@@ -244,3 +244,92 @@ def test_probe_raw_many_sync_smoke(respx_mock: respx.MockRouter) -> None:
     results = probe_raw_many_sync([_profile()])
     assert len(results) == 1
     assert results[0][1] == 200  # status code
+
+
+# ---------------------------------------------------------------------------
+# _local_auth_expired — short-circuits before network when token is past expiry
+# ---------------------------------------------------------------------------
+
+
+def _expired_profile(*, refresh_present: bool) -> Profile:
+    from datetime import UTC, datetime, timedelta
+
+    return Profile(
+        name="expired-acct",
+        access_token="sk-ant-oat01-stale",
+        credentials_path="/tmp/expired/.credentials.json",
+        credentials_mtime=1000.0,
+        access_token_expires_at=datetime.now(UTC) - timedelta(minutes=10),
+        refresh_token_present=refresh_present,
+    )
+
+
+def test_local_auth_expired_with_refresh_token_suggests_refresh() -> None:
+    from claude_lb.probe import _local_auth_expired
+
+    result = _local_auth_expired(_expired_profile(refresh_present=True))
+    assert result is not None
+    assert result.health is Health.AUTH_EXPIRED
+    assert result.error is not None
+    assert "claude-lb refresh" in result.error.message
+    assert "claude login" not in result.error.message
+    # No network was hit — latency is 0.
+    assert result.probe_latency_ms == 0
+
+
+def test_local_auth_expired_without_refresh_token_suggests_login() -> None:
+    """Profile with no stored refresh token can't be healed by `refresh` —
+    the message should point operators at `claude login --profile` instead."""
+    from claude_lb.probe import _local_auth_expired
+
+    result = _local_auth_expired(_expired_profile(refresh_present=False))
+    assert result is not None
+    assert result.health is Health.AUTH_EXPIRED
+    assert "claude login --profile" in result.error.message
+    assert "no refresh token" in result.error.message.lower()
+
+
+def test_local_auth_expired_returns_none_when_token_still_valid() -> None:
+    """A profile with a future expires_at should fall through to network probe."""
+    from datetime import UTC, datetime, timedelta
+
+    from claude_lb.probe import _local_auth_expired
+
+    fresh = Profile(
+        name="fresh",
+        access_token="sk-ant-oat01-fresh",
+        credentials_path="/tmp/fresh/.credentials.json",
+        credentials_mtime=1000.0,
+        access_token_expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    assert _local_auth_expired(fresh) is None
+
+
+def test_local_auth_expired_returns_none_when_no_expires_at() -> None:
+    """Profiles whose credentials shape doesn't expose expiresAt fall through."""
+    from claude_lb.probe import _local_auth_expired
+
+    no_expires = Profile(
+        name="no-exp",
+        access_token="sk-ant-oat01-x",
+        credentials_path="/tmp/no-exp/.credentials.json",
+        credentials_mtime=1000.0,
+        access_token_expires_at=None,
+    )
+    assert _local_auth_expired(no_expires) is None
+
+
+@pytest.mark.asyncio
+async def test_probe_many_skips_network_for_already_expired_profiles(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """An already-expired profile should be classified locally without
+    consuming a respx call. Mix it with a healthy profile and verify only
+    the healthy one hits the mock."""
+    route = respx_mock.get(API_URL).respond(200, json=_ok_body())
+    expired = _expired_profile(refresh_present=True)
+    fresh = _profile("fresh")
+    results = await probe_many([expired, fresh])
+    assert results[0].health is Health.AUTH_EXPIRED
+    assert results[1].health is Health.OK
+    assert route.call_count == 1  # only `fresh` hit the network
