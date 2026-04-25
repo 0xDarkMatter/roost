@@ -3214,6 +3214,243 @@ def test_refresh_invalid_soon_value_json_envelope(profile_factory) -> None:
     assert "soon" in payload["error"]["message"].lower()
 
 
+# ---------------------------------------------------------------------------
+# invalidate — JSON paths
+# ---------------------------------------------------------------------------
+
+
+def test_invalidate_unknown_profile_json_emits_not_found(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["invalidate", "nonexistent", "--json"])
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+def test_invalidate_known_profile_json_envelope(profile_factory) -> None:
+    """Successful invalidate with --json should emit a structured envelope
+    with action=invalidated."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        runner.invoke(app, ["status"])  # seed cache
+    result = runner.invoke(app, ["invalidate", "account-a", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["name"] == "account-a"
+    assert payload["meta"]["action"] == "invalidated"
+
+
+# ---------------------------------------------------------------------------
+# refresh — no-profiles-discovered (JSON envelope on the empty-discover path)
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_with_no_profiles_discovered_emits_not_found(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`refresh --all` with no profiles on disk → exit 9 (UNAVAILABLE)."""
+    # Override profiles dir to empty
+    empty = tmp_path / "no-profiles"
+    empty.mkdir()
+    monkeypatch.setenv("CLAUDE_LB_PROFILES_DIR", str(empty))
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 9
+    flat = " ".join(result.stderr.split()).lower()
+    assert "no profiles" in flat
+
+
+def test_refresh_with_no_profiles_discovered_json_envelope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    empty = tmp_path / "no-profiles"
+    empty.mkdir()
+    monkeypatch.setenv("CLAUDE_LB_PROFILES_DIR", str(empty))
+    result = runner.invoke(app, ["refresh", "--all", "--json"])
+    assert result.exit_code == 9
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# refresh — by-name targets path (line 952 of cli.py)
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_by_name_dispatches_only_named_profile(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`refresh <name>` should only refresh the named profile, not all."""
+    from claude_lb.refresh import RefreshResult
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    captured: list[str] = []
+
+    def _stub(profiles, *, timeout=10.0):
+        captured.extend(p.name for p in profiles)
+        return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
+
+    monkeypatch.setattr(cli_mod, "refresh_many_sync", _stub)
+    result = runner.invoke(app, ["refresh", "account-b"])
+    assert result.exit_code == 0
+    assert captured == ["account-b"]
+
+
+# ---------------------------------------------------------------------------
+# show — show JSON when entry has no probed_at (entry-None branch
+# is line 579-581: _iso_or_none with None input)
+# ---------------------------------------------------------------------------
+
+
+def test_show_unprobed_profile_iso_helper_handles_none(profile_factory) -> None:
+    """The show command's local _iso_or_none helper returns None for None
+    input — exercised when a discovered-but-unprobed profile is shown."""
+    profile_factory("never-probed")
+    result = runner.invoke(app, ["show", "never-probed", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["probed_at"] is None
+    assert payload["data"]["expires_at"] is None
+    assert payload["data"]["session_reset_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# exec — retry-on-429 when no second profile is available (line 1434-1436)
+# ---------------------------------------------------------------------------
+
+
+def test_exec_retry_falls_back_to_original_rc_when_no_second_profile(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the child failed AND the profile flipped to throttled BUT there's
+    no other profile to retry with, exec should propagate the original rc
+    rather than crashing or returning a different error."""
+    from datetime import UTC, datetime
+
+    from claude_lb.exec_cmd import ExecResult
+    from claude_lb.models import ProfileHealth
+
+    # Single profile only — no second to retry with
+    profile_factory("only-one")
+
+    def _stub_run(argv, **kw):
+        return ExecResult(rc=99, duration_ms=5)
+
+    def _stub_reprobe(cache, name):
+        return ProfileHealth(
+            name=name, health=Health.RATE_LIMITED,
+            probed_at=datetime.now(UTC), credentials_mtime=1000.0,
+        )
+
+    monkeypatch.setattr(cli_mod, "run_child", _stub_run)
+    monkeypatch.setattr(cli_mod, "_reprobe_after_child", _stub_reprobe)
+
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["exec", "--retry-on-429", "1", "claude"])
+    # Should propagate the original child rc (99), not crash
+    assert result.exit_code == 99
+
+
+# ---------------------------------------------------------------------------
+# _reprobe_after_child — None paths (lines 1226-1227 / 1231-1232)
+# ---------------------------------------------------------------------------
+
+
+def test_reprobe_after_child_returns_none_when_profile_disappeared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If get_profile returns None (profile was removed mid-exec), reprobe
+    should return None gracefully — not crash."""
+    from claude_lb.models import HealthCache
+
+    monkeypatch.setattr(cli_mod, "get_profile", lambda name: None)
+    cache = HealthCache(updated_at=__import__("datetime").datetime.now(UTC))
+    result = cli_mod._reprobe_after_child(cache, "vanished")
+    assert result is None
+
+
+def test_reprobe_after_child_returns_none_when_probe_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If probe_many_sync somehow returns empty, reprobe must return None."""
+    from datetime import UTC, datetime
+
+    from claude_lb.models import HealthCache, Profile
+
+    fake_profile = Profile(
+        name="x",
+        access_token="sk-ant-oat01-x",
+        credentials_path="/tmp/x/.credentials.json",
+        credentials_mtime=1000.0,
+    )
+    monkeypatch.setattr(cli_mod, "get_profile", lambda name: fake_profile)
+    monkeypatch.setattr(cli_mod, "probe_many_sync", lambda *a, **kw: [])
+    cache = HealthCache(updated_at=datetime.now(UTC))
+    assert cli_mod._reprobe_after_child(cache, "x") is None
+
+
+# ---------------------------------------------------------------------------
+# pick — diagnose_failure REQUIRE_OK_NONE (line 381 of pick.py)
+# ---------------------------------------------------------------------------
+
+
+def test_pick_require_ok_when_no_profile_is_ok_returns_forbidden(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`pick --require-ok` with all profiles in non-OK states should exit 5
+    (FORBIDDEN) — covers the REQUIRE_OK_NONE diagnose_failure path."""
+    from datetime import UTC, datetime, timedelta
+
+    from claude_lb.models import ProfileHealth
+
+    profile_factory("rate-limited")
+
+    def _stub(profiles, *, prev_health=None):
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.RATE_LIMITED,
+                probed_at=datetime.now(UTC),
+                retry_after_s=30,
+                expires_at=datetime.now(UTC) + timedelta(seconds=30),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        result = runner.invoke(app, ["pick", "--require-ok"])
+    assert result.exit_code == 5  # FORBIDDEN
+
+
+# ---------------------------------------------------------------------------
+# History — file open OSError (lines 1639-1640)
+# ---------------------------------------------------------------------------
+
+
+def test_history_handles_oserror_on_log_read(
+    _isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If picks.log exists but read_text raises OSError (locked file, perms),
+    history should still emit cleanly with zero entries — not crash."""
+    log_path = _isolated_home / "picks.log"
+    log_path.write_text("2026-04-25T10:00:00Z\ta\tsticky\tscore=0.5\n")
+
+    real_read_text = Path.read_text
+
+    def _boom_read_text(self, *a, **kw):
+        if self == log_path:
+            raise OSError("locked")
+        return real_read_text(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", _boom_read_text)
+    result = runner.invoke(app, ["history", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 0
+
+
 def test_pick_warn_at_session_threshold_emits_warning(
     profile_factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
