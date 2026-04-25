@@ -150,6 +150,50 @@ def _check_credentials_parseable() -> CheckResult:
     )
 
 
+def _check_refresh_tokens() -> CheckResult:
+    """Verify each profile has a stored refresh token.
+
+    Profiles without one fall through `pick --auto-refresh` silently (correctly,
+    since there's nothing to refresh) but only manifest at the moment a token
+    expires and the operator finds out the profile needs `claude login`. Doctor
+    surfaces this proactively. Warning, not failure: a deliberate API-key-only
+    or legacy-shape profile is a valid setup, just won't auto-heal.
+    """
+    profiles = discover_profiles()
+    if not profiles:
+        return CheckResult(
+            name="refresh_tokens_present",
+            passed=True,
+            detail="(skipped — no profiles)",
+        )
+    with_token = [p.name for p in profiles if p.refresh_token_present]
+    without_token = [p.name for p in profiles if not p.refresh_token_present]
+    if not without_token:
+        return CheckResult(
+            name="refresh_tokens_present",
+            passed=True,
+            detail=f"all {len(profiles)} profile(s) have refresh tokens",
+            extra={"with_token": with_token, "without_token": without_token},
+        )
+    # Don't fail the doctor run — this is a warning, not a hard error.
+    # Distinguish in `extra` so JSON consumers can react.
+    return CheckResult(
+        name="refresh_tokens_present",
+        passed=True,  # warn-level; failure would block CI for legitimate setups
+        detail=(
+            f"{len(without_token)} of {len(profiles)} profile(s) have NO refresh "
+            f"token: {', '.join(without_token)}. These can't be healed by "
+            f"`refresh` or `pick --auto-refresh` — they need `claude login "
+            f"--profile <name>` when their access token expires."
+        ),
+        extra={
+            "with_token": with_token,
+            "without_token": without_token,
+            "warning": True,
+        },
+    )
+
+
 def _check_cache_readable() -> CheckResult:
     target = cache_path()
     if not target.is_file():
@@ -229,6 +273,7 @@ def run_doctor(*, skip_network: bool = False) -> DoctorReport:
         _check_config_dir_writable(),
         _check_profiles_discoverable(),
         _check_credentials_parseable(),
+        _check_refresh_tokens(),
         _check_cache_readable(),
     ]
     if not skip_network:

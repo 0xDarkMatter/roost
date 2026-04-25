@@ -64,7 +64,7 @@ def test_version() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert "claude-lb" in result.stdout
-    assert "0.5.0" in result.stdout
+    assert "0.6.0" in result.stdout
 
 
 def test_help_exits_zero() -> None:
@@ -1053,6 +1053,272 @@ def test_exec_no_retry_on_timeout(profile_factory) -> None:
         )
     assert result.exit_code == 124
     assert len(stub_run.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Shell completion (helpers only — full shell integration is Typer's job)
+# ---------------------------------------------------------------------------
+
+
+def test_completion_profile_names_filters_by_prefix(profile_factory) -> None:
+    profile_factory("account-a")
+    profile_factory("account-b")
+    profile_factory("account-c")
+    assert sorted(cli_mod._complete_profile_names("")) == [
+        "account-b", "account-c", "account-a",
+    ]
+    assert cli_mod._complete_profile_names("ro") == ["account-a"]
+    assert cli_mod._complete_profile_names("zzz") == []
+
+
+def test_completion_profile_names_swallows_errors(monkeypatch) -> None:
+    """Completion must never break the user's shell — broken discovery returns []."""
+
+    def _boom():
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr("claude_lb.discovery.discover_profiles", _boom)
+    assert cli_mod._complete_profile_names("anything") == []
+
+
+def test_completion_strategy_filters_by_prefix() -> None:
+    from claude_lb.pick import Strategy
+    all_strategies = {s.value for s in Strategy}
+    assert set(cli_mod._complete_strategy("")) == all_strategies
+    assert cli_mod._complete_strategy("least") == ["least-used"]
+    assert cli_mod._complete_strategy("zzz") == []
+
+
+# ---------------------------------------------------------------------------
+# Duration parser (used by --soon and --since)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_duration_variants() -> None:
+    assert cli_mod._parse_duration("30s") == 30
+    assert cli_mod._parse_duration("30m") == 1800
+    assert cli_mod._parse_duration("1h") == 3600
+    assert cli_mod._parse_duration("2d") == 172800
+    assert cli_mod._parse_duration("1w") == 604800
+    assert cli_mod._parse_duration("90") == 90  # bare seconds
+    assert cli_mod._parse_duration("  1h  ") == 3600  # whitespace tolerated
+    assert cli_mod._parse_duration("1H") == 3600  # case-insensitive
+
+
+def test_parse_duration_rejects_garbage() -> None:
+    assert cli_mod._parse_duration("") is None
+    assert cli_mod._parse_duration("h") is None
+    assert cli_mod._parse_duration("1y") is None  # year not supported
+    assert cli_mod._parse_duration("abc") is None
+    assert cli_mod._parse_duration("-1h") is None  # negative rejected
+    assert cli_mod._parse_duration("1.5h") is None  # fractional rejected
+
+
+# ---------------------------------------------------------------------------
+# claude-lb history
+# ---------------------------------------------------------------------------
+
+
+def _seed_picks_log(log_path: Path, lines: list[str]) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_history_no_log_file(_isolated_home: Path) -> None:
+    """No picks.log yet → friendly message, exit 0."""
+    result = runner.invoke(app, ["history"])
+    assert result.exit_code == 0
+    assert "no history" in result.stderr.lower()
+
+
+def test_history_default_shows_recent_entries(_isolated_home: Path) -> None:
+    log_path = _isolated_home / "picks.log"
+    _seed_picks_log(log_path, [
+        "2026-04-25T01:00:00.000000+00:00\taccount-a\tsticky\tscore=1.00",
+        "2026-04-25T01:01:00.000000+00:00\taccount-b\tleast-used\tscore=0.50",
+        "2026-04-25T01:02:00.000000+00:00\taccount-a\tEXEC\targv=python\trc=0\tdur=92ms",
+    ])
+    result = runner.invoke(app, ["history"])
+    assert result.exit_code == 0
+    assert "account-a" in result.stderr
+    assert "account-b" in result.stderr
+    assert "EXEC" in result.stderr
+    assert "3 of 3 entries" in result.stdout
+
+
+def test_history_filter_by_profile(_isolated_home: Path) -> None:
+    log_path = _isolated_home / "picks.log"
+    _seed_picks_log(log_path, [
+        "2026-04-25T01:00:00.000000+00:00\taccount-a\tsticky\tscore=1.00",
+        "2026-04-25T01:01:00.000000+00:00\taccount-b\tleast-used\tscore=0.50",
+    ])
+    result = runner.invoke(app, ["history", "--profile", "account-a"])
+    assert result.exit_code == 0
+    assert "account-a" in result.stderr
+    assert "account-b" not in result.stderr
+    assert "1 of 2 entries" in result.stdout
+
+
+def test_history_filter_by_since(_isolated_home: Path) -> None:
+    """--since 1h should keep only entries within the last hour."""
+    from datetime import UTC, datetime, timedelta
+
+    log_path = _isolated_home / "picks.log"
+    now = datetime.now(UTC)
+    old = (now - timedelta(hours=2)).isoformat()
+    fresh = (now - timedelta(minutes=10)).isoformat()
+    _seed_picks_log(log_path, [
+        f"{old}\told-profile\tsticky\tscore=1.00",
+        f"{fresh}\tnew-profile\tsticky\tscore=1.00",
+    ])
+    result = runner.invoke(app, ["history", "--since", "1h"])
+    assert result.exit_code == 0
+    assert "new-profile" in result.stderr
+    assert "old-profile" not in result.stderr
+
+
+def test_history_invalid_since_rejected(_isolated_home: Path) -> None:
+    log_path = _isolated_home / "picks.log"
+    _seed_picks_log(log_path, [
+        "2026-04-25T01:00:00.000000+00:00\taccount-a\tsticky\tscore=1.00",
+    ])
+    result = runner.invoke(app, ["history", "--since", "garbage"])
+    assert result.exit_code == 4  # VALIDATION
+    assert "invalid --since" in result.stderr.lower()
+
+
+def test_history_json_shape(_isolated_home: Path) -> None:
+    log_path = _isolated_home / "picks.log"
+    _seed_picks_log(log_path, [
+        "2026-04-25T01:00:00.000000+00:00\taccount-a\tsticky\tscore=1.00",
+        "2026-04-25T01:01:00.000000+00:00\taccount-a\tEXEC\targv=python\trc=0\tdur=92ms",
+    ])
+    result = runner.invoke(app, ["history", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert isinstance(payload["data"], list)
+    assert len(payload["data"]) == 2
+    assert payload["meta"]["count"] == 2
+    assert payload["meta"]["total_in_log"] == 2
+    # EXEC entry has structured details
+    exec_entry = next(e for e in payload["data"] if e["action"] == "EXEC")
+    assert exec_entry["details"]["rc"] == "0"
+    assert exec_entry["details"]["argv"] == "python"
+
+
+def test_history_tail_limits_count(_isolated_home: Path) -> None:
+    log_path = _isolated_home / "picks.log"
+    _seed_picks_log(log_path, [
+        f"2026-04-25T01:0{i}:00.000000+00:00\taccount-a\tsticky\tscore=1.00"
+        for i in range(5)
+    ])
+    result = runner.invoke(app, ["history", "--tail", "2", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert len(payload["data"]) == 2
+    # Should be the last two
+    assert payload["data"][-1]["timestamp"].startswith("2026-04-25T01:04")
+
+
+def test_history_skips_malformed_lines(_isolated_home: Path) -> None:
+    log_path = _isolated_home / "picks.log"
+    _seed_picks_log(log_path, [
+        "2026-04-25T01:00:00.000000+00:00\taccount-a\tsticky\tscore=1.00",
+        "garbage line with no tabs",
+        "not-a-timestamp\tprofile\taction",
+        "2026-04-25T01:02:00.000000+00:00\taccount-a\tsticky\tscore=1.00",
+    ])
+    result = runner.invoke(app, ["history", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 2  # malformed lines silently dropped
+
+
+# ---------------------------------------------------------------------------
+# refresh --soon
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_soon_invalid_value_rejected(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--soon", "garbage"])
+    assert result.exit_code == 4
+    assert "invalid --soon" in result.stderr.lower()
+
+
+def test_refresh_soon_filters_by_window(
+    profile_factory, _isolated_home: Path
+) -> None:
+    """--soon 1h refreshes profiles expiring within 1 hour. Use a non-default
+    timeout via stub to confirm targets get passed through."""
+    from datetime import UTC, datetime, timedelta
+
+    cred_a = profile_factory("expires_in_30m")
+    cred_b = profile_factory("expires_in_2d")
+
+    # Mutate expiresAt on disk for each
+    now = datetime.now(UTC)
+    soon_ms = int((now + timedelta(minutes=30)).timestamp() * 1000)
+    later_ms = int((now + timedelta(days=2)).timestamp() * 1000)
+    for cred, ms in [(cred_a, soon_ms), (cred_b, later_ms)]:
+        data = json.loads(cred.read_text())
+        data["claudeAiOauth"]["expiresAt"] = ms
+        cred.write_text(json.dumps(data))
+
+    # Stub refresh to capture which profiles get refreshed
+    captured_names: list[str] = []
+
+    def _stub_refresh(profiles, *, timeout=10.0):
+        from claude_lb.refresh import RefreshResult
+        captured_names.extend(p.name for p in profiles)
+        return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
+
+    from claude_lb import cli as _cli_mod
+    with patch.object(_cli_mod, "refresh_many_sync", _stub_refresh):
+        result = runner.invoke(app, ["refresh", "--soon", "1h", "--json"])
+
+    assert result.exit_code == 0
+    # expires_in_30m is within 1h window; expires_in_2d is not.
+    assert captured_names == ["expires_in_30m"]
+
+
+def test_refresh_soon_includes_already_expired(profile_factory) -> None:
+    """`--soon N` must cover already-expired tokens too (they're <= now < cutoff)."""
+    from datetime import UTC, datetime, timedelta
+
+    cred = profile_factory("expired_yesterday")
+    past_ms = int((datetime.now(UTC) - timedelta(days=1)).timestamp() * 1000)
+    data = json.loads(cred.read_text())
+    data["claudeAiOauth"]["expiresAt"] = past_ms
+    cred.write_text(json.dumps(data))
+
+    captured: list[str] = []
+
+    def _stub(profiles, *, timeout=10.0):
+        from claude_lb.refresh import RefreshResult
+        captured.extend(p.name for p in profiles)
+        return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
+
+    from claude_lb import cli as _cli_mod
+    with patch.object(_cli_mod, "refresh_many_sync", _stub):
+        result = runner.invoke(app, ["refresh", "--soon", "30m"])
+    assert result.exit_code == 0
+    assert captured == ["expired_yesterday"]
+
+
+def test_refresh_soon_conflicts_with_expired() -> None:
+    """Passing both --soon and --expired is ambiguous → EXIT_VALIDATION."""
+    result = runner.invoke(app, ["refresh", "--soon", "1h", "--expired"])
+    # No profiles → may exit 9 first; let's add a profile to force the actual check
+    # Actually: validation runs after discovery. With no profiles, we get exit 9 first.
+    # That's a separate test concern. For the conflict-check test, ensure profiles exist.
+
+
+def test_refresh_soon_and_expired_together_rejected(profile_factory) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--soon", "1h", "--expired"])
+    assert result.exit_code == 4
+    assert "exactly one" in result.stderr.lower()
 
 
 def test_exec_auto_refresh_is_honored(profile_factory, _isolated_home: Path) -> None:

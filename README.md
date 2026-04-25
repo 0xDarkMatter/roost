@@ -3,7 +3,7 @@
 [![Forma](https://img.shields.io/badge/forma-experimental-orange.svg)](https://github.com/forma-tools/forma)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.6.0-blue.svg)](CHANGELOG.md)
 
 > Pick the healthiest Claude Code Max profile — health taxonomy + load balancer for local OAuth profiles.
 
@@ -99,8 +99,14 @@ claude-lb pick --count 3 --json
 claude-lb refresh account-a                 # Refresh one profile's OAuth token
 claude-lb refresh --all                  # Refresh every discovered profile
 claude-lb refresh --expired              # Refresh only past-expiry profiles
-claude-lb refresh --expired --json       # Machine-readable output
+claude-lb refresh --soon 30m             # Refresh anything expiring within 30 min
+claude-lb refresh --soon 1h --json       # Cron-friendly: */15 * * * * <-- this
 ```
+
+`--soon DURATION` is anticipatory: it covers already-expired tokens AND tokens
+expiring within the window. Combined with a 15-min cron, it keeps the fleet
+warm without `--auto-refresh` having to fire mid-spawn (with the latency cost
+that implies).
 
 `refresh` POSTs the stored refresh token to Anthropic's OAuth endpoint,
 atomically rewrites `.credentials.json` (preserving non-oauth fields), and
@@ -156,6 +162,31 @@ for profile in $(claude-lb pick --count 3 --strategy least-used); do
 done
 wait
 ```
+
+### History
+
+```bash
+claude-lb history                        # Last 20 picks + exec runs
+claude-lb history --tail 50              # Last 50
+claude-lb history --profile account-a       # Filter to one profile
+claude-lb history --since 1h             # Last hour ('30m', '1h', '2d', '1w', or seconds)
+claude-lb history --json                 # Structured output
+```
+
+Reads `picks.log` (the audit trail every pick + exec writes to). Useful for
+"what did the daemon dispatch in the last hour?" without grepping a
+tab-separated file.
+
+### Shell completion
+
+```bash
+claude-lb --install-completion           # Install for your shell (bash/zsh/fish/pwsh)
+claude-lb --show-completion              # Print the script without installing
+```
+
+Once installed, `<TAB>` completes commands, flags, profile names (for `show`,
+`probe`, `refresh`, `invalidate`, `history --profile`), and `--strategy`
+values (`sticky | least-used | round-robin | weighted | first-healthy`).
 
 ### Diagnostics
 

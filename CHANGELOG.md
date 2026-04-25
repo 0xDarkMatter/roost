@@ -5,6 +5,48 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-25
+
+### Added
+
+- **Shell completion** — re-enabled (`add_completion=True`). Run
+  `claude-lb --install-completion` to generate completion scripts for
+  bash/zsh/fish/PowerShell. Per-argument completers wired up:
+  - `claude-lb show <TAB>` / `probe`/`refresh`/`invalidate` complete to
+    discovered profile names (read live from `~/.claude-profiles/`).
+  - `--strategy <TAB>` completes to `sticky | least-used | round-robin |
+    weighted | first-healthy`.
+- **`claude-lb history`** — read recent picks + exec runs from `picks.log`.
+  Default tails the last 20 entries; filterable by `--profile NAME`,
+  `--since 30m|1h|2d|1w`, capped via `--tail N`. Renders a Rich table on
+  stderr with elapsed-time formatting; emits structured JSON via `--json`
+  (`{data: [...], meta: {count, total_in_log, log_path, filters}}`).
+  Malformed log lines are silently skipped (rotation can leave partial
+  trailing lines).
+- **`claude-lb refresh --soon DURATION`** — anticipatory refresh.
+  Refreshes profiles whose access token expires within the window
+  (includes already-expired). Cron-friendly:
+  `*/15 * * * * claude-lb refresh --soon 30m --json` keeps the fleet warm
+  without burning cycles on already-fresh tokens. Mutually exclusive with
+  `--all` / `--expired` / explicit names. DURATION grammar: `30s` / `30m`
+  / `1h` / `2d` / `1w`, or bare seconds.
+- **`claude-lb doctor` refresh-token check** — new `refresh_tokens_present`
+  check warns (yellow `WARN`, doesn't fail) for any profile missing a
+  stored refresh token. Such profiles silently fall through
+  `--auto-refresh` (correctly — there's nothing to refresh) but only
+  manifest at expiry; doctor surfaces them proactively.
+- WARN level in doctor output — passed checks with `extra.warning=true`
+  render as `[yellow]WARN[/yellow]` instead of `OK`. Keeps `all_passed`
+  semantics for CI but draws operator attention.
+
+### Internal
+
+- `_parse_duration()` helper shared by `--soon` (refresh) and `--since`
+  (history). Grammar: `<int>[smhdw]` or bare integer seconds.
+- `_humanize_elapsed()` helper for `Xs/m/h/d ago` formatting in history.
+- `_parse_pick_log()` parses tab-separated log lines into structured
+  entries; tolerates malformed/partial lines.
+
 ## [0.5.0] - 2026-04-25
 
 ### Added

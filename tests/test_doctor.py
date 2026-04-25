@@ -111,6 +111,56 @@ def test_credentials_parseable_reports_token_source_distribution(profile_factory
 
 
 # ---------------------------------------------------------------------------
+# Refresh-token check (warning, not failure)
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_tokens_check_passes_when_all_have_tokens(profile_factory) -> None:
+    profile_factory("account-a")  # default modern shape includes refreshToken
+    profile_factory("account-b")
+    report = doctor_mod.run_doctor(skip_network=True)
+    check = next(c for c in report.checks if c.name == "refresh_tokens_present")
+    assert check.passed is True
+    assert check.extra.get("warning") is None  # no warn marker
+    assert "all 2" in check.detail.lower() or "2 profile" in check.detail.lower()
+
+
+def test_refresh_tokens_check_warns_on_missing(
+    profile_factory, credentials_dir: Path
+) -> None:
+    """Profiles without refreshToken should produce a WARN (passed=True + warning flag).
+    Doesn't fail doctor — legacy/API-key profiles are valid setups."""
+    import json as _json
+
+    profile_factory("with_refresh")  # has refreshToken (modern shape)
+    # Build a profile manually without refreshToken
+    no_rt_dir = credentials_dir / "no_refresh"
+    no_rt_dir.mkdir(parents=True, exist_ok=True)
+    (no_rt_dir / ".credentials.json").write_text(_json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-no-rt",
+            "expiresAt": 99999999999999,
+        }
+    }))
+
+    report = doctor_mod.run_doctor(skip_network=True)
+    check = next(c for c in report.checks if c.name == "refresh_tokens_present")
+    assert check.passed is True  # WARN level — doesn't fail the doctor run
+    assert check.extra.get("warning") is True
+    assert "no_refresh" in check.detail
+    assert "claude login" in check.detail
+    assert check.extra["with_token"] == ["with_refresh"]
+    assert check.extra["without_token"] == ["no_refresh"]
+
+
+def test_refresh_tokens_check_skipped_with_no_profiles() -> None:
+    report = doctor_mod.run_doctor(skip_network=True)
+    check = next(c for c in report.checks if c.name == "refresh_tokens_present")
+    assert check.passed is True
+    assert "skipped" in check.detail.lower()
+
+
+# ---------------------------------------------------------------------------
 # Reachability check — iterate all address-family candidates
 # ---------------------------------------------------------------------------
 

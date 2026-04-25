@@ -38,8 +38,73 @@ app = typer.Typer(
     name="claude-lb",
     help="Pick the healthiest Claude Code Max profile — health taxonomy + load balancer.",
     no_args_is_help=True,
-    add_completion=False,
+    # Typer adds `--install-completion` / `--show-completion` here for free.
+    # Bash/Zsh/Fish/PowerShell all supported. Per-argument profile-name
+    # completion is wired below via the `_complete_profile_names` callback.
+    add_completion=True,
 )
+
+
+def _complete_profile_names(incomplete: str) -> list[str]:
+    """Tab-complete profile names for `show`, `probe`, `refresh`, `invalidate`.
+
+    Called by typer at completion time. Best-effort: a slow/broken discovery
+    must not break the user's shell — swallow exceptions and return [].
+    """
+    try:
+        from .discovery import discover_profiles
+        return [p.name for p in discover_profiles() if p.name.startswith(incomplete)]
+    except Exception:
+        return []
+
+
+def _complete_strategy(incomplete: str) -> list[str]:
+    """Tab-complete --strategy values."""
+    from .pick import Strategy
+    return [s.value for s in Strategy if s.value.startswith(incomplete)]
+
+
+_DURATION_UNITS: dict[str, int] = {
+    "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800,
+}
+
+
+def _parse_duration(value: str) -> int | None:
+    """Parse '30m' / '1h' / '2d' / '1w' / plain seconds → seconds, else None.
+
+    Used by `--soon` (refresh window) and `--since` (history filter). Keep the
+    grammar minimal: one integer + one unit suffix (or bare seconds).
+    """
+    s = value.strip().lower()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    if len(s) < 2:
+        return None
+    try:
+        n = int(s[:-1])
+    except ValueError:
+        return None
+    unit = s[-1]
+    mult = _DURATION_UNITS.get(unit)
+    if mult is None or n < 0:
+        return None
+    return n * mult
+
+
+def _humanize_elapsed(seconds: float) -> str:
+    """'37s ago' / '4m ago' / '2h ago' / '3d ago'. Matches status table style."""
+    s = int(seconds)
+    if s < 0:
+        return "0s ago"
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
 
 profiles_app = typer.Typer(help="Profile operations")
 app.add_typer(profiles_app, name="profiles")
@@ -321,7 +386,10 @@ def top_list(
 def profiles_probe(
     name: Annotated[
         str | None,
-        typer.Argument(help="Probe only this profile (default: all)."),
+        typer.Argument(
+            help="Probe only this profile (default: all).",
+            autocompletion=_complete_profile_names,
+        ),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     raw: Annotated[
@@ -390,7 +458,10 @@ def profiles_probe(
 
 @app.command("probe")
 def top_probe(
-    name: Annotated[str | None, typer.Argument()] = None,
+    name: Annotated[
+        str | None,
+        typer.Argument(autocompletion=_complete_profile_names),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     raw: Annotated[bool, typer.Option("--raw")] = False,
 ) -> None:
@@ -453,7 +524,10 @@ def top_status(
 
 @profiles_app.command("show")
 def profiles_show(
-    name: Annotated[str, typer.Argument(help="Profile name.")],
+    name: Annotated[
+        str,
+        typer.Argument(help="Profile name.", autocompletion=_complete_profile_names),
+    ],
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Show one profile's full health detail."""
@@ -517,7 +591,9 @@ def profiles_show(
 
 @app.command("show")
 def top_show(
-    name: Annotated[str, typer.Argument()],
+    name: Annotated[
+        str, typer.Argument(autocompletion=_complete_profile_names)
+    ],
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Alias for `profiles show`."""
@@ -533,7 +609,11 @@ def top_show(
 def profiles_pick(
     strategy: Annotated[
         str,
-        typer.Option("--strategy", help="sticky | least-used | round-robin | weighted | first-healthy"),
+        typer.Option(
+            "--strategy",
+            help="sticky | least-used | round-robin | weighted | first-healthy",
+            autocompletion=_complete_strategy,
+        ),
     ] = "sticky",
     stickiness: Annotated[
         int | None,
@@ -706,7 +786,10 @@ def profiles_pick(
 
 @app.command("pick")
 def top_pick(
-    strategy: Annotated[str, typer.Option("--strategy")] = "sticky",
+    strategy: Annotated[
+        str,
+        typer.Option("--strategy", autocompletion=_complete_strategy),
+    ] = "sticky",
     stickiness: Annotated[int | None, typer.Option("--stickiness")] = None,
     require_ok: Annotated[bool, typer.Option("--require-ok")] = False,
     export: Annotated[bool, typer.Option("--export")] = False,
@@ -741,7 +824,12 @@ def top_pick(
 
 @profiles_app.command("invalidate")
 def profiles_invalidate(
-    name: Annotated[str, typer.Argument(help="Profile to invalidate.")],
+    name: Annotated[
+        str,
+        typer.Argument(
+            help="Profile to invalidate.", autocompletion=_complete_profile_names
+        ),
+    ],
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Drop a profile's cache entry so the next status/pick re-probes."""
@@ -762,7 +850,9 @@ def profiles_invalidate(
 
 @app.command("invalidate")
 def top_invalidate(
-    name: Annotated[str, typer.Argument()],
+    name: Annotated[
+        str, typer.Argument(autocompletion=_complete_profile_names)
+    ],
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Alias for `profiles invalidate`."""
@@ -779,10 +869,11 @@ def _run_refresh(
     *,
     all_profiles: bool,
     expired_only: bool,
+    soon_seconds: int | None,
     timeout: float,
     json_output: bool,
 ) -> None:
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime, timedelta
 
     discovered = discover_profiles()
     if not discovered:
@@ -793,22 +884,27 @@ def _run_refresh(
 
     by_name = {p.name: p for p in discovered}
 
-    if names and (all_profiles or expired_only):
+    selectors_used = sum(
+        1 for v in (bool(names), all_profiles, expired_only, soon_seconds is not None) if v
+    )
+    if selectors_used > 1:
         if json_output:
             emit_error_json(
                 "VALIDATION_ERROR",
-                "Pass either <name>... or --all/--expired, not both.",
-            )
-        stderr.print("[red]Pass either <name>... or --all/--expired, not both.[/red]")
-        raise typer.Exit(EXIT_VALIDATION)
-    if not names and not all_profiles and not expired_only:
-        if json_output:
-            emit_error_json(
-                "VALIDATION_ERROR",
-                "Specify one or more profile names, --all, or --expired.",
+                "Pass exactly one of: <name>..., --all, --expired, --soon.",
             )
         stderr.print(
-            "[red]Specify one or more profile names, --all, or --expired.[/red]"
+            "[red]Pass exactly one of: <name>..., --all, --expired, --soon.[/red]"
+        )
+        raise typer.Exit(EXIT_VALIDATION)
+    if selectors_used == 0:
+        if json_output:
+            emit_error_json(
+                "VALIDATION_ERROR",
+                "Specify one or more profile names, --all, --expired, or --soon.",
+            )
+        stderr.print(
+            "[red]Specify one or more profile names, --all, --expired, or --soon.[/red]"
         )
         raise typer.Exit(EXIT_VALIDATION)
 
@@ -829,6 +925,17 @@ def _run_refresh(
             p
             for p in discovered
             if p.access_token_expires_at is not None and p.access_token_expires_at <= now
+        ]
+    elif soon_seconds is not None:
+        # `--soon N` covers everything `--expired` does plus tokens that will
+        # expire within the window. Anticipatory refresh: cron-friendly way to
+        # keep the fleet warm without waiting for a token to actually expire
+        # mid-spawn.
+        cutoff = datetime.now(UTC) + timedelta(seconds=soon_seconds)
+        targets = [
+            p
+            for p in discovered
+            if p.access_token_expires_at is not None and p.access_token_expires_at <= cutoff
         ]
     else:
         targets = list(discovered)
@@ -924,7 +1031,10 @@ def _run_refresh(
 def profiles_refresh(
     names: Annotated[
         list[str] | None,
-        typer.Argument(help="Profile name(s) to refresh. Omit with --all or --expired."),
+        typer.Argument(
+            help="Profile name(s) to refresh. Omit with --all / --expired / --soon.",
+            autocompletion=_complete_profile_names,
+        ),
     ] = None,
     all_profiles: Annotated[
         bool, typer.Option("--all", help="Refresh every discovered profile.")
@@ -936,16 +1046,44 @@ def profiles_refresh(
             help="Refresh only profiles whose access token is already expired.",
         ),
     ] = False,
+    soon: Annotated[
+        str | None,
+        typer.Option(
+            "--soon",
+            help=(
+                "Refresh profiles expiring within this window: '30m', '1h', "
+                "'2d', '1w', or seconds. Includes already-expired tokens. "
+                "Cron-friendly anticipatory refresh: */15 * * * * "
+                "claude-lb refresh --soon 30m --json"
+            ),
+        ),
+    ] = None,
     timeout: Annotated[
         float, typer.Option("--timeout", help="HTTP timeout per refresh, seconds.")
     ] = 10.0,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Exchange stored refresh tokens for fresh access tokens (SPEC §10)."""
+    soon_secs: int | None = None
+    if soon is not None:
+        soon_secs = _parse_duration(soon)
+        if soon_secs is None:
+            if json_output:
+                emit_error_json(
+                    "VALIDATION_ERROR",
+                    f"invalid --soon value: {soon!r} "
+                    "(use '30m', '1h', '2d', '1w', or seconds)",
+                )
+            stderr.print(
+                f"[red]invalid --soon value:[/red] {soon!r} "
+                "(use '30m', '1h', '2d', '1w', or seconds)"
+            )
+            raise typer.Exit(EXIT_VALIDATION)
     _run_refresh(
         list(names or []),
         all_profiles=all_profiles,
         expired_only=expired_only,
+        soon_seconds=soon_secs,
         timeout=timeout,
         json_output=json_output,
     )
@@ -953,17 +1091,22 @@ def profiles_refresh(
 
 @app.command("refresh")
 def top_refresh(
-    names: Annotated[list[str] | None, typer.Argument()] = None,
+    names: Annotated[
+        list[str] | None,
+        typer.Argument(autocompletion=_complete_profile_names),
+    ] = None,
     all_profiles: Annotated[bool, typer.Option("--all")] = False,
     expired_only: Annotated[bool, typer.Option("--expired")] = False,
+    soon: Annotated[str | None, typer.Option("--soon")] = None,
     timeout: Annotated[float, typer.Option("--timeout")] = 10.0,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Alias for `profiles refresh`."""
-    _run_refresh(
-        list(names or []),
+    profiles_refresh(
+        names=names,
         all_profiles=all_profiles,
         expired_only=expired_only,
+        soon=soon,
         timeout=timeout,
         json_output=json_output,
     )
@@ -1088,7 +1231,12 @@ def _child_hit_rate_limit(
 def exec_cmd(
     ctx: typer.Context,
     strategy: Annotated[
-        str, typer.Option("--strategy", help="Pick strategy.")
+        str,
+        typer.Option(
+            "--strategy",
+            help="Pick strategy.",
+            autocompletion=_complete_strategy,
+        ),
     ] = "sticky",
     stickiness: Annotated[
         int | None, typer.Option("--stickiness")
@@ -1282,6 +1430,176 @@ def exec_cmd(
 
 
 # ---------------------------------------------------------------------------
+# history — read picks.log
+# ---------------------------------------------------------------------------
+
+
+def _parse_pick_log(path: Any) -> list[dict[str, Any]]:
+    """Parse picks.log into structured entries.
+
+    Lines are tab-separated:
+        {ts}\\t{profile}\\t{action}\\t{key=value}...
+    Where action is a strategy name (`sticky`, `least-used`, ...) for picks
+    or `EXEC` for child runs. Malformed lines are skipped silently — the log
+    is rotated under load and a partial last line is plausible.
+    """
+    from datetime import UTC, datetime as _dt
+    from pathlib import Path as _Path
+
+    entries: list[dict[str, Any]] = []
+    if not _Path(str(path)).is_file():
+        return entries
+    try:
+        text = _Path(str(path)).read_text(encoding="utf-8")
+    except OSError:
+        return entries
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        ts_raw, profile, action = parts[0], parts[1], parts[2]
+        try:
+            iso = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
+            ts = _dt.fromisoformat(iso)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        details: dict[str, str] = {}
+        for chunk in parts[3:]:
+            if "=" in chunk:
+                k, v = chunk.split("=", 1)
+                details[k] = v
+        entries.append({
+            "timestamp": ts,
+            "profile": profile,
+            "action": action,
+            "details": details,
+        })
+    return entries
+
+
+@app.command("history")
+def history(
+    tail: Annotated[
+        int,
+        typer.Option(
+            "--tail", "-n", min=1,
+            help="Show the last N entries (default 20).",
+        ),
+    ] = 20,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            help="Filter to one profile only.",
+            autocompletion=_complete_profile_names,
+        ),
+    ] = None,
+    since: Annotated[
+        str | None,
+        typer.Option(
+            "--since",
+            help=(
+                "Filter to entries within this window: '30m', '1h', '2d', "
+                "'1w', or seconds as an integer."
+            ),
+        ),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Show recent picks + exec invocations from picks.log.
+
+    Filters compose: `--profile account-a --since 1h --tail 5` shows the last
+    five entries for account-a within the past hour.
+    """
+    from datetime import UTC, datetime as _dt, timedelta
+
+    from .pick import pick_log_path
+
+    target = pick_log_path()
+    cutoff: _dt | None = None
+    if since is not None:
+        secs = _parse_duration(since)
+        if secs is None:
+            stderr.print(
+                f"[red]invalid --since value:[/red] {since!r} "
+                "(use '30m', '1h', '2d', '1w', or seconds)"
+            )
+            raise typer.Exit(EXIT_VALIDATION)
+        cutoff = _dt.now(UTC) - timedelta(seconds=secs)
+
+    all_entries = _parse_pick_log(target)
+    filtered = all_entries
+    if profile:
+        filtered = [e for e in filtered if e["profile"] == profile]
+    if cutoff is not None:
+        filtered = [e for e in filtered if e["timestamp"] >= cutoff]
+    final = filtered[-tail:] if tail > 0 else filtered
+
+    if json_output:
+        emit_json({
+            "data": [
+                {
+                    "timestamp": e["timestamp"].isoformat().replace("+00:00", "Z"),
+                    "profile": e["profile"],
+                    "action": e["action"],
+                    "details": e["details"],
+                }
+                for e in final
+            ],
+            "meta": {
+                "count": len(final),
+                "total_in_log": len(all_entries),
+                "log_path": str(target),
+                "filters": {
+                    "tail": tail,
+                    "profile": profile,
+                    "since": since,
+                },
+            },
+        })
+        return
+
+    if not final:
+        if not target.is_file():
+            stderr.print("[yellow]No history yet.[/yellow] (no picks.log)")
+        else:
+            stderr.print("[yellow]No matching entries.[/yellow]")
+        return
+
+    from rich.table import Table
+
+    table = Table(show_lines=False, expand=False)
+    table.add_column("Time", style="dim", no_wrap=True)
+    table.add_column("Profile")
+    table.add_column("Action")
+    table.add_column("Detail", overflow="fold")
+
+    now = _dt.now(UTC)
+    for e in final:
+        elapsed = (now - e["timestamp"]).total_seconds()
+        when = _humanize_elapsed(elapsed)
+        if e["action"] == "EXEC":
+            argv = e["details"].get("argv", "")
+            rc = e["details"].get("rc", "?")
+            dur = e["details"].get("dur", "")
+            detail = f"argv={argv} rc={rc} dur={dur}".strip()
+            action_style = (
+                f"[green]EXEC[/green]" if rc == "0" else f"[red]EXEC[/red]"
+            )
+        else:
+            detail = " ".join(f"{k}={v}" for k, v in e["details"].items())
+            action_style = e["action"]
+        table.add_row(when, e["profile"], action_style, detail)
+
+    stderr.print(table)
+    emit_text(f"{len(final)} of {len(all_entries)} entries")
+
+
+# ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
 
@@ -1303,7 +1621,14 @@ def doctor(
         return
     stderr.print(f"[bold]claude-lb doctor[/bold] (v{report.version})")
     for check in report.checks:
-        mark = "[green]OK[/green]" if check.passed else "[red]FAIL[/red]"
+        # WARN: passed but flagged a non-fatal concern (e.g. profiles without
+        # refresh tokens — valid setup, just won't auto-heal).
+        if check.passed and check.extra.get("warning"):
+            mark = "[yellow]WARN[/yellow]"
+        elif check.passed:
+            mark = "[green]OK[/green]"
+        else:
+            mark = "[red]FAIL[/red]"
         stderr.print(f"  {mark}  {check.name}: {check.detail}")
     if report.all_passed:
         stderr.print("[green]All checks passed.[/green]")
