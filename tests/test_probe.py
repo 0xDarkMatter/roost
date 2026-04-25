@@ -127,3 +127,120 @@ async def test_probe_sends_required_headers(respx_mock: respx.MockRouter) -> Non
 
 def test_api_url_is_oauth_usage_endpoint() -> None:
     assert API_URL == "https://api.anthropic.com/api/oauth/usage"
+
+
+# ---------------------------------------------------------------------------
+# _classify_exception — every httpx error class maps to the right kind
+# ---------------------------------------------------------------------------
+
+
+def test_classify_exception_timeout() -> None:
+    from claude_lb.probe import _classify_exception
+
+    probe = _classify_exception(httpx.ReadTimeout("read timeout after 10s"))
+    assert probe.exception_kind == "timeout"
+    assert "read timeout" in probe.exception_message.lower()
+
+
+def test_classify_exception_connect_error() -> None:
+    from claude_lb.probe import _classify_exception
+
+    probe = _classify_exception(httpx.ConnectError("refused"))
+    assert probe.exception_kind == "refused"
+    assert probe.exception_message == "refused"
+
+
+def test_classify_exception_generic_network_error() -> None:
+    from claude_lb.probe import _classify_exception
+
+    # NetworkError parent class — covers DNS, transport, etc.
+    probe = _classify_exception(httpx.NetworkError("dns dead"))
+    assert probe.exception_kind == "network"
+
+
+def test_classify_exception_unknown_kind_falls_back_to_other() -> None:
+    from claude_lb.probe import _classify_exception
+
+    # An httpx.HTTPError subclass that's none of the recognised kinds.
+    probe = _classify_exception(httpx.InvalidURL("bad URL"))
+    assert probe.exception_kind == "other"
+
+
+def test_classify_exception_empty_message_uses_class_name() -> None:
+    """An exception with no message should still produce a useful
+    exception_message (the class name) instead of the empty string."""
+    from claude_lb.probe import _classify_exception
+
+    probe = _classify_exception(httpx.ConnectError(""))
+    assert probe.exception_message == "ConnectError"
+
+
+# ---------------------------------------------------------------------------
+# probe_many error paths — request actually times out / connection refused
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_probe_profile_with_timeout_classifies_network_error(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """End-to-end: respx raises a timeout, classifier maps to NETWORK_ERROR."""
+    respx_mock.get(API_URL).mock(side_effect=httpx.ReadTimeout("timeout"))
+    result = await probe_profile(_profile())
+    assert result.health is Health.NETWORK_ERROR
+
+
+@pytest.mark.asyncio
+async def test_probe_profile_with_connect_error_classifies_network_error(
+    respx_mock: respx.MockRouter,
+) -> None:
+    respx_mock.get(API_URL).mock(side_effect=httpx.ConnectError("refused"))
+    result = await probe_profile(_profile())
+    assert result.health is Health.NETWORK_ERROR
+    assert result.error is not None
+
+
+@pytest.mark.asyncio
+async def test_probe_many_empty_returns_empty_list() -> None:
+    """Edge case: empty input should not even open an httpx client."""
+    results = await probe_many([])
+    assert results == []
+
+
+# ---------------------------------------------------------------------------
+# probe_raw_many — the diagnostic surface used by `probe --raw`
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_probe_raw_many_returns_tuples_with_status_body_headers(
+    respx_mock: respx.MockRouter,
+) -> None:
+    from claude_lb.probe import probe_raw_many
+
+    body = _ok_body()
+    respx_mock.get(API_URL).respond(200, json=body, headers={"x-test": "1"})
+    results = await probe_raw_many([_profile("a"), _profile("b")])
+    assert len(results) == 2
+    name, status, returned_body, headers = results[0]
+    assert name == "a"
+    assert status == 200
+    assert returned_body == body
+    assert headers.get("x-test") == "1"
+
+
+@pytest.mark.asyncio
+async def test_probe_raw_many_empty_returns_empty_list() -> None:
+    from claude_lb.probe import probe_raw_many
+
+    assert await probe_raw_many([]) == []
+
+
+def test_probe_raw_many_sync_smoke(respx_mock: respx.MockRouter) -> None:
+    """The sync wrapper should round-trip through asyncio.run cleanly."""
+    from claude_lb.probe import probe_raw_many_sync
+
+    respx_mock.get(API_URL).respond(200, json=_ok_body())
+    results = probe_raw_many_sync([_profile()])
+    assert len(results) == 1
+    assert results[0][1] == 200  # status code
