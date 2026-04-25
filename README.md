@@ -86,6 +86,20 @@ claude-lb status
 `claude` command continues to work against whichever account you most
 recently logged into.
 
+**Want one command per profile?** Wrap it in a shell function — claude-lb
+deliberately doesn't ship its own browser-login orchestration (the
+`claude` CLI owns that):
+
+```bash
+add_profile() {
+  claude logout 2>/dev/null
+  claude login && claude-lb add "$1"
+}
+
+add_profile personal
+add_profile work
+```
+
 **Custom locations:**
 
 | Variable | Purpose |
