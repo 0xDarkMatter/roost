@@ -68,3 +68,22 @@ def test_run_child_records_duration() -> None:
     )
     assert result.rc == 0
     assert result.duration_ms >= 90  # 100ms ± jitter
+
+
+def test_run_child_timeout_returns_rc_124() -> None:
+    """Child that runs past the timeout should be killed and report
+    rc=124 (GNU `timeout` convention) with timed_out=True."""
+    start = time.monotonic()
+    result = run_child(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        env_var_name="AXIOM_CLAUDE_PROFILE",
+        profile_name="account-a",
+        timeout=0.3,
+    )
+    elapsed = time.monotonic() - start
+    assert result.rc == RC_TIMEOUT
+    assert result.timed_out is True
+    assert result.not_found is False
+    # Should have killed the child reasonably close to the timeout, not waited
+    # the full 5s. Allow generous slack for slow CI.
+    assert elapsed < 4.0
