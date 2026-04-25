@@ -117,7 +117,7 @@ latency. Document this in `--help` and README so operators can make an
 informed choice.
 
 **Action for v0.2:** if Anthropic publishes a concrete breakdown, link it
-from `SPEC.md` §9 and consider widening the default stickiness window.
+from `SPEC.md` §9 (sibling file) and consider widening the default stickiness window.
 
 ---
 

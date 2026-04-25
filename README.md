@@ -294,7 +294,7 @@ plus a local check of the stored token's `expiresAt`.
 | `network_error` | timeout / DNS / TLS / refused | 30 s | Transient; retry |
 | `unknown` | other 4xx/5xx, malformed body | 60 s | Inspect with `show` |
 
-Classification order: network exception → local-expiry → 200+utilization → 401 → 403+scope-check → 429 → unknown. See [`SPEC.md`](SPEC.md) §6 + [`src/claude_lb/taxonomy.py`](src/claude_lb/taxonomy.py).
+Classification order: network exception → local-expiry → 200+utilization → 401 → 403+scope-check → 429 → unknown. See [`docs/SPEC.md`](docs/SPEC.md) §6 + [`src/claude_lb/taxonomy.py`](src/claude_lb/taxonomy.py).
 
 ## Picker Strategies
 
@@ -541,7 +541,7 @@ This tool follows the [Forma Protocol](https://github.com/forma-tools/forma):
 - Semantic exit codes (0–9)
 - `stdout` = data only; `stderr` = tables, progress, warnings
 - `[tool.forma]` metadata in [`pyproject.toml`](pyproject.toml)
-- See [`SPEC.md`](SPEC.md) for the full specification
+- See [`docs/SPEC.md`](docs/SPEC.md) for the full specification
 
 ## License
 

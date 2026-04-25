@@ -123,7 +123,7 @@ Invariants an agent cannot intuit from `--help`:
 
 ## Forma protocol compliance
 
-This tool adheres to Forma Protocol v1.4. See [SPEC.md](SPEC.md) for the full mapping. Key points:
+This tool adheres to Forma Protocol v1.4. See [docs/SPEC.md](docs/SPEC.md) for the full mapping. Key points:
 
 - `{data, meta}` JSON envelope
 - Semantic exit codes (0–9)
