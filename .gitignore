@@ -52,3 +52,4 @@ Thumbs.db
 .claude/settings.local.json
 docs/screenshots/
 BLOCKERS.md
+results.tsv
