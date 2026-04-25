@@ -2382,3 +2382,205 @@ def test_history_text_output_when_log_missing(_isolated_home: Path) -> None:
     flat = " ".join(result.stderr.split()).lower()
     assert "no history" in flat or "no picks" in flat
 
+
+# ---------------------------------------------------------------------------
+# refresh — exit-code mapping when failures dominate
+# ---------------------------------------------------------------------------
+
+
+def _stub_refresh_results(profile_names: list[str], *, error_code: str | None):
+    """Build a refresh_many_sync stub returning failures with a specific code."""
+    from claude_lb.refresh import RefreshResult
+
+    def _stub(profiles, *, timeout=10.0):
+        return [
+            RefreshResult(
+                name=p.name,
+                refreshed=False,
+                error_code=error_code,
+                error_message=f"simulated {error_code}",
+            )
+            for p in profiles
+        ]
+
+    return _stub
+
+
+def test_refresh_all_failures_with_lock_held_exits_conflict(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When every profile fails AND any error_code is LOCK_HELD, exit is 7."""
+    profile_factory("account-a")
+    monkeypatch.setattr(
+        cli_mod,
+        "refresh_many_sync",
+        _stub_refresh_results(["account-a"], error_code="LOCK_HELD"),
+    )
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 7
+
+
+def test_refresh_all_failures_refresh_rejected_exits_auth_required(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REFRESH_REJECTED → AUTH_REQUIRED (2)."""
+    profile_factory("account-a")
+    monkeypatch.setattr(
+        cli_mod,
+        "refresh_many_sync",
+        _stub_refresh_results(["account-a"], error_code="REFRESH_REJECTED"),
+    )
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 2
+
+
+def test_refresh_all_failures_unexpected_response_exits_error(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile_factory("account-a")
+    monkeypatch.setattr(
+        cli_mod,
+        "refresh_many_sync",
+        _stub_refresh_results(["account-a"], error_code="UNEXPECTED_RESPONSE"),
+    )
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 1
+
+
+def test_refresh_partial_success_with_lock_exits_conflict(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mixed: one succeeded, one LOCK_HELD → still exit 7 so retries pick up
+    just the conflicted ones."""
+    from claude_lb.refresh import RefreshResult
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    def _mixed(profiles, *, timeout=10.0):
+        return [
+            RefreshResult(name=profiles[0].name, refreshed=True),
+            RefreshResult(name=profiles[1].name, refreshed=False, error_code="LOCK_HELD"),
+        ]
+
+    monkeypatch.setattr(cli_mod, "refresh_many_sync", _mixed)
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 7
+
+
+def test_refresh_partial_success_with_other_error_exits_error(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mixed: one succeeded, one generic failure → exit 1 (ERROR)."""
+    from claude_lb.refresh import RefreshResult
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    def _mixed(profiles, *, timeout=10.0):
+        return [
+            RefreshResult(name=profiles[0].name, refreshed=True),
+            RefreshResult(
+                name=profiles[1].name, refreshed=False, error_code="UNEXPECTED_RESPONSE"
+            ),
+        ]
+
+    monkeypatch.setattr(cli_mod, "refresh_many_sync", _mixed)
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 1
+
+
+def test_refresh_json_aggregate_meta_counts(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`refresh --all --json` should emit aggregate counts in meta even
+    on partial failure."""
+    from claude_lb.refresh import RefreshResult
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    def _mixed(profiles, *, timeout=10.0):
+        return [
+            RefreshResult(name=profiles[0].name, refreshed=True),
+            RefreshResult(name=profiles[1].name, refreshed=False, error_code="REFRESH_REJECTED"),
+        ]
+
+    monkeypatch.setattr(cli_mod, "refresh_many_sync", _mixed)
+    result = runner.invoke(app, ["refresh", "--all", "--json"])
+    # JSON-mode partial failure exits 1 (ERROR) — exit-code escalation to
+    # AUTH_REQUIRED only kicks in when ALL refreshes failed.
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 2
+    assert payload["meta"]["refreshed"] == 1
+    assert payload["meta"]["failed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# doctor — JSON failing-check returns EXIT_ERROR
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_json_returns_exit_error_when_any_check_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a check fails, `doctor --json` should exit 1 even though the JSON
+    envelope still emits cleanly to stdout."""
+    from claude_lb import doctor as doctor_mod
+
+    def _fake_run_doctor(*, skip_network: bool = False):
+        return doctor_mod.DoctorReport(
+            version="0.8.0",
+            checks=[
+                doctor_mod.CheckResult(name="x", passed=True),
+                doctor_mod.CheckResult(name="y", passed=False, detail="boom"),
+            ],
+        )
+
+    monkeypatch.setattr(cli_mod, "run_doctor", _fake_run_doctor)
+    result = runner.invoke(app, ["doctor", "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["all_passed"] is False
+    assert payload["meta"]["failed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# pick — JSON failure envelope path
+# ---------------------------------------------------------------------------
+
+
+def test_pick_no_profiles_json_emits_error_envelope() -> None:
+    """`pick --json` with no profiles should emit an error envelope, not a
+    success-shape with empty data."""
+    result = runner.invoke(app, ["pick", "--json"])
+    assert result.exit_code != 0
+    payload = json.loads(result.stdout)
+    assert "error" in payload
+    assert "code" in payload["error"]
+
+
+def test_pick_all_auth_dead_returns_auth_required(profile_factory) -> None:
+    """All AUTH_DEAD → exit 2 (AUTH_REQUIRED) per the reason mapping."""
+    from claude_lb.models import ErrorInfo, ProfileHealth
+
+    profile_factory("dead-a")
+
+    def _stub(profiles, *, prev_health=None):
+        from datetime import UTC, datetime
+        return [
+            ProfileHealth(
+                name=p.name,
+                health=Health.AUTH_DEAD,
+                probed_at=datetime.now(UTC),
+                error=ErrorInfo(type="auth_error", message="dead"),
+                credentials_mtime=p.credentials_mtime,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        result = runner.invoke(app, ["pick"])
+    assert result.exit_code == 2
+
