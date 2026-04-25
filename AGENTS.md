@@ -5,8 +5,8 @@ invoking `claude-lb` as part of a Claude Code spawn pre-flight.
 
 ## What this is
 
-A one-shot stateless CLI that answers "which Anthropic Max profile is
-healthy right now?" It reads local OAuth credentials from
+A one-shot stateless CLI that answers "which of my Claude Code OAuth
+profiles is healthy right now?" It reads local OAuth credentials from
 `~/.claude-profiles/<name>/.credentials.json`, probes
 `GET /api/oauth/usage` (with `anthropic-beta: oauth-2025-04-20`),
 classifies the response into eight health states, caches results, and
@@ -14,16 +14,25 @@ picks the best profile for downstream scripts. It can also exchange
 stored refresh tokens for fresh access tokens via
 `claude-lb refresh <name>`.
 
+Works with any Claude Code OAuth account (Max / Pro / Team). Max plans
+return rich utilization data on `/api/oauth/usage`; Pro/Team return a
+403 "scope requirement user:profile" which is correctly classified as
+`ok` with `usage: null` — the tool still picks/balances them, just
+without per-window % numbers.
+
 ## Command reference
 
 | Command | Purpose |
 |---------|---------|
+| `claude-lb add <name> [--from PATH]` | Onboard an existing `.credentials.json` into the multi-profile layout |
 | `claude-lb list` | Enumerate discovered profiles |
 | `claude-lb probe [<name>]` | Live probe all profiles or one |
 | `claude-lb status` | Cached health table + stdout summary |
 | `claude-lb show <name>` | One profile's full health detail |
 | `claude-lb pick [--strategy S]` | Return the best profile name (exit 0) |
-| `claude-lb refresh <name> \| --all \| --expired` | OAuth refresh, rewrites `.credentials.json` |
+| `claude-lb refresh <name> \| --all \| --expired \| --soon DURATION` | OAuth refresh, rewrites `.credentials.json` |
+| `claude-lb exec <cmd...>` | Pick a profile, run a child command with `AXIOM_CLAUDE_PROFILE` set |
+| `claude-lb history` | Show recent picks + exec runs from `picks.log` |
 | `claude-lb invalidate <name>` | Drop cache entry for re-probe |
 | `claude-lb doctor` | Diagnose local setup (dirs, creds, cache, network) |
 | `claude-lb update` | Version + upstream ahead/behind check |
@@ -65,7 +74,7 @@ Invariants an agent cannot intuit from `--help`:
 2. **Always check exit codes before acting on stdout.** Exit 2/5/6/9 mean stdout is either empty or contains an error envelope (when `--json`). See [README.md](README.md) exit-code table.
 3. **Always use `--json` when parsing output programmatically.** The human text tables on stderr are not a stable contract; the JSON envelope is.
 4. **Try `claude-lb refresh --expired` before concluding a profile is dead.** Exit 2 from `pick` is ambiguous between `auth_dead` (refresh token gone) and `auth_expired` (fixable with one refresh call).
-5. **Never widen scope to other providers.** Anthropic / Claude Code Max only. OpenAI, Gemini, etc. are out of scope.
+5. **Never widen scope to other providers.** Anthropic / Claude Code only. Any OAuth-using plan is fine (Max / Pro / Team) — but OpenAI, Gemini, and other LLM providers are out of scope; multi-provider load-balancing is a different tool.
 6. **Never add a daemon, proxy, or persistent service.** This is a stateless CLI. Continuous behaviour belongs in a separate tool.
 7. **Never transmit credentials off-device.** Tokens are read from local disk, used for exactly one outbound request per probe/refresh, and never logged at default verbosity.
 8. **`stdout` is sacred.** Only data or a single profile name goes to stdout. Tables, progress, warnings, colors → stderr.

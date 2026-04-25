@@ -1430,6 +1430,160 @@ def exec_cmd(
 
 
 # ---------------------------------------------------------------------------
+# add — onboard an existing .credentials.json into the multi-profile layout
+# ---------------------------------------------------------------------------
+
+
+@app.command("add")
+def add(
+    name: Annotated[
+        str,
+        typer.Argument(
+            help=(
+                "Name for the new profile. Becomes the directory under "
+                "~/.claude-profiles/<NAME>/. Must match [A-Za-z0-9_-]+."
+            ),
+        ),
+    ],
+    from_path: Annotated[
+        str | None,
+        typer.Option(
+            "--from",
+            help=(
+                "Source .credentials.json. Default: ~/.claude/.credentials.json "
+                "(where `claude login` writes by default)."
+            ),
+        ),
+    ] = None,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            "-f",
+            help="Overwrite an existing profile of the same name.",
+        ),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Import an existing .credentials.json into the multi-profile layout.
+
+    Typical onboarding:
+
+        claude login                # populates ~/.claude/.credentials.json
+        claude-lb add personal      # imports it as 'personal'
+        claude logout && claude login   # sign in to a different account
+        claude-lb add work          # imports the new state as 'work'
+        claude-lb status            # both visible, ready to balance
+
+    Source file is copied (not moved) so the standard `claude` CLI keeps
+    working unchanged. Profile name must match the discovery regex
+    [A-Za-z0-9_-]+; anything else is rejected.
+    """
+    import json as _json
+    import re as _re
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    from .paths import profiles_dir as _profiles_dir
+
+    if not _re.match(r"^[A-Za-z0-9_-]+$", name):
+        msg = (
+            f"invalid profile name: {name!r} (must match [A-Za-z0-9_-]+)"
+        )
+        if json_output:
+            emit_error_json("VALIDATION_ERROR", msg)
+        stderr.print(f"[red]{msg}[/red]")
+        raise typer.Exit(EXIT_VALIDATION)
+
+    src = _Path(from_path).expanduser() if from_path else _Path.home() / ".claude" / ".credentials.json"
+    if not src.is_file():
+        hint = (
+            "" if from_path else
+            " (default location — run `claude login` first, or pass --from PATH)"
+        )
+        msg = f"source not found: {src}{hint}"
+        if json_output:
+            emit_error_json("NOT_FOUND", msg)
+        stderr.print(f"[red]{msg}[/red]")
+        raise typer.Exit(EXIT_NOT_FOUND)
+
+    # Validate parseable JSON + recognisable token shape before committing
+    # to the copy. Better to refuse early than to leave a broken profile
+    # on disk that subsequent `pick` calls will silently skip.
+    try:
+        with src.open("rb") as fh:
+            payload = _json.load(fh)
+    except (OSError, ValueError) as exc:
+        if json_output:
+            emit_error_json("VALIDATION_ERROR", f"source not parseable: {exc}")
+        stderr.print(f"[red]source not parseable JSON:[/red] {exc}")
+        raise typer.Exit(EXIT_VALIDATION) from None
+    if not isinstance(payload, dict):
+        msg = "source must be a JSON object (got list/scalar)"
+        if json_output:
+            emit_error_json("VALIDATION_ERROR", msg)
+        stderr.print(f"[red]{msg}[/red]")
+        raise typer.Exit(EXIT_VALIDATION)
+    # Light sanity check: at least one of the recognised token shapes is present.
+    has_token = (
+        isinstance(payload.get("claudeAiOauth"), dict)
+        and isinstance(payload["claudeAiOauth"].get("accessToken"), str)
+        and bool(payload["claudeAiOauth"]["accessToken"].strip())
+    ) or any(
+        isinstance(payload.get(k), str) and payload[k].strip()
+        for k in ("oauthAccessToken", "accessToken")
+    )
+    if not has_token:
+        msg = (
+            "source has no recognised access token "
+            "(expected claudeAiOauth.accessToken, oauthAccessToken, or accessToken)"
+        )
+        if json_output:
+            emit_error_json("VALIDATION_ERROR", msg)
+        stderr.print(f"[red]{msg}[/red]")
+        raise typer.Exit(EXIT_VALIDATION)
+
+    dest_dir = _profiles_dir() / name
+    dest = dest_dir / ".credentials.json"
+    if dest.exists() and not force:
+        msg = (
+            f"profile {name!r} already exists at {dest}. "
+            "Pass --force to overwrite."
+        )
+        if json_output:
+            emit_error_json("CONFLICT", msg)
+        stderr.print(f"[red]{msg}[/red]")
+        raise typer.Exit(EXIT_CONFLICT)
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        _shutil.copy2(src, dest)
+    except OSError as exc:
+        if json_output:
+            emit_error_json("ERROR", f"copy failed: {exc}")
+        stderr.print(f"[red]copy failed:[/red] {exc}")
+        raise typer.Exit(EXIT_ERROR) from None
+
+    if json_output:
+        emit_json({
+            "data": {
+                "name": name,
+                "source": str(src),
+                "destination": str(dest),
+                "overwritten": force and dest.exists(),
+            },
+            "meta": {"action": "added"},
+        })
+        return
+    stderr.print(
+        f"[green]added[/green] profile {name!r} → {dest}"
+    )
+    stderr.print(
+        "  next: claude-lb probe " + name + "  (or `claude-lb status` to see all)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # history — read picks.log
 # ---------------------------------------------------------------------------
 

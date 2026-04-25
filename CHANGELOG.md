@@ -5,6 +5,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-25
+
+### Added
+
+- **`claude-lb add <name> [--from PATH] [--force]`** — onboard an existing
+  `.credentials.json` into the multi-profile layout under
+  `~/.claude-profiles/<name>/`. Default source is `~/.claude/.credentials.json`
+  (where `claude login` writes), so typical setup is now:
+
+      claude login                # standard claude CLI
+      claude-lb add personal      # imports as 'personal'
+      claude logout && claude login
+      claude-lb add work          # imports new state as 'work'
+      claude-lb status            # both visible
+
+  Source is copied (not moved) so the standard `claude` command keeps
+  working unchanged. Validates parseable JSON + recognised token shape
+  before committing the copy. Refuses overwrite without `--force`. Cuts
+  onboarding from "manually create directories you've never heard of" to
+  one command.
+
+### Changed
+
+- **Audience widened.** Documentation no longer assumes Max-only — the
+  tool works for any Claude Code OAuth account (Max / Pro / Team), with
+  richer usage data on Max. Pro/Team profiles return 403 on
+  `/api/oauth/usage` (correctly classified as `ok` with `usage: null`),
+  so health/picking still works without per-window utilization numbers.
+- **Identifying account names removed** from documentation, examples,
+  test fixtures, and code comments. Test profiles now use neutral
+  `account-a` / `account-b` / `account-c`. README `Why this exists`
+  rewritten to be generic. AGENTS.md rule 5 updated to "Anthropic /
+  Claude Code only" (any plan), explicitly out-of-scope for OpenAI etc.
+- **README structure.** New `## Setup` section documents the `claude-lb
+  add` workflow + `CLAUDE_LB_PROFILES_DIR` / `CLAUDE_CONFIG_DIR`
+  alternatives. `## Recent updates` section now links to GitHub releases
+  with one-paragraph summaries of v0.5.0 / v0.6.0 / v0.7.0.
+
 ## [0.6.0] - 2026-04-25
 
 ### Added

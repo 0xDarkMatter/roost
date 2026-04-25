@@ -3,39 +3,85 @@
 [![Forma](https://img.shields.io/badge/forma-experimental-orange.svg)](https://github.com/forma-tools/forma)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.6.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](CHANGELOG.md)
 
-> Pick the healthiest Claude Code Max profile — health taxonomy + load balancer for local OAuth profiles.
+> Pick the healthiest Claude Code OAuth profile — health taxonomy + load balancer for local OAuth profiles. Works with any plan (Max / Pro / Team), with richer usage data on Max.
 
 ## Why this exists
 
-Claude Code Max users often run multiple accounts stored as
-`~/.claude-profiles/<name>/.credentials.json`. Nothing built-in picks the
-right one at dispatch time — spawning a session with an expired, dead, or
-quota-exhausted profile burns attempts on 401s and rate-limit retries.
+If you run more than one Claude Code account — for redundancy, quota
+spreading, or just personal-vs-work separation — there's nothing built-in
+that picks the right one at dispatch time. Spawning against an expired,
+dead, or quota-exhausted profile burns attempts on 401s and rate-limit
+retries.
 
 `claude-lb` is a **stateless one-shot CLI primitive** that answers
-"which profile is healthy right now?" as an exit-code-friendly scripting call,
-reading utilization numbers straight from Anthropic's OAuth usage endpoint.
+"which of my profiles is healthy right now?" as an exit-code-friendly
+scripting call, reading utilization numbers straight from Anthropic's
+OAuth usage endpoint.
 
 ```bash
-AXIOM_CLAUDE_PROFILE=$(claude-lb pick) axiom queue enqueue ...
+AXIOM_CLAUDE_PROFILE=$(claude-lb pick) my-script ...
 ```
+
+It works with any Claude Code OAuth account (Max / Pro / Team). On Max
+plans you get the full session/weekly utilization picture; on Pro/Team
+the tool still classifies health correctly (network / auth / rate-limit
+states) but `usage` data is null.
 
 ## Install
 
 ```bash
+# From PyPI (when published) or direct from a local clone:
 uv tool install --editable .
 ```
+
+## Setup
+
+`claude-lb` needs more than one OAuth profile on disk to balance between
+them. The standard `claude` CLI writes a single profile to
+`~/.claude/.credentials.json`. `claude-lb add` imports that file into a
+multi-profile layout under `~/.claude-profiles/<name>/.credentials.json`,
+which is what `claude-lb` discovers and rotates between.
+
+Typical onboarding:
+
+```bash
+# 1. Sign in to your first account (uses the standard Claude Code flow)
+claude login
+
+# 2. Import that credentials file as a named profile
+claude-lb add personal
+
+# 3. Sign in to a different account (overwrites ~/.claude/.credentials.json)
+claude logout && claude login
+
+# 4. Import the new state as another named profile
+claude-lb add work
+
+# 5. Confirm both are visible and ready
+claude-lb status
+```
+
+`claude-lb add` copies (doesn't move) the source file, so the standard
+`claude` command continues to work against whichever account you most
+recently logged into.
+
+**Custom locations:**
+
+| Variable | Purpose |
+|----------|---------|
+| `CLAUDE_LB_PROFILES_DIR` | Override the profiles tree (default `~/.claude-profiles`) |
+| `CLAUDE_CONFIG_DIR` | Single-profile fallback: if set to a dir with a direct `.credentials.json`, loaded as profile `default` |
 
 ## Quick Start
 
 ```bash
 claude-lb probe                          # Live-probe all profiles
 claude-lb status                         # Cached health table
-claude-lb pick                           # → account-a  (one profile name, exit 0)
+claude-lb pick                           # → personal  (one profile name, exit 0)
 claude-lb refresh --expired              # Refresh any profile whose token expired
-eval "$(claude-lb pick --export)"        # AXIOM_CLAUDE_PROFILE=account-a in shell
+eval "$(claude-lb pick --export)"        # AXIOM_CLAUDE_PROFILE=personal in shell
 claude-lb status --json | jq '.meta'     # Machine-readable summary
 ```
 
@@ -296,13 +342,14 @@ Cache writes are atomic (tempfile + `os.replace`). A credentials file's
 
 - Python 3.11+
 - One or more OAuth profiles under `~/.claude-profiles/<name>/.credentials.json`
-  (populated by `claude login --profile <name>`)
+  — created via `claude-lb add <name>` (see [Setup](#setup) above)
 - Outbound HTTPS access to `api.anthropic.com`
 
-## Monthly Overage
+## Monthly Overage (Max-only)
 
 Anthropic Max plans support pay-as-you-go overage when the weekly window is
-exhausted. `claude-lb` surfaces it via `usage.extra` on every probe:
+exhausted. `claude-lb` surfaces it via `usage.extra` on every probe (Pro/Team
+profiles return `usage: null` since they don't expose this surface):
 
 ```json
 "extra": {
@@ -319,44 +366,51 @@ still works but falls back to the hard weekly/session caps until the next
 month. The status table shows an **Overage** column (colour-coded) when any
 profile has overage enabled.
 
-## Recent Changes
+## Recent updates
 
-### v0.4.0 (2026-04-24)
+[**Releases on GitHub**](https://github.com/0xDarkMatter/claude-lb/releases) ·
+[Full CHANGELOG](CHANGELOG.md)
 
-- `usage.extra` — monthly overage surfaced (credits used, budget, currency, utilisation)
-- `refresh` concurrent-write race closed with per-profile `filelock` + `EXIT_CONFLICT=7`
-- `pick --warn-at <pct>` — non-fatal stderr warning when a chosen profile is running hot
-- `probe --raw` — dump the literal `/api/oauth/usage` response body for diagnostics
-- Status table adds Session / Sonnet / Opus / Overage columns (conditional) and `"resets in 37m"` formatting
+### v0.7.0 — onboarding helper
 
-### v0.3.0 (2026-04-24)
+- **`claude-lb add <name>`** — import an existing `.credentials.json` (default
+  source: `~/.claude/.credentials.json`) into the multi-profile layout. Cuts
+  onboarding from "manually copy files into a directory I haven't created"
+  to one command.
+- Audience widened: docs no longer assume Max-only — works for any Claude
+  Code OAuth account (Max / Pro / Team), with richer usage data on Max.
+- Identifying account names stripped from documentation and examples.
 
-- Added `claude-lb refresh <name> | --all | --expired` for explicit OAuth token refresh
-- Added 8th health state `auth_expired` — detected locally from `expiresAt` with no network call
-- Atomic `.credentials.json` rewrite preserving non-oauth fields; health cache invalidated on refresh
+### v0.6.0 — operational polish
 
-### v0.2.0 (2026-04-24)
+- **Shell completion** (`claude-lb --install-completion`) — bash/zsh/fish/pwsh,
+  with profile-name + strategy completion.
+- **`claude-lb history`** — read the picks.log audit trail with `--profile`,
+  `--since 30m`, `--tail N` filters.
+- **`refresh --soon DURATION`** — anticipatory refresh; cron-friendly
+  (`*/15 * * * * claude-lb refresh --soon 30m --json`).
+- **doctor refresh-token check** — warns on profiles missing a refreshToken
+  (won't auto-heal at expiry).
 
-- Swapped probe endpoint `/v1/models` → `/api/oauth/usage` (the `/v1/*` path rejects OAuth tokens)
-- Taxonomy derives `session_limit` / `weekly_limit` from real utilization numbers, not 429 keywords
-- Reset timestamps come from response body, not "next Sunday" heuristics
-- Populated `usage.session_pct` / `weekly_pct` / `sonnet_pct` / `opus_pct` on every healthy probe
-- Retired `patterns.py` (429 keyword lists)
+### v0.5.0 — composing the north-star idiom
 
-### v0.1.0 (2026-04-24)
-
-- Initial release — seven-state health taxonomy, five picker strategies, semantic exit codes, atomic cache writes
-
-[Full changelog](CHANGELOG.md)
+- **`claude-lb exec <cmd...>`** — pick a profile, set `AXIOM_CLAUDE_PROFILE`,
+  exec the command, propagate child rc. With `--auto-refresh` and
+  `--retry-on-429`.
+- **`claude-lb pick --auto-refresh`** — inline-refresh expired tokens before
+  picking. Folds the two-step preflight into one call.
+- **`claude-lb pick --count N` (alias `-n N`)** — multi-pick for parallel
+  dispatch workflows.
 
 ## Non-goals
 
 - **Not a proxy.** Doesn't sit in the request path. Use
   [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) if you want that.
-- **Not an interactive authenticator.** `claude login` creates profiles;
-  `claude-lb refresh` extends their lifetime — but the browser-based OAuth
-  flow is owned by the `claude` CLI.
-- **Not multi-provider.** Anthropic / Claude Code Max only.
+- **Not an interactive authenticator.** `claude login` creates the
+  underlying credentials; `claude-lb add` imports them, `claude-lb refresh`
+  extends their lifetime — the browser-based OAuth flow itself is owned by
+  the `claude` CLI.
+- **Not multi-provider.** Anthropic / Claude Code only.
 - **Not persistent.** No daemon, no watchdog. Every invocation is one-shot.
 
 ## Forma Protocol

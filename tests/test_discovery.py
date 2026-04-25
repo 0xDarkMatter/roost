@@ -107,7 +107,7 @@ def test_single_profile_fallback(
 def test_discover_names_returns_strings(profile_factory) -> None:
     profile_factory("account-a")
     profile_factory("account-b")
-    assert discovery.discover_names() == ["account-b", "account-a"]
+    assert discovery.discover_names() == ["account-a", "account-b"]
 
 
 def test_credentials_mtime_is_captured(profile_factory) -> None:

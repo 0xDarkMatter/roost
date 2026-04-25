@@ -64,7 +64,7 @@ def test_version() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert "claude-lb" in result.stdout
-    assert "0.6.0" in result.stdout
+    assert "0.7.0" in result.stdout
 
 
 def test_help_exits_zero() -> None:
@@ -1065,9 +1065,12 @@ def test_completion_profile_names_filters_by_prefix(profile_factory) -> None:
     profile_factory("account-b")
     profile_factory("account-c")
     assert sorted(cli_mod._complete_profile_names("")) == [
-        "account-b", "account-c", "account-a",
+        "account-a", "account-b", "account-c",
     ]
-    assert cli_mod._complete_profile_names("ro") == ["account-a"]
+    assert cli_mod._complete_profile_names("account-a") == ["account-a"]
+    assert sorted(cli_mod._complete_profile_names("account")) == [
+        "account-a", "account-b", "account-c",
+    ]
     assert cli_mod._complete_profile_names("zzz") == []
 
 
@@ -1319,6 +1322,143 @@ def test_refresh_soon_and_expired_together_rejected(profile_factory) -> None:
     result = runner.invoke(app, ["refresh", "--soon", "1h", "--expired"])
     assert result.exit_code == 4
     assert "exactly one" in result.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# claude-lb add — onboarding helper
+# ---------------------------------------------------------------------------
+
+
+def _write_credentials_file(path: Path, *, with_refresh: bool = True) -> None:
+    """Write a valid modern-shape credentials file at the given path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-test",
+            "expiresAt": 99999999999999,
+        }
+    }
+    if with_refresh:
+        payload["claudeAiOauth"]["refreshToken"] = "sk-ant-ort01-test"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_add_imports_from_default_claude_dir(
+    tmp_path: Path, credentials_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`claude-lb add NAME` defaults --from to ~/.claude/.credentials.json."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: fake_home)
+    src = fake_home / ".claude" / ".credentials.json"
+    _write_credentials_file(src)
+
+    result = runner.invoke(app, ["add", "personal"])
+    assert result.exit_code == 0
+    dest = credentials_dir / "personal" / ".credentials.json"
+    assert dest.is_file()
+    # Source is preserved (copy, not move)
+    assert src.is_file()
+
+
+def test_add_with_explicit_from_path(
+    tmp_path: Path, credentials_dir: Path
+) -> None:
+    src = tmp_path / "elsewhere.json"
+    _write_credentials_file(src)
+    result = runner.invoke(app, ["add", "work", "--from", str(src)])
+    assert result.exit_code == 0
+    dest = credentials_dir / "work" / ".credentials.json"
+    assert dest.is_file()
+
+
+def test_add_rejects_invalid_name(credentials_dir: Path, tmp_path: Path) -> None:
+    """Profile name must match [A-Za-z0-9_-]+ — same regex as discovery."""
+    src = tmp_path / "src.json"
+    _write_credentials_file(src)
+    result = runner.invoke(app, ["add", "bad name with spaces", "--from", str(src)])
+    assert result.exit_code == 4
+    assert "invalid profile name" in result.stderr.lower()
+    # Nothing written
+    assert not (credentials_dir / "bad name with spaces").exists()
+
+
+def test_add_missing_source_returns_not_found(
+    tmp_path: Path, credentials_dir: Path
+) -> None:
+    nonexistent = tmp_path / "does-not-exist.json"
+    result = runner.invoke(app, ["add", "x", "--from", str(nonexistent)])
+    assert result.exit_code == 3
+    assert "not found" in result.stderr.lower()
+
+
+def test_add_default_source_missing_gives_helpful_hint(
+    tmp_path: Path, credentials_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the default source (~/.claude/.credentials.json) is missing, the
+    error should mention `claude login` so the user knows what to do."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: fake_home)
+    result = runner.invoke(app, ["add", "x"])
+    assert result.exit_code == 3
+    # Rich wraps long lines; collapse whitespace before matching.
+    flat = " ".join(result.stderr.split()).lower()
+    assert "claude login" in flat
+
+
+def test_add_validates_source_is_parseable_json(
+    tmp_path: Path, credentials_dir: Path
+) -> None:
+    src = tmp_path / "bad.json"
+    src.write_text("{not valid json", encoding="utf-8")
+    result = runner.invoke(app, ["add", "x", "--from", str(src)])
+    assert result.exit_code == 4
+    assert "parseable" in result.stderr.lower() or "json" in result.stderr.lower()
+    # Nothing copied
+    assert not (credentials_dir / "x").exists()
+
+
+def test_add_rejects_credentials_with_no_token(
+    tmp_path: Path, credentials_dir: Path
+) -> None:
+    """Empty/non-token JSON shouldn't be accepted — would silently fail at pick time."""
+    src = tmp_path / "no-token.json"
+    src.write_text(json.dumps({"unrelated_field": "value"}), encoding="utf-8")
+    result = runner.invoke(app, ["add", "x", "--from", str(src)])
+    assert result.exit_code == 4
+    assert "token" in result.stderr.lower()
+
+
+def test_add_refuses_to_overwrite_without_force(
+    tmp_path: Path, credentials_dir: Path
+) -> None:
+    src = tmp_path / "src.json"
+    _write_credentials_file(src)
+    runner.invoke(app, ["add", "dup", "--from", str(src)])
+    # Second invocation
+    result = runner.invoke(app, ["add", "dup", "--from", str(src)])
+    assert result.exit_code == 7  # CONFLICT
+    assert "force" in result.stderr.lower() or "exists" in result.stderr.lower()
+
+
+def test_add_force_overwrites(tmp_path: Path, credentials_dir: Path) -> None:
+    src = tmp_path / "src.json"
+    _write_credentials_file(src)
+    runner.invoke(app, ["add", "dup", "--from", str(src)])
+    result = runner.invoke(app, ["add", "dup", "--from", str(src), "--force"])
+    assert result.exit_code == 0
+
+
+def test_add_json_output(tmp_path: Path, credentials_dir: Path) -> None:
+    src = tmp_path / "src.json"
+    _write_credentials_file(src)
+    result = runner.invoke(app, ["add", "newprofile", "--from", str(src), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["name"] == "newprofile"
+    assert payload["data"]["source"] == str(src)
+    assert payload["meta"]["action"] == "added"
 
 
 # ---------------------------------------------------------------------------
