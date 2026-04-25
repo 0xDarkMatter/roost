@@ -1598,6 +1598,214 @@ def test_add_json_oauth_accessToken_legacy_shape_accepted(
 
 
 # ---------------------------------------------------------------------------
+# refresh command — selector validation envelopes
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_no_selector_returns_validation_error(profile_factory) -> None:
+    """`claude-lb refresh` with no name and no flags should refuse — would
+    otherwise be ambiguous between "all" and "nothing"."""
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh"])
+    assert result.exit_code == 4
+    flat = " ".join(result.stderr.split()).lower()
+    assert "specify" in flat or "one of" in flat
+
+
+def test_refresh_no_selector_json_emits_validation_error_envelope(
+    profile_factory,
+) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_refresh_multiple_selectors_returns_validation_error(
+    profile_factory,
+) -> None:
+    """Combining --all and --expired (or any two selectors) is ambiguous."""
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--all", "--expired"])
+    assert result.exit_code == 4
+    flat = " ".join(result.stderr.split()).lower()
+    assert "exactly one" in flat or "one of" in flat
+
+
+def test_refresh_multiple_selectors_json_emits_validation_envelope(
+    profile_factory,
+) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--all", "--expired", "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_refresh_unknown_profile_name_returns_not_found(
+    profile_factory,
+) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "nonexistent"])
+    assert result.exit_code == 3
+    flat = " ".join(result.stderr.split()).lower()
+    assert "no such profile" in flat
+
+
+def test_refresh_unknown_profile_name_json_emits_not_found_envelope(
+    profile_factory,
+) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "nonexistent", "--json"])
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+def test_refresh_expired_with_no_expired_profiles_succeeds_quietly(
+    profile_factory,
+) -> None:
+    """`refresh --expired` with no eligible profiles should succeed (rc=0)
+    with a "nothing to do" message — not an error."""
+    profile_factory("account-a")  # default has future expiresAt
+    result = runner.invoke(app, ["refresh", "--expired"])
+    assert result.exit_code == 0
+
+
+def test_refresh_expired_with_no_expired_profiles_json_envelope(
+    profile_factory,
+) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["refresh", "--expired", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"] == []
+    assert payload["meta"]["count"] == 0
+    assert payload["meta"]["refreshed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# update --apply CLI surface (the apply_update path is unit-tested separately)
+# ---------------------------------------------------------------------------
+
+
+def test_update_command_renders_status_text() -> None:
+    """`claude-lb update` (no --apply) prints the version + git status."""
+    result = runner.invoke(app, ["update"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split())
+    # Always at least mentions the current version + a hint
+    assert "claude-lb" in flat
+    assert "hint" in flat.lower()
+
+
+def test_update_command_json_envelope() -> None:
+    result = runner.invoke(app, ["update", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert "data" in payload
+    assert "meta" in payload
+    assert "current_version" in payload["data"]
+    assert isinstance(payload["meta"]["update_available"], bool)
+
+
+def test_update_apply_happy_path_renders_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When apply_update succeeds, the CLI prints 'Update applied' on stderr
+    and exits 0."""
+    from claude_lb.updater import UpdateApplyResult
+
+    def _fake_apply(*, pull: bool) -> UpdateApplyResult:
+        return UpdateApplyResult(
+            current_version="0.8.0",
+            install_dir="/path",
+            applied=True,
+            pulled=pull,
+            reinstalled=True,
+            stdout="ok",
+        )
+
+    monkeypatch.setattr(cli_mod, "apply_update", _fake_apply)
+    result = runner.invoke(app, ["update", "--apply"])
+    assert result.exit_code == 0
+    flat = " ".join(result.stderr.split()).lower()
+    assert "update applied" in flat
+
+
+def test_update_apply_failure_returns_exit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_lb.updater import UpdateApplyResult
+
+    def _fake_apply(*, pull: bool) -> UpdateApplyResult:
+        return UpdateApplyResult(
+            current_version="0.8.0",
+            install_dir="/path",
+            applied=False,
+            pulled=False,
+            reinstalled=False,
+            error="simulated failure",
+            stdout="some details",
+        )
+
+    monkeypatch.setattr(cli_mod, "apply_update", _fake_apply)
+    result = runner.invoke(app, ["update", "--apply"])
+    assert result.exit_code == 1
+    flat = " ".join(result.stderr.split()).lower()
+    assert "update failed" in flat
+    assert "simulated failure" in flat
+
+
+def test_update_apply_json_failure_returns_exit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_lb.updater import UpdateApplyResult
+
+    def _fake_apply(*, pull: bool) -> UpdateApplyResult:
+        return UpdateApplyResult(
+            current_version="0.8.0",
+            install_dir="/path",
+            applied=False,
+            pulled=False,
+            reinstalled=False,
+            error="boom",
+        )
+
+    monkeypatch.setattr(cli_mod, "apply_update", _fake_apply)
+    result = runner.invoke(app, ["update", "--apply", "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["data"]["applied"] is False
+    assert payload["meta"]["applied"] is False
+
+
+def test_update_apply_no_pull_flag_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--no-pull` should pass `pull=False` through to apply_update."""
+    from claude_lb.updater import UpdateApplyResult
+
+    captured: dict = {}
+
+    def _fake_apply(*, pull: bool) -> UpdateApplyResult:
+        captured["pull"] = pull
+        return UpdateApplyResult(
+            current_version="0.8.0",
+            install_dir="/p",
+            applied=True,
+            pulled=False,
+            reinstalled=True,
+        )
+
+    monkeypatch.setattr(cli_mod, "apply_update", _fake_apply)
+    result = runner.invoke(app, ["update", "--apply", "--no-pull"])
+    assert result.exit_code == 0
+    assert captured["pull"] is False
+
+
+# ---------------------------------------------------------------------------
 # Edge cases — ferreting out behaviours not covered by the headline tests
 # ---------------------------------------------------------------------------
 
