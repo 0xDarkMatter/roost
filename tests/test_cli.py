@@ -1500,6 +1500,104 @@ def test_add_json_output(tmp_path: Path, credentials_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# add command — JSON-output error envelopes for every validation path
+# ---------------------------------------------------------------------------
+
+
+def test_add_json_invalid_name_emits_validation_error_envelope(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "src.json"
+    _write_credentials_file(src)
+    result = runner.invoke(app, ["add", "bad name", "--from", str(src), "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert "invalid profile name" in payload["error"]["message"].lower()
+
+
+def test_add_json_missing_source_emits_not_found_envelope(
+    tmp_path: Path,
+) -> None:
+    nonexistent = tmp_path / "nope.json"
+    result = runner.invoke(
+        app, ["add", "x", "--from", str(nonexistent), "--json"]
+    )
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+def test_add_json_malformed_source_emits_validation_error(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "bad.json"
+    src.write_text("{not valid json", encoding="utf-8")
+    result = runner.invoke(app, ["add", "x", "--from", str(src), "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert "parseable" in payload["error"]["message"].lower()
+
+
+def test_add_json_source_is_list_emits_validation_error(
+    tmp_path: Path,
+) -> None:
+    """A JSON list (vs object) at the source path should be rejected with
+    a clear message — covers the `not isinstance(payload, dict)` branch."""
+    src = tmp_path / "list.json"
+    src.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+    result = runner.invoke(app, ["add", "x", "--from", str(src), "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert "object" in payload["error"]["message"].lower()
+
+
+def test_add_json_no_token_emits_validation_error(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "no-token.json"
+    src.write_text(json.dumps({"unrelated": 1}), encoding="utf-8")
+    result = runner.invoke(app, ["add", "x", "--from", str(src), "--json"])
+    assert result.exit_code == 4
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert "token" in payload["error"]["message"].lower()
+
+
+def test_add_json_conflict_emits_conflict_envelope(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "src.json"
+    _write_credentials_file(src)
+    runner.invoke(app, ["add", "dup", "--from", str(src)])
+    result = runner.invoke(app, ["add", "dup", "--from", str(src), "--json"])
+    assert result.exit_code == 7
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "CONFLICT"
+    assert "exists" in payload["error"]["message"].lower()
+
+
+def test_add_json_oauth_accessToken_legacy_shape_accepted(
+    tmp_path: Path, credentials_dir: Path
+) -> None:
+    """Legacy `oauthAccessToken` shape should pass token validation
+    (covers the `any(...)` branch in the token-shape check)."""
+    src = tmp_path / "legacy.json"
+    src.write_text(
+        json.dumps({"oauthAccessToken": "sk-ant-oat01-legacy"}),
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app, ["add", "legacy", "--from", str(src), "--json"]
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["name"] == "legacy"
+
+
+# ---------------------------------------------------------------------------
 # Edge cases — ferreting out behaviours not covered by the headline tests
 # ---------------------------------------------------------------------------
 
