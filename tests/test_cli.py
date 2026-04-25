@@ -1125,6 +1125,37 @@ def test_parse_duration_rejects_garbage() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _humanize_elapsed — every duration band
+# ---------------------------------------------------------------------------
+
+
+def test_humanize_elapsed_negative_clamps_to_zero() -> None:
+    assert cli_mod._humanize_elapsed(-5) == "0s ago"
+    assert cli_mod._humanize_elapsed(-9999) == "0s ago"
+
+
+def test_humanize_elapsed_seconds_band() -> None:
+    assert cli_mod._humanize_elapsed(0) == "0s ago"
+    assert cli_mod._humanize_elapsed(1) == "1s ago"
+    assert cli_mod._humanize_elapsed(59) == "59s ago"
+
+
+def test_humanize_elapsed_minutes_band() -> None:
+    assert cli_mod._humanize_elapsed(60) == "1m ago"
+    assert cli_mod._humanize_elapsed(3599) == "59m ago"
+
+
+def test_humanize_elapsed_hours_band() -> None:
+    assert cli_mod._humanize_elapsed(3600) == "1h ago"
+    assert cli_mod._humanize_elapsed(86399) == "23h ago"
+
+
+def test_humanize_elapsed_days_band() -> None:
+    assert cli_mod._humanize_elapsed(86400) == "1d ago"
+    assert cli_mod._humanize_elapsed(86400 * 7) == "7d ago"
+
+
+# ---------------------------------------------------------------------------
 # claude-lb history
 # ---------------------------------------------------------------------------
 
