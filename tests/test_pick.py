@@ -673,3 +673,72 @@ def test_read_last_pick_returns_none_for_wrong_shape(tmp_path) -> None:
     target = tmp_path / "wrong.json"
     target.write_text(_json.dumps({"profile": 12345, "timestamp": "x"}))
     assert read_last_pick(path=target) is None
+
+
+# ---------------------------------------------------------------------------
+# _diagnose_failure — every reason path
+# ---------------------------------------------------------------------------
+
+
+def test_diagnose_failure_with_empty_entries_returns_no_profiles() -> None:
+    """Filter ladder yielded zero candidates because there are no profiles
+    at all (vs. all-filtered) — should return NO_PROFILES."""
+    from claude_lb.pick import _diagnose_failure
+    from claude_lb.pick import PickFailureReason as PFR
+
+    outcome = _diagnose_failure([], require_ok=False)
+    assert outcome.reason is PFR.NO_PROFILES
+
+
+def test_diagnose_failure_with_mixed_dead_and_expired_returns_all_auth_expired() -> None:
+    """A fleet that's a mix of AUTH_DEAD and AUTH_EXPIRED should resolve to
+    ALL_AUTH_EXPIRED — the actionable subset (the operator can `refresh`
+    the expired ones first, then deal with dead profiles separately)."""
+    from datetime import UTC, datetime
+
+    from claude_lb.models import ErrorInfo, Health, ProfileHealth
+    from claude_lb.pick import _diagnose_failure
+    from claude_lb.pick import PickFailureReason as PFR
+
+    now = datetime.now(UTC)
+    entries = [
+        ProfileHealth(
+            name="dead",
+            health=Health.AUTH_DEAD,
+            probed_at=now,
+            error=ErrorInfo(type="auth_error", message="dead"),
+            credentials_mtime=1000.0,
+        ),
+        ProfileHealth(
+            name="expired",
+            health=Health.AUTH_EXPIRED,
+            probed_at=now,
+            error=ErrorInfo(type="token_expired", message="expired"),
+            credentials_mtime=1000.0,
+        ),
+    ]
+    outcome = _diagnose_failure(entries, require_ok=False)
+    assert outcome.reason is PFR.ALL_AUTH_EXPIRED
+
+
+def test_is_selectable_rejects_non_ok_when_require_ok_is_true() -> None:
+    """The require_ok branch in _is_selectable should drop non-OK profiles
+    even when they'd otherwise pass the ladder."""
+    from datetime import UTC, datetime, timedelta
+
+    from claude_lb.models import Health, ProfileHealth
+    from claude_lb.pick import _is_selectable
+
+    now = datetime.now(UTC)
+    # NETWORK_ERROR normally passes the ladder (transient), but require_ok
+    # should still drop it.
+    entry = ProfileHealth(
+        name="netfail",
+        health=Health.NETWORK_ERROR,
+        probed_at=now,
+        expires_at=now + timedelta(minutes=5),
+        credentials_mtime=1000.0,
+    )
+    assert _is_selectable(entry, now, require_ok=True) is False
+    # Without require_ok, NETWORK_ERROR passes
+    assert _is_selectable(entry, now, require_ok=False) is True

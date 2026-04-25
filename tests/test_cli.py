@@ -3429,6 +3429,81 @@ def test_pick_require_ok_when_no_profile_is_ok_returns_forbidden(
 # ---------------------------------------------------------------------------
 
 
+def test_history_parses_naive_timestamps(_isolated_home: Path) -> None:
+    """Pick log lines with no timezone offset should be assumed UTC and
+    survive the parse. Hits the `if ts.tzinfo is None: replace(tzinfo=UTC)`
+    branch in the history parser."""
+    log_path = _isolated_home / "picks.log"
+    # No Z, no offset — naive
+    log_path.write_text(
+        "2026-04-25T10:00:00\taccount-a\tsticky\tscore=0.50\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 1
+
+
+def test_history_skips_log_chunks_without_equals_sign(_isolated_home: Path) -> None:
+    """Detail chunks without `=` should be silently skipped during parsing,
+    not crash the loop."""
+    log_path = _isolated_home / "picks.log"
+    log_path.write_text(
+        "2026-04-25T10:00:00Z\taccount-a\tsticky\tno-equals-here\tscore=0.50\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["history", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["count"] == 1
+
+
+def test_update_apply_success_with_no_stdout_returns_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful apply with no stdout to print should still exit 0
+    cleanly — covers the early-return at line 1867."""
+    from claude_lb.updater import UpdateApplyResult
+
+    monkeypatch.setattr(
+        cli_mod, "apply_update",
+        lambda *, pull: UpdateApplyResult(
+            current_version="0.8.0",
+            install_dir="/p",
+            applied=True,
+            pulled=True,
+            reinstalled=True,
+            stdout="",  # empty
+        ),
+    )
+    result = runner.invoke(app, ["update", "--apply"])
+    assert result.exit_code == 0
+
+
+def test_update_apply_json_success_returns_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`update --apply --json` with applied=True should exit 0 (not raise
+    EXIT_ERROR) — covers the early-return after emit_json."""
+    from claude_lb.updater import UpdateApplyResult
+
+    monkeypatch.setattr(
+        cli_mod, "apply_update",
+        lambda *, pull: UpdateApplyResult(
+            current_version="0.8.0",
+            install_dir="/p",
+            applied=True,
+            pulled=True,
+            reinstalled=True,
+        ),
+    )
+    result = runner.invoke(app, ["update", "--apply", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["applied"] is True
+
+
 def test_history_handles_oserror_on_log_read(
     _isolated_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

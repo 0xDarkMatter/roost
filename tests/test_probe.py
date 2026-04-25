@@ -358,3 +358,19 @@ async def test_probe_profile_uses_supplied_client(
     async with httpx.AsyncClient() as client:
         result = await probe_profile(_profile(), client=client)
     assert result.health is Health.OK
+
+
+@pytest.mark.asyncio
+async def test_probe_profile_short_circuits_on_locally_expired(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """probe_profile should return the AUTH_EXPIRED record without hitting
+    the network when the local expiresAt is past. Hits the early-return at
+    line 164."""
+    from claude_lb.probe import probe_profile
+
+    route = respx_mock.get(API_URL).respond(200, json=_ok_body())
+    expired = _expired_profile(refresh_present=True)
+    result = await probe_profile(expired)
+    assert result.health is Health.AUTH_EXPIRED
+    assert route.call_count == 0  # network not touched
