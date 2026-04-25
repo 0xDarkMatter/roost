@@ -3393,7 +3393,7 @@ def test_reprobe_after_child_returns_none_when_probe_returns_empty(
 
     fake_profile = Profile(
         name="x",
-        access_token="sk-ant-oat01-x",
+        access_token="oat-stub",
         credentials_path="/tmp/x/.credentials.json",
         credentials_mtime=1000.0,
     )

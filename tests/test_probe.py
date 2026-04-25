@@ -256,7 +256,7 @@ def _expired_profile(*, refresh_present: bool) -> Profile:
 
     return Profile(
         name="expired-acct",
-        access_token="sk-ant-oat01-stale",
+        access_token="oat-stale",
         credentials_path="/tmp/expired/.credentials.json",
         credentials_mtime=1000.0,
         access_token_expires_at=datetime.now(UTC) - timedelta(minutes=10),
@@ -297,7 +297,7 @@ def test_local_auth_expired_returns_none_when_token_still_valid() -> None:
 
     fresh = Profile(
         name="fresh",
-        access_token="sk-ant-oat01-fresh",
+        access_token="oat-fresh",
         credentials_path="/tmp/fresh/.credentials.json",
         credentials_mtime=1000.0,
         access_token_expires_at=datetime.now(UTC) + timedelta(hours=1),
@@ -311,7 +311,7 @@ def test_local_auth_expired_returns_none_when_no_expires_at() -> None:
 
     no_expires = Profile(
         name="no-exp",
-        access_token="sk-ant-oat01-x",
+        access_token="oat-stub",
         credentials_path="/tmp/no-exp/.credentials.json",
         credentials_mtime=1000.0,
         access_token_expires_at=None,

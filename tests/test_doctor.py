@@ -138,7 +138,7 @@ def test_refresh_tokens_check_warns_on_missing(
     no_rt_dir.mkdir(parents=True, exist_ok=True)
     (no_rt_dir / ".credentials.json").write_text(_json.dumps({
         "claudeAiOauth": {
-            "accessToken": "sk-ant-oat01-no-rt",
+            "accessToken": "oat-stub",
             "expiresAt": 99999999999999,
         }
     }))

@@ -599,7 +599,7 @@ def test_discover_in_skips_dirs_with_invalid_names(tmp_path) -> None:
     # Create one valid + one invalid-named dir
     (tmp_path / "valid").mkdir()
     (tmp_path / "valid" / ".credentials.json").write_text(
-        '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-x"}}'
+        '{"claudeAiOauth": {"accessToken": "oat-stub"}}'
     )
     (tmp_path / "has spaces in name").mkdir()
     (tmp_path / "has spaces in name" / ".credentials.json").write_text("{}")
@@ -620,7 +620,7 @@ def test_discover_in_skips_files_in_profiles_dir(tmp_path) -> None:
     # Mix of one valid profile dir + one stray file
     (tmp_path / "validprofile").mkdir()
     (tmp_path / "validprofile" / ".credentials.json").write_text(
-        '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-x"}}'
+        '{"claudeAiOauth": {"accessToken": "oat-stub"}}'
     )
     (tmp_path / "stray-file.txt").write_text("garbage")
     (tmp_path / ".DS_Store").write_text("mac noise")
