@@ -39,6 +39,7 @@ dev = [
 
 [project.scripts]
 roost = "claude_lb.cli:app"
+claude-lb = "claude_lb.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/0xDarkMatter/roost"
