@@ -13,6 +13,30 @@
 
 ![roost](docs/assets/hackathon.gif)
 
+## Architecture
+
+```
+  ~/.claude-profiles/<name>/.credentials.json
+                    │
+                    ▼  discover_profiles()
+         ┌──────────────────┐    probe (async)    ┌───────────────────────┐
+         │    discovery     │───────────────────► │   api.anthropic.com   │
+         └────────┬─────────┘ ◄── classify ────── │   GET /oauth/usage    │
+                  │               8 states         └───────────────────────┘
+                  ▼
+         ┌────────────────────────────────────────┐
+         │  cache  ·  health.json  ·  picks.log   │
+         └───────────────────┬────────────────────┘
+                             │  pick(strategy)
+                             ▼
+                  ┌──────────────────────┐
+                  │  sticky              │
+                  │  least-used          │──► AXIOM_CLAUDE_PROFILE=‹name›
+                  │  round-robin         │              → claude ...
+                  │  weighted            │
+                  └──────────────────────┘
+```
+
 ## Why this exists
 
 If you run more than one Claude Code account — for redundancy, quota
