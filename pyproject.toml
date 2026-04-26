@@ -1,12 +1,12 @@
 [project]
-name = "claude-lb"
+name = "roost"
 version = "0.8.0"
-description = "Pick the healthiest Claude Code Max profile — health taxonomy + load balancer"
+description = "Pick the healthiest Claude Code profile — health taxonomy + load balancer"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "claude-lb contributors" }]
-keywords = ["claude", "claude-code", "anthropic", "oauth", "load-balancer", "cli", "forma"]
+authors = [{ name = "roost contributors" }]
+keywords = ["claude", "claude-code", "anthropic", "oauth", "load-balancer", "cli", "forma", "roost"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -38,11 +38,11 @@ dev = [
 ]
 
 [project.scripts]
-claude-lb = "claude_lb.cli:app"
+roost = "claude_lb.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/0xDarkMatter/claude-lb"
-Issues = "https://github.com/0xDarkMatter/claude-lb/issues"
+Homepage = "https://github.com/0xDarkMatter/roost"
+Issues = "https://github.com/0xDarkMatter/roost/issues"
 
 [build-system]
 requires = ["hatchling"]

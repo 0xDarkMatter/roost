@@ -1,7 +1,7 @@
-# claude-lb Specification
+# roost Specification
 
 > Version 0.1 · 2026-04-24
-> CLI shape adapted from [Forma Protocol](file:///X:/Forma/00_forma/docs/protocol/) v1.4 · domain-specific content is claude-lb's own.
+> CLI shape adapted from [Forma Protocol](file:///X:/Forma/00_forma/docs/protocol/) v1.4 · domain-specific content is roost's own.
 
 ---
 
@@ -23,7 +23,7 @@
 | 12 | [Project Structure](#12-project-structure) |
 | 13 | [Compliance Checklist](#13-compliance-checklist) |
 
-Sections **6–9 are the core of claude-lb**. Everything else is boilerplate Forma-protocol compliance.
+Sections **6–9 are the core of roost**. Everything else is boilerplate Forma-protocol compliance.
 
 ---
 
@@ -54,7 +54,7 @@ Built as a Forma CLI — agentic-first, composable, parseable, quiet-by-default.
 ### Structural pattern (Forma §2)
 
 ```
-claude-lb [global-opts] <resource> <action> [opts]
+roost [global-opts] <resource> <action> [opts]
 ```
 
 Single resource: `profiles`. For convenience, top-level aliases collapse the resource word.
@@ -63,24 +63,24 @@ Single resource: `profiles`. For convenience, top-level aliases collapse the res
 
 | Command | Alias | Description |
 |---|---|---|
-| `claude-lb profiles list` | `claude-lb list` | List discovered profiles (no probe) |
-| `claude-lb profiles status` | `claude-lb status` | Show cached health + usage per profile |
-| `claude-lb profiles show <name>` | `claude-lb show <name>` | One profile's full health detail |
-| `claude-lb profiles probe [<name>]` | `claude-lb probe` | Live-probe (all or one); update cache |
-| `claude-lb profiles pick [--strategy <s>]` | `claude-lb pick` | Return the best healthy profile name |
-| `claude-lb profiles invalidate <name>` | `claude-lb invalidate <name>` | Drop cache for a profile; forces re-probe |
-| `claude-lb profiles refresh [<name>\|--all\|--expired]` | `claude-lb refresh ...` | Refresh OAuth tokens (§10) |
-| `claude-lb exec <cmd...>` | — | Pick a profile, run a child command with `AXIOM_CLAUDE_PROFILE` set; propagate child rc |
-| `claude-lb doctor` | — | Diagnose local setup (§11) |
-| `claude-lb update [--apply]` | — | Check or apply an in-place upgrade |
-| `claude-lb --version` | — | Print semver, exit 0 |
-| `claude-lb --help` | — | Show help, exit 0 |
+| `roost profiles list` | `roost list` | List discovered profiles (no probe) |
+| `roost profiles status` | `roost status` | Show cached health + usage per profile |
+| `roost profiles show <name>` | `roost show <name>` | One profile's full health detail |
+| `roost profiles probe [<name>]` | `roost probe` | Live-probe (all or one); update cache |
+| `roost profiles pick [--strategy <s>]` | `roost pick` | Return the best healthy profile name |
+| `roost profiles invalidate <name>` | `roost invalidate <name>` | Drop cache for a profile; forces re-probe |
+| `roost profiles refresh [<name>\|--all\|--expired]` | `roost refresh ...` | Refresh OAuth tokens (§10) |
+| `roost exec <cmd...>` | — | Pick a profile, run a child command with `AXIOM_CLAUDE_PROFILE` set; propagate child rc |
+| `roost doctor` | — | Diagnose local setup (§11) |
+| `roost update [--apply]` | — | Check or apply an in-place upgrade |
+| `roost --version` | — | Print semver, exit 0 |
+| `roost --help` | — | Show help, exit 0 |
 
 ### Naming conventions (Forma §2)
 
 | Element | Convention |
 |---|---|
-| Tool name | `claude-lb` (lowercase, 9 chars, one hyphen — kept under 12 per Forma) |
+| Tool name | `roost` (lowercase, 9 chars, one hyphen — kept under 12 per Forma) |
 | Resource | `profiles` (plural noun) |
 | Actions | lowercase verbs (`list`, `probe`, `pick`) |
 | Long flags | kebab-case (`--strategy`, `--no-cache`, `--json`) |
@@ -164,7 +164,7 @@ account-a
 AXIOM_CLAUDE_PROFILE=account-a
 ```
 
-Shell-sourceable via `eval $(claude-lb pick --export)`. No quoting — profile names are guaranteed `[a-zA-Z0-9_-]+` (same constraint as directory names under `~/.claude-profiles/`).
+Shell-sourceable via `eval $(roost pick --export)`. No quoting — profile names are guaranteed `[a-zA-Z0-9_-]+` (same constraint as directory names under `~/.claude-profiles/`).
 
 ### `profiles pick --json`
 
@@ -212,7 +212,7 @@ Standard Forma (§5) mapping:
 ### Scripting example
 
 ```bash
-profile=$(claude-lb pick 2>/dev/null)
+profile=$(roost pick 2>/dev/null)
 case $? in
   0) export AXIOM_CLAUDE_PROFILE="$profile" ;;
   5) echo "no ok profiles; sleeping 60s then retrying with rate-limited allowed" >&2; sleep 60 ;;
@@ -313,7 +313,7 @@ Authorization: Bearer <oauth-access-token>
 anthropic-version: 2023-06-01
 anthropic-beta: oauth-2025-04-20
 Accept: application/json
-User-Agent: claude-lb/<version>
+User-Agent: roost/<version>
 ```
 
 The OAuth access token is read from `~/.claude-profiles/<name>/.credentials.json` (see §10).
@@ -355,7 +355,7 @@ One probe per profile per invocation unless `--all` is used with `invalidate`. C
 | Linux / macOS | `~/.config/claude-lb/health.json` |
 | Windows | `%APPDATA%\claude-lb\health.json` |
 
-XDG override respected: `$XDG_CONFIG_HOME/claude-lb/health.json`.
+XDG override respected: `$XDG_CONFIG_HOME/roost/health.json`.
 
 ### Schema
 
@@ -392,7 +392,7 @@ XDG override respected: `$XDG_CONFIG_HOME/claude-lb/health.json`.
 
 A cached entry is **fresh** iff `probed_at <= now() <= expires_at`. Past `expires_at`, the entry is re-probed on next `status`/`pick` call (unless `--no-cache` forces all-probe).
 
-`auth_dead` entries have `expires_at: null` — they never expire until manually invalidated via `claude-lb invalidate <name>` or until the profile's `.credentials.json` mtime changes (treat mtime bump as implicit invalidation).
+`auth_dead` entries have `expires_at: null` — they never expire until manually invalidated via `roost invalidate <name>` or until the profile's `.credentials.json` mtime changes (treat mtime bump as implicit invalidation).
 
 ### Concurrency
 
@@ -430,9 +430,9 @@ Cache writes use **atomic write-rename** (`tempfile` in same dir + `os.replace`)
 **Configuration:**
 
 ```bash
-claude-lb pick --stickiness 300       # Stick for 5 min (default)
-claude-lb pick --stickiness 0         # Disable stickiness entirely
-claude-lb pick --strategy round-robin # Load-spread explicitly (ignores stickiness)
+roost pick --stickiness 300       # Stick for 5 min (default)
+roost pick --stickiness 0         # Disable stickiness entirely
+roost pick --strategy round-robin # Load-spread explicitly (ignores stickiness)
 ```
 
 **Algorithm:**
@@ -490,8 +490,8 @@ silently (they need `claude login`, not `refresh`). Collapses the
 |---|---|---|
 | All `auth_dead` | 2 | `No authenticated profiles. Run: claude login --profile <name>` |
 | All `weekly_limit` | 9 | `All profiles weekly-exhausted. Earliest reset: <timestamp>` |
-| All in any terminal-bad state | 9 | `No profiles available. Run: claude-lb status` |
-| `--require=ok` with no `ok` | 5 | `No profiles currently ok. Run: claude-lb probe` |
+| All in any terminal-bad state | 9 | `No profiles available. Run: roost status` |
+| `--require=ok` with no `ok` | 5 | `No profiles currently ok. Run: roost probe` |
 | Some `rate_limited` / `session_limit` still within their TTL | 6 | `All profiles throttled. Earliest retry: <timestamp>` |
 
 ### Pick log (audit trail)
@@ -548,7 +548,7 @@ Max plan OAuth access tokens live ~5 hours. When `.claudeAiOauth.expiresAt` is p
 
 **Local detection (no network):** `discovery.py` records `access_token_expires_at` and `refresh_token_present` on every `Profile`. `probe.py` short-circuits to `AUTH_EXPIRED` (health state) when the stored token is already past its expiry — no round-trip needed.
 
-**Explicit refresh:** `claude-lb refresh <name> | --all | --expired` POSTs to `https://api.anthropic.com/v1/oauth/token`:
+**Explicit refresh:** `roost refresh <name> | --all | --expired` POSTs to `https://api.anthropic.com/v1/oauth/token`:
 
 ```http
 POST /v1/oauth/token HTTP/1.1
@@ -578,7 +578,7 @@ On success, `.credentials.json` is atomically rewritten (tempfile + `os.replace`
 
 **Out of scope:**
 - Auto-refresh on probe (deferred to v0.4+ — requires cross-process locking to avoid two parallel `pick` invocations both consuming the same refresh token).
-- Browser-based OAuth flow. `claude-lb` cannot create a profile from scratch; use `claude login --profile <name>` for that.
+- Browser-based OAuth flow. `roost` cannot create a profile from scratch; use `claude login --profile <name>` for that.
 
 ### Never touch
 
@@ -594,7 +594,7 @@ On success, `.credentials.json` is atomically rewritten (tempfile + `os.replace`
 ### `pick --export`
 
 ```bash
-$ claude-lb pick --export
+$ roost pick --export
 AXIOM_CLAUDE_PROFILE=account-a
 ```
 
@@ -606,7 +606,7 @@ Output format:
 Usage:
 
 ```bash
-eval $(claude-lb pick --export)
+eval $(roost pick --export)
 # $AXIOM_CLAUDE_PROFILE is now set in current shell
 ```
 
@@ -625,7 +625,7 @@ See §4. Every exit code mapped to a concrete operator / retry action.
 Standard Forma §16 layout, Python + `uv`:
 
 ```
-claude-lb/
+roost/
 ├── README.md                     # This file
 ├── SPEC.md                       # This spec
 ├── HANDOFF.md                    # For the build agent
@@ -658,7 +658,7 @@ claude-lb/
 
 ```toml
 [project]
-name = "claude-lb"
+name = "roost"
 version = "0.1.0"
 description = "Claude Code profile health + load balancer"
 readme = "README.md"
@@ -679,7 +679,7 @@ dev = [
 ]
 
 [project.scripts]
-claude-lb = "claude_lb.cli:app"
+roost = "claude_lb.cli:app"
 
 [build-system]
 requires = ["hatchling"]
@@ -714,7 +714,7 @@ asyncio_mode = "auto"
 uv tool install --editable .
 
 # Then anywhere:
-claude-lb status
+roost status
 ```
 
 ---
@@ -723,10 +723,10 @@ claude-lb status
 
 ### Minimum viable
 
-- [ ] `claude-lb profiles list` works
-- [ ] `claude-lb profiles probe` live-probes all discovered profiles
-- [ ] `claude-lb profiles status` renders cached health in a rich table (stderr) + JSON summary (stdout)
-- [ ] `claude-lb profiles pick` returns exactly one healthy profile name on stdout, exit 0
+- [ ] `roost profiles list` works
+- [ ] `roost profiles probe` live-probes all discovered profiles
+- [ ] `roost profiles status` renders cached health in a rich table (stderr) + JSON summary (stdout)
+- [ ] `roost profiles pick` returns exactly one healthy profile name on stdout, exit 0
 - [ ] All §6 seven states classified correctly from real Anthropic response fixtures
 - [ ] `--json` works on every command
 - [ ] Semantic exit codes (§4)
@@ -750,7 +750,7 @@ claude-lb status
 
 - [ ] Token refresh when Claude Code CLI's own refresh mechanism is documented (borrow from [teamclaude](https://github.com/KarpelesLab/teamclaude))
 - [ ] Shell completion installer
-- [ ] `claude-lb doctor` — diagnose "why is profile X not picked?" with rationale trace
+- [ ] `roost doctor` — diagnose "why is profile X not picked?" with rationale trace
 - [ ] Optional Anthropic usage API integration (if/when endpoint available publicly)
 
 ---

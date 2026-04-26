@@ -1,4 +1,4 @@
-# claude-lb
+# roost
 
 [![Forma](https://img.shields.io/badge/forma-experimental-orange.svg)](https://github.com/forma-tools/forma)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -16,13 +16,13 @@ that picks the right one at dispatch time. Spawning against an expired,
 dead, or quota-exhausted profile burns attempts on 401s and rate-limit
 retries.
 
-`claude-lb` is a **stateless one-shot CLI primitive** that answers
+`roost` is a **stateless one-shot CLI primitive** that answers
 "which of my profiles is healthy right now?" as an exit-code-friendly
 scripting call, reading utilization numbers straight from Anthropic's
 OAuth usage endpoint.
 
 ```bash
-AXIOM_CLAUDE_PROFILE=$(claude-lb pick) my-script ...
+AXIOM_CLAUDE_PROFILE=$(roost pick) my-script ...
 ```
 
 It works with any Claude Code OAuth account (Max / Pro / Team). On Max
@@ -35,34 +35,34 @@ states) but `usage` data is null.
 Not on PyPI. Install from a local clone:
 
 ```bash
-git clone https://github.com/0xDarkMatter/claude-lb.git
-cd claude-lb
+git clone https://github.com/0xDarkMatter/roost.git
+cd roost
 uv tool install --editable .
 
-claude-lb --version    # → claude-lb 0.8.0
+roost --version    # → roost 0.8.0
 ```
 
 To upgrade later, pull + reinstall:
 
 ```bash
-git -C claude-lb pull && uv tool install --reinstall --editable claude-lb
+git -C roost pull && uv tool install --reinstall --editable roost
 ```
 
-Or use the built-in `claude-lb update --apply` on POSIX (Windows has a
+Or use the built-in `roost update --apply` on POSIX (Windows has a
 [self-upgrade caveat](#diagnostics)).
 
 **Why `--editable`?** It links the install to your clone, so `git pull`
 picks up new code without reinstalling. The downside: deps added in a new
 release require a re-sync (`uv tool install --reinstall --editable .` from
-the clone), which `claude-lb update --apply` handles automatically.
+the clone), which `roost update --apply` handles automatically.
 
 ## Setup
 
-`claude-lb` needs more than one OAuth profile on disk to balance between
+`roost` needs more than one OAuth profile on disk to balance between
 them. The standard `claude` CLI writes a single profile to
-`~/.claude/.credentials.json`. `claude-lb add` imports that file into a
+`~/.claude/.credentials.json`. `roost add` imports that file into a
 multi-profile layout under `~/.claude-profiles/<name>/.credentials.json`,
-which is what `claude-lb` discovers and rotates between.
+which is what `roost` discovers and rotates between.
 
 Typical onboarding:
 
@@ -71,30 +71,30 @@ Typical onboarding:
 claude login
 
 # 2. Import that credentials file as a named profile
-claude-lb add personal
+roost add personal
 
 # 3. Sign in to a different account (overwrites ~/.claude/.credentials.json)
 claude logout && claude login
 
 # 4. Import the new state as another named profile
-claude-lb add work
+roost add work
 
 # 5. Confirm both are visible and ready
-claude-lb status
+roost status
 ```
 
-`claude-lb add` copies (doesn't move) the source file, so the standard
+`roost add` copies (doesn't move) the source file, so the standard
 `claude` command continues to work against whichever account you most
 recently logged into.
 
-**Want one command per profile?** Wrap it in a shell function — claude-lb
+**Want one command per profile?** Wrap it in a shell function — roost
 deliberately doesn't ship its own browser-login orchestration (the
 `claude` CLI owns that):
 
 ```bash
 add_profile() {
   claude logout 2>/dev/null
-  claude login && claude-lb add "$1"
+  claude login && roost add "$1"
 }
 
 add_profile personal
@@ -111,12 +111,12 @@ add_profile work
 ## Quick Start
 
 ```bash
-claude-lb probe                          # Live-probe all profiles
-claude-lb status                         # Cached health table
-claude-lb pick                           # → personal  (one profile name, exit 0)
-claude-lb refresh --expired              # Refresh any profile whose token expired
-eval "$(claude-lb pick --export)"        # AXIOM_CLAUDE_PROFILE=personal in shell
-claude-lb status --json | jq '.meta'     # Machine-readable summary
+roost probe                          # Live-probe all profiles
+roost status                         # Cached health table
+roost pick                           # → personal  (one profile name, exit 0)
+roost refresh --expired              # Refresh any profile whose token expired
+eval "$(roost pick --export)"        # AXIOM_CLAUDE_PROFILE=personal in shell
+roost status --json | jq '.meta'     # Machine-readable summary
 ```
 
 ## Commands
@@ -124,36 +124,36 @@ claude-lb status --json | jq '.meta'     # Machine-readable summary
 ### Discovery
 
 ```bash
-claude-lb list                           # Names of discovered profiles
-claude-lb list --json                    # {data: [...], meta: {count}}
+roost list                           # Names of discovered profiles
+roost list --json                    # {data: [...], meta: {count}}
 ```
 
 ### Health
 
 ```bash
-claude-lb probe                          # Live-probe all (concurrent)
-claude-lb probe account-a                   # Live-probe one
-claude-lb status                         # Cached table + Anthropic platform-status header (stderr) + summary (stdout)
-claude-lb status --no-cache              # Ignore cache; full re-probe (incl. status.claude.com)
-claude-lb status --no-platform-status    # Skip the status.claude.com fetch
-claude-lb show account-a                    # Detail for one profile
-claude-lb invalidate account-a              # Drop this profile's cache entry
+roost probe                          # Live-probe all (concurrent)
+roost probe account-a                   # Live-probe one
+roost status                         # Cached table + Anthropic platform-status header (stderr) + summary (stdout)
+roost status --no-cache              # Ignore cache; full re-probe (incl. status.claude.com)
+roost status --no-platform-status    # Skip the status.claude.com fetch
+roost show account-a                    # Detail for one profile
+roost invalidate account-a              # Drop this profile's cache entry
 ```
 
 ### Picking
 
 ```bash
-claude-lb pick                           # Default: sticky (cache-locality)
-claude-lb pick --strategy least-used     # Lowest weekly % wins
-claude-lb pick --strategy round-robin    # Rotate through profiles
-claude-lb pick --strategy weighted       # Combine weekly + session usage
-claude-lb pick --require-ok              # Exit 5 if none are ok
-claude-lb pick --export                  # Shell-sourceable VAR=value
-claude-lb pick --json                    # {data: {name, health, rationale}}
-claude-lb pick --warn-at 80              # Stderr warning when session/weekly ≥80%
-claude-lb pick --auto-refresh            # Refresh auth_expired profiles inline, then pick
-claude-lb pick --count 3                 # Return up to 3 profiles (newline-separated)
-claude-lb pick -n 3 --strategy least-used  # Short form; lowest-3 weekly%
+roost pick                           # Default: sticky (cache-locality)
+roost pick --strategy least-used     # Lowest weekly % wins
+roost pick --strategy round-robin    # Rotate through profiles
+roost pick --strategy weighted       # Combine weekly + session usage
+roost pick --require-ok              # Exit 5 if none are ok
+roost pick --export                  # Shell-sourceable VAR=value
+roost pick --json                    # {data: {name, health, rationale}}
+roost pick --warn-at 80              # Stderr warning when session/weekly ≥80%
+roost pick --auto-refresh            # Refresh auth_expired profiles inline, then pick
+roost pick --count 3                 # Return up to 3 profiles (newline-separated)
+roost pick -n 3 --strategy least-used  # Short form; lowest-3 weekly%
 ```
 
 `--auto-refresh` folds the `refresh --expired` preflight into `pick` itself:
@@ -170,18 +170,18 @@ multiple names programmatically. The JSON shape flips to an array when
 `N > 1`:
 
 ```bash
-claude-lb pick --count 3 --json
+roost pick --count 3 --json
 # {"data": [{...}, {...}, {...}], "meta": {"count": 3, "requested": 3, ...}}
 ```
 
 ### Refresh
 
 ```bash
-claude-lb refresh account-a                 # Refresh one profile's OAuth token
-claude-lb refresh --all                  # Refresh every discovered profile
-claude-lb refresh --expired              # Refresh only past-expiry profiles
-claude-lb refresh --soon 30m             # Refresh anything expiring within 30 min
-claude-lb refresh --soon 1h --json       # Cron-friendly: */15 * * * * <-- this
+roost refresh account-a                 # Refresh one profile's OAuth token
+roost refresh --all                  # Refresh every discovered profile
+roost refresh --expired              # Refresh only past-expiry profiles
+roost refresh --soon 30m             # Refresh anything expiring within 30 min
+roost refresh --soon 1h --json       # Cron-friendly: */15 * * * * <-- this
 ```
 
 `--soon DURATION` is anticipatory: it covers already-expired tokens AND tokens
@@ -192,24 +192,24 @@ that implies).
 `refresh` POSTs the stored refresh token to Anthropic's OAuth endpoint,
 atomically rewrites `.credentials.json` (preserving non-oauth fields), and
 invalidates the health cache. A cron hook like
-`0 * * * * claude-lb refresh --expired --json` keeps the fleet warm.
+`0 * * * * roost refresh --expired --json` keeps the fleet warm.
 
 ### Running commands
 
 ```bash
 # The composed idiom: pick + refresh + dispatch in one call.
-claude-lb exec --auto-refresh -- claude --dangerously-skip-permissions "write fn"
+roost exec --auto-refresh -- claude --dangerously-skip-permissions "write fn"
 
 # With explicit strategy, timeout, and retry-on-rate-limit:
-claude-lb exec --strategy least-used --timeout 300 --retry-on-429 1 -- claude ...
+roost exec --strategy least-used --timeout 300 --retry-on-429 1 -- claude ...
 
 # Dry-run: show what would execute without talking to the API
-claude-lb exec --dry-run -- claude --help
+roost exec --dry-run -- claude --help
 # → AXIOM_CLAUDE_PROFILE=account-a claude --help
 ```
 
-`claude-lb exec` picks a profile, sets `AXIOM_CLAUDE_PROFILE=<name>` in the
-child's env, and execs the command. The child's exit code becomes claude-lb's
+`roost exec` picks a profile, sets `AXIOM_CLAUDE_PROFILE=<name>` in the
+child's env, and execs the command. The child's exit code becomes roost's
 exit code, so scripts can treat `exec` as a transparent wrapper. stdin/stdout/
 stderr are inherited (interactive children work unchanged). Every run is
 audited to `picks.log` with duration + rc.
@@ -228,7 +228,7 @@ Key flags:
 
 ```bash
 # If `exec` doesn't fit, drop to pick + eval yourself:
-profile=$(claude-lb pick --auto-refresh 2>/dev/null)
+profile=$(roost pick --auto-refresh 2>/dev/null)
 case $? in
   0) export AXIOM_CLAUDE_PROFILE="$profile" ;;
   2) echo "All profiles dead or expired: run claude login --profile <name>" ;;
@@ -238,7 +238,7 @@ case $? in
 esac
 
 # Parallel dispatch to N accounts via --count
-for profile in $(claude-lb pick --count 3 --strategy least-used); do
+for profile in $(roost pick --count 3 --strategy least-used); do
     AXIOM_CLAUDE_PROFILE=$profile axiom launch-parcel &
 done
 wait
@@ -247,11 +247,11 @@ wait
 ### History
 
 ```bash
-claude-lb history                        # Last 20 picks + exec runs
-claude-lb history --tail 50              # Last 50
-claude-lb history --profile account-a       # Filter to one profile
-claude-lb history --since 1h             # Last hour ('30m', '1h', '2d', '1w', or seconds)
-claude-lb history --json                 # Structured output
+roost history                        # Last 20 picks + exec runs
+roost history --tail 50              # Last 50
+roost history --profile account-a       # Filter to one profile
+roost history --since 1h             # Last hour ('30m', '1h', '2d', '1w', or seconds)
+roost history --json                 # Structured output
 ```
 
 Reads `picks.log` (the audit trail every pick + exec writes to). Useful for
@@ -261,8 +261,8 @@ tab-separated file.
 ### Shell completion
 
 ```bash
-claude-lb --install-completion           # Install for your shell (bash/zsh/fish/pwsh)
-claude-lb --show-completion              # Print the script without installing
+roost --install-completion           # Install for your shell (bash/zsh/fish/pwsh)
+roost --show-completion              # Print the script without installing
 ```
 
 Once installed, `<TAB>` completes commands, flags, profile names (for `show`,
@@ -272,8 +272,8 @@ values (`sticky | least-used | round-robin | weighted | first-healthy`).
 ### Diagnostics
 
 ```bash
-claude-lb probe --raw                    # Dump untouched /api/oauth/usage body
-claude-lb probe --raw --json             # Machine-readable raw dump
+roost probe --raw                    # Dump untouched /api/oauth/usage body
+roost probe --raw --json             # Machine-readable raw dump
 ```
 
 `--raw` bypasses classification and the cache write; useful for inspecting
@@ -290,7 +290,7 @@ plus a local check of the stored token's `expiresAt`.
 | `rate_limited` | 429 on usage endpoint | `retry-after` s, else 60 s | Retry in N seconds |
 | `session_limit` | HTTP 200 with `five_hour.utilization >= 100` | until `five_hour.resets_at` | Skip until session reset |
 | `weekly_limit` | HTTP 200 with `seven_day.utilization >= 100` | until `seven_day.resets_at` | Skip until weekly reset |
-| `auth_expired` | Local: stored `expiresAt` is past (no network call) | invalidates on refresh | `claude-lb refresh <name>` |
+| `auth_expired` | Local: stored `expiresAt` is past (no network call) | invalidates on refresh | `roost refresh <name>` |
 | `auth_dead` | HTTP 401 on usage endpoint | manual | `claude login --profile <name>` |
 | `network_error` | timeout / DNS / TLS / refused | 30 s | Transient; retry |
 | `unknown` | other 4xx/5xx, malformed body | 60 s | Inspect with `show` |
@@ -315,7 +315,7 @@ Stickiness window: `--stickiness <s>` or `CLAUDE_LB_STICKINESS=<s>`. Set to `0` 
 |------|---------|
 | 0 | Success |
 | 1 | Unexpected error |
-| 2 | `AUTH_REQUIRED` — all profiles `auth_dead` or `auth_expired`; run `claude-lb refresh --expired` or `claude login` |
+| 2 | `AUTH_REQUIRED` — all profiles `auth_dead` or `auth_expired`; run `roost refresh --expired` or `claude login` |
 | 3 | `NOT_FOUND` — unknown profile given to `show` / `probe` / `refresh` / `invalidate` |
 | 4 | `VALIDATION` — bad flag (e.g. unknown strategy, or `refresh` with no args) |
 | 5 | `FORBIDDEN` — `--require-ok` but no profile is `ok` |
@@ -336,21 +336,21 @@ Stickiness window: `--stickiness <s>` or `CLAUDE_LB_STICKINESS=<s>`. Set to `0` 
 ## Diagnostics
 
 ```bash
-claude-lb doctor                 # Check config dir, profiles, credentials, cache, network, status.claude.com
-claude-lb doctor --skip-network  # Offline variant (also skips status-page check)
-claude-lb doctor --json          # Machine-readable
+roost doctor                 # Check config dir, profiles, credentials, cache, network, status.claude.com
+roost doctor --skip-network  # Offline variant (also skips status-page check)
+roost doctor --json          # Machine-readable
 
-claude-lb update                 # Version + git-upstream ahead/behind check
-claude-lb update --json          # meta.update_available tells you if behind
-claude-lb update --apply         # git pull --ff-only + uv tool install --reinstall --editable
-claude-lb update --apply --no-pull  # Just re-sync deps (useful when a new dep was added locally)
+roost update                 # Version + git-upstream ahead/behind check
+roost update --json          # meta.update_available tells you if behind
+roost update --apply         # git pull --ff-only + uv tool install --reinstall --editable
+roost update --apply --no-pull  # Just re-sync deps (useful when a new dep was added locally)
 ```
 
-**Windows self-upgrade caveat:** on Windows, `claude-lb update --apply` can't
+**Windows self-upgrade caveat:** on Windows, `roost update --apply` can't
 reinstall itself while running — the current process has its own `.pyd` files
 memory-mapped, so `uv tool install --reinstall` hits `EACCES` on those files.
-claude-lb detects this and prints the exact workaround. Run the reinstall
-from a shell that isn't claude-lb (bash, cmd, or PowerShell):
+roost detects this and prints the exact workaround. Run the reinstall
+from a shell that isn't roost (bash, cmd, or PowerShell):
 
 ```bash
 uv tool install --reinstall --editable "X:/Forge/claude-lb"
@@ -372,19 +372,19 @@ POSIX platforms (macOS, Linux) are unaffected — inode-swap semantics let
 
 Cache writes are atomic (tempfile + `os.replace`). A credentials file's
 `mtime` change implicitly invalidates its cache entry — so `claude login` or
-`claude-lb refresh` automatically refreshes the classifier on the next probe.
+`roost refresh` automatically refreshes the classifier on the next probe.
 
 ## Requirements
 
 - Python 3.11+
 - One or more OAuth profiles under `~/.claude-profiles/<name>/.credentials.json`
-  — created via `claude-lb add <name>` (see [Setup](#setup) above)
+  — created via `roost add <name>` (see [Setup](#setup) above)
 - Outbound HTTPS access to `api.anthropic.com`
 
 ## Monthly Overage (Max-only)
 
 Anthropic Max plans support pay-as-you-go overage when the weekly window is
-exhausted. `claude-lb` surfaces it via `usage.extra` on every probe (Pro/Team
+exhausted. `roost` surfaces it via `usage.extra` on every probe (Pro/Team
 profiles return `usage: null` since they don't expose this surface):
 
 ```json
@@ -405,7 +405,7 @@ profile has overage enabled.
 > **Unit caveat:** `monthly_limit` and `used_credits` are integers from
 > Anthropic's API. The unit is undocumented. Empirically, the numbers only
 > make sense as **currency minor units (×100)** — so `monthly_limit: 31000`
-> with `currency: "AUD"` is **$310 AUD**, not $31,000 AUD. `claude-lb`
+> with `currency: "AUD"` is **$310 AUD**, not $31,000 AUD. `roost`
 > doesn't reinterpret these — it stores them raw and reports `utilization`
 > as a percentage, which is the only field guaranteed to mean the same thing
 > regardless of unit. If you need the displayed dollar amount, divide by 100
@@ -413,7 +413,7 @@ profile has overage enabled.
 
 ## Platform status (status.claude.com)
 
-`claude-lb status` consults Anthropic's public status page
+`roost status` consults Anthropic's public status page
 (`https://status.claude.com/api/v2/summary.json`) and renders a one-line
 header above the profile table whenever there's a non-resolved incident
 or a degraded component. When everything's operational the header is
@@ -464,17 +464,17 @@ anyway — going dark during an actual incident defeats the point.
 scripts that don't want any extra HTTP on the hot path). `--no-cache` /
 `--refresh` forces a fresh fetch alongside re-probing profiles.
 
-`claude-lb doctor` runs the same check as a WARN-level diagnostic — see
+`roost doctor` runs the same check as a WARN-level diagnostic — see
 [Diagnostics](#diagnostics).
 
 ## Recent updates
 
-[**Releases on GitHub**](https://github.com/0xDarkMatter/claude-lb/releases) ·
+[**Releases on GitHub**](https://github.com/0xDarkMatter/roost/releases) ·
 [Full CHANGELOG](CHANGELOG.md)
 
 ### v0.8.0 — platform-status awareness
 
-- **`claude-lb status` now surfaces Anthropic-side incidents** above the
+- **`roost status` now surfaces Anthropic-side incidents** above the
   profile table by polling `https://status.claude.com/api/v2/summary.json`
   (60s cache at `<config>/platform-status.json`, stale-fallback when the
   fetch fails). Catches the case where misbehaviour you'd otherwise blame
@@ -483,9 +483,9 @@ scripts that don't want any extra HTTP on the hot path). `--no-cache` /
   all clean. JSON envelope folds the data into `meta.platform_status`.
   Opt out per-call with `--no-platform-status`; `--no-cache` propagates
   through.
-- **`claude-lb doctor` adds a status.claude.com check** — same source,
+- **`roost doctor` adds a status.claude.com check** — same source,
   always-fresh (no cache), WARN-level. Designed to never fail the doctor
-  run since claude-lb can't *fix* an Anthropic-side incident; it just
+  run since roost can't *fix* an Anthropic-side incident; it just
   helps operators distinguish "my setup is broken" from "Anthropic is
   degraded right now". Skipped under `--skip-network`.
 - Doctor's stale-install check (`subcommand_imports`) now covers
@@ -494,7 +494,7 @@ scripts that don't want any extra HTTP on the hot path). `--no-cache` /
 
 ### v0.7.0 — onboarding helper
 
-- **`claude-lb add <name>`** — import an existing `.credentials.json` (default
+- **`roost add <name>`** — import an existing `.credentials.json` (default
   source: `~/.claude/.credentials.json`) into the multi-profile layout. Cuts
   onboarding from "manually copy files into a directory I haven't created"
   to one command.
@@ -504,23 +504,23 @@ scripts that don't want any extra HTTP on the hot path). `--no-cache` /
 
 ### v0.6.0 — operational polish
 
-- **Shell completion** (`claude-lb --install-completion`) — bash/zsh/fish/pwsh,
+- **Shell completion** (`roost --install-completion`) — bash/zsh/fish/pwsh,
   with profile-name + strategy completion.
-- **`claude-lb history`** — read the picks.log audit trail with `--profile`,
+- **`roost history`** — read the picks.log audit trail with `--profile`,
   `--since 30m`, `--tail N` filters.
 - **`refresh --soon DURATION`** — anticipatory refresh; cron-friendly
-  (`*/15 * * * * claude-lb refresh --soon 30m --json`).
+  (`*/15 * * * * roost refresh --soon 30m --json`).
 - **doctor refresh-token check** — warns on profiles missing a refreshToken
   (won't auto-heal at expiry).
 
 ### v0.5.0 — exec, auto-refresh, multi-pick
 
-- **`claude-lb exec <cmd...>`** — pick a profile, set `AXIOM_CLAUDE_PROFILE`,
+- **`roost exec <cmd...>`** — pick a profile, set `AXIOM_CLAUDE_PROFILE`,
   exec the command, propagate child rc. With `--auto-refresh` and
   `--retry-on-429`.
-- **`claude-lb pick --auto-refresh`** — inline-refresh expired tokens before
+- **`roost pick --auto-refresh`** — inline-refresh expired tokens before
   picking. Folds the two-step preflight into one call.
-- **`claude-lb pick --count N` (alias `-n N`)** — multi-pick for parallel
+- **`roost pick --count N` (alias `-n N`)** — multi-pick for parallel
   dispatch workflows.
 
 ## Non-goals
@@ -528,7 +528,7 @@ scripts that don't want any extra HTTP on the hot path). `--no-cache` /
 - **Not a proxy.** Doesn't sit in the request path. Use
   [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) if you want that.
 - **Not an interactive authenticator.** `claude login` creates the
-  underlying credentials; `claude-lb add` imports them, `claude-lb refresh`
+  underlying credentials; `roost add` imports them, `roost refresh`
   extends their lifetime — the browser-based OAuth flow itself is owned by
   the `claude` CLI.
 - **Not multi-provider.** Anthropic / Claude Code only.
