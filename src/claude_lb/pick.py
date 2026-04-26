@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -22,6 +24,40 @@ log = logging.getLogger(__name__)
 
 DEFAULT_STICKINESS_S = 300
 PICK_LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+
+# Atomic-replace retry budget. On Windows, os.replace fails with WinError 5
+# (Access is denied) when another process briefly holds the target open —
+# common when N parallel claude-lb invocations all write last-pick.json in
+# the same millisecond. Retry-with-jitter is the documented Windows pattern.
+_REPLACE_MAX_ATTEMPTS = 5
+_REPLACE_BASE_DELAY_S = 0.05
+_REPLACE_MAX_DELAY_S = 0.2
+
+
+def _atomic_replace_with_retry(tmp: str, target: Path | str) -> None:
+    """``os.replace(tmp, target)`` with exponential backoff + jitter.
+
+    On Windows, ``os.replace`` raises ``PermissionError`` (WinError 5) when
+    another process has the target file open — even briefly for read. Up
+    to ``_REPLACE_MAX_ATTEMPTS`` retries with jittered exponential backoff.
+    Re-raises the last exception on final failure so callers can decide
+    whether to swallow or propagate.
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(_REPLACE_MAX_ATTEMPTS):
+        try:
+            os.replace(tmp, target)
+            return
+        except (PermissionError, OSError) as exc:
+            last_exc = exc
+            if attempt == _REPLACE_MAX_ATTEMPTS - 1:
+                break
+            delay = random.uniform(_REPLACE_BASE_DELAY_S, _REPLACE_MAX_DELAY_S) * (
+                2 ** attempt
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 class Strategy(str, Enum):
@@ -131,7 +167,20 @@ def write_last_pick(name: str, path: Path | None = None) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(payload)
-        os.replace(tmp, target)
+        try:
+            _atomic_replace_with_retry(tmp, target)
+        except (PermissionError, OSError) as exc:
+            # last-pick.json is a stickiness hint, not load-bearing. After
+            # exhausting retries under heavy concurrency, log + swallow so
+            # the caller's child process still runs.
+            log.warning(
+                "write_last_pick: atomic replace failed after retries (%s); "
+                "skipping update", exc,
+            )
+            try:
+                os.unlink(tmp)
+            except OSError:  # pragma: no cover  -- cleanup-of-cleanup
+                pass
     except Exception:
         try:
             os.unlink(tmp)
@@ -175,7 +224,7 @@ def _rotate_pick_log_if_needed(path: Path) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.writelines(keep)
-        os.replace(tmp, path)
+        _atomic_replace_with_retry(tmp, path)
     except Exception:  # pragma: no cover  -- rotation failure shouldn't crash the pick path
         try:
             os.unlink(tmp)

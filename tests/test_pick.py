@@ -625,8 +625,10 @@ def test_pick_log_rotation_no_op_when_file_missing(tmp_path) -> None:
 def test_write_last_pick_unlinks_tempfile_on_failure(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If os.replace fails inside write_last_pick, the tempfile must be
-    cleaned up — otherwise stale .last-pick-*.json.tmp files accumulate."""
+    """If os.replace fails persistently inside write_last_pick, the tempfile
+    must be cleaned up — otherwise stale .last-pick-*.json.tmp files
+    accumulate. Persistent replace failures are now logged + swallowed
+    (last-pick.json is a stickiness hint, not load-bearing)."""
     import os as _os
 
     from claude_lb.pick import write_last_pick
@@ -637,12 +639,41 @@ def test_write_last_pick_unlinks_tempfile_on_failure(
     def boom_replace(*a, **kw):
         raise OSError("simulated")
 
+    # Skip retry sleeps so the test stays fast.
+    monkeypatch.setattr("claude_lb.pick.time.sleep", lambda _s: None)
     monkeypatch.setattr(_os, "replace", boom_replace)
-    with pytest.raises(OSError):
-        write_last_pick("account-a", path=target)
+    write_last_pick("account-a", path=target)  # no exception — swallowed
     monkeypatch.setattr(_os, "replace", real_replace)
     leftover = list(tmp_path.glob(".last-pick-*.json.tmp"))
     assert leftover == []
+    assert not target.exists()  # nothing was written
+
+
+def test_write_last_pick_retries_on_transient_permission_error(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows-style WinError 5 transient races should be absorbed by the
+    retry helper — first call fails, second succeeds, file is written."""
+    import os as _os
+
+    from claude_lb.pick import write_last_pick
+
+    target = tmp_path / "last-pick.json"
+    real_replace = _os.replace
+    call_count = {"n": 0}
+
+    def flaky_replace(src, dst, *a, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise PermissionError("[WinError 5] Access is denied")
+        return real_replace(src, dst, *a, **kw)
+
+    monkeypatch.setattr("claude_lb.pick.time.sleep", lambda _s: None)
+    monkeypatch.setattr(_os, "replace", flaky_replace)
+    write_last_pick("account-a", path=target)
+    assert call_count["n"] == 2
+    assert target.exists()
+    assert "account-a" in target.read_text()
 
 
 # ---------------------------------------------------------------------------
