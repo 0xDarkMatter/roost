@@ -13,41 +13,6 @@
 
 ![roost](docs/assets/hackathon.gif)
 
-## Architecture
-
-```mermaid
-flowchart LR
-    User(["user / script"])
-
-    subgraph Local["Local Disk"]
-        Profiles["~/.claude-profiles/\n‹name›/.credentials.json"]
-        CacheFile[("health.json\npicks.log\nlast-pick.json")]
-    end
-
-    subgraph Roost["roost"]
-        Discovery["discovery\nprofile enumeration"]
-        Probe["probe\nasync batch"]
-        Taxonomy["taxonomy\n8 health states"]
-        Pick["pick\nstrategy selection"]
-    end
-
-    subgraph Anthropic["Anthropic API"]
-        UsageEP["/api/oauth/usage"]
-        TokenEP["/v1/oauth/token"]
-    end
-
-    User -->|"roost pick · exec · probe"| Discovery
-    Discovery -->|reads| Profiles
-    Discovery -->|reads| CacheFile
-    Discovery --> Probe
-    Probe -->|GET bearer| UsageEP
-    Probe -->|POST refresh| TokenEP
-    Probe --> Taxonomy
-    Taxonomy -->|writes| CacheFile
-    Pick -->|reads| CacheFile
-    Pick -->|"AXIOM_CLAUDE_PROFILE=‹name›"| User
-```
-
 ## Why this exists
 
 If you run more than one Claude Code account — for redundancy, quota
