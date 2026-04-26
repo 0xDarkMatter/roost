@@ -1,19 +1,19 @@
-# HANDOFF: claude-lb v0.1 implementation
+# HANDOFF: roost v0.1 implementation
 
 **From:** Axiom building lane (0xDarkMatter)
 **Date:** 2026-04-24
 **Target:** Fresh headless or interactive agent
-**Scope:** Build `claude-lb` v0.1 from the spec at `SPEC.md`
+**Scope:** Build `roost` v0.1 from the spec at `SPEC.md`
 **Est effort:** 4–6h focused
 
 ---
 
 ## The ask
 
-Build the `claude-lb` CLI per [SPEC.md](SPEC.md). Deliver:
+Build the `roost` CLI per [SPEC.md](SPEC.md). Deliver:
 
 1. A pip/uv-installable Python package
-2. A `claude-lb` binary on `$PATH` after `uv tool install --editable .`
+2. A `roost` binary on `$PATH` after `uv tool install --editable .`
 3. All minimum-viable compliance items from SPEC §13 checked
 4. Green CI on Linux + macOS + Windows (3.11 / 3.12 / 3.13)
 5. A `CHANGELOG.md` documenting v0.1 features
@@ -25,7 +25,7 @@ Build the `claude-lb` CLI per [SPEC.md](SPEC.md). Deliver:
 
 The Axiom orchestrator daemon spawns parcel workers using OAuth profiles at `~/.claude-profiles/<name>/.credentials.json`. Right now it round-robins with no health check — spawning against a dead profile burns one of three attempts per parcel. The hackfix was to pin the rotation via `ops/axiom-daemon.ecosystem.config.js`, manually adding/removing profiles when they die or recover. That's fragile.
 
-`claude-lb pick` becomes the daemon's profile source. One call per spawn, exit code scripts the fallback. Any other Claude Code Max user with multiple profiles gets the same benefit.
+`roost pick` becomes the daemon's profile source. One call per spawn, exit code scripts the fallback. Any other Claude Code Max user with multiple profiles gets the same benefit.
 
 ---
 
@@ -40,11 +40,11 @@ Bootstrap:
 
 ```bash
 cd X:/Forge/claude-lb
-uv init --package --name claude-lb       # if not already done
+uv init --package --name roost       # if not already done
 uv add typer rich httpx pydantic
 uv add --dev pytest pytest-asyncio ruff mypy
 uv tool install --editable .
-claude-lb --version                      # should work
+roost --version                      # should work
 ```
 
 ---
@@ -65,7 +65,7 @@ Credentials discovery path on Windows: `C:\Users\<user>\.claude-profiles\<name>\
 
 ### 3. Cache concurrency
 
-Multiple `claude-lb pick` invocations can race — e.g. Axiom daemon spawning two parcels 100ms apart. Atomic write-rename (`tempfile.NamedTemporaryFile` + `os.replace`) is enough. No need for OS locks.
+Multiple `roost pick` invocations can race — e.g. Axiom daemon spawning two parcels 100ms apart. Atomic write-rename (`tempfile.NamedTemporaryFile` + `os.replace`) is enough. No need for OS locks.
 
 **Reads** don't need a lock; worst case a reader sees a slightly-stale entry and we re-probe.
 
@@ -102,7 +102,7 @@ Please document answers in SPEC.md or a new `docs/findings.md`:
 ## Out of scope for v0.1
 
 - HTTP proxying (SPEC §1 Non-goals)
-- Multi-provider (OpenAI, Gemini, etc.) — claude-lb is Anthropic-only
+- Multi-provider (OpenAI, Gemini, etc.) — roost is Anthropic-only
 - OAuth token refresh (defer to v0.2; borrow from teamclaude when we pick it up)
 - Usage API if it doesn't exist publicly — leave null
 - GUI / menu bar / system tray (vibeproxy's space)
@@ -113,9 +113,9 @@ Please document answers in SPEC.md or a new `docs/findings.md`:
 
 ## Success criteria
 
-1. `claude-lb pick` on this machine (3 profiles: account-a, account-b, account-c) returns a healthy profile name, exit 0, under 500ms (when cache warm) or under 10s (when probing)
-2. Running Axiom's `ops/axiom-daemon.ecosystem.config.js` replaced with `AXIOM_CLAUDE_PROFILE=$(claude-lb pick)` in a wrapper script, restarted via pm2, and the next parcel dispatch succeeds on the first attempt
-3. `claude-lb status --json | jq '.meta'` returns accurate counts matching each profile's actual state
+1. `roost pick` on this machine (3 profiles: account-a, account-b, account-c) returns a healthy profile name, exit 0, under 500ms (when cache warm) or under 10s (when probing)
+2. Running Axiom's `ops/axiom-daemon.ecosystem.config.js` replaced with `AXIOM_CLAUDE_PROFILE=$(roost pick)` in a wrapper script, restarted via pm2, and the next parcel dispatch succeeds on the first attempt
+3. `roost status --json | jq '.meta'` returns accurate counts matching each profile's actual state
 4. CI green on GitHub Actions across 9 matrix cells (3 OS × 3 Python)
 5. README documents the primitive's value clearly enough that a Claude Code user unfamiliar with Axiom understands why they'd use this
 
@@ -123,7 +123,7 @@ Please document answers in SPEC.md or a new `docs/findings.md`:
 
 ## What NOT to do
 
-- Don't add a `claude-lb daemon start` subcommand. We are not a daemon.
+- Don't add a `roost daemon start` subcommand. We are not a daemon.
 - Don't write a transparent proxy. CLIProxyAPI and TeamClaude already exist.
 - Don't widen scope to other providers. Claude Code Max specifically.
 - Don't put it under `src/axiom/`. This is a separate standalone project. If we wanted Axiom-coupling we'd have done that.
@@ -175,7 +175,7 @@ X:/Forge/claude-lb/
 
 Either:
 
-- **Option A** — Initialise this directory as its own git repo: `git -C X:/Forge/claude-lb init -b main`, publish to `github.com/0xDarkMatter/claude-lb` when done. **Recommended for v0.1.**
+- **Option A** — Initialise this directory as its own git repo: `git -C X:/Forge/claude-lb init -b main`, publish to `github.com/0xDarkMatter/roost` when done. **Recommended for v0.1.**
 - **Option B** — Commit inline as a sibling to Axiom (monorepo-ish) if that matches the operator's preference. Ask before assuming.
 
 ---
@@ -192,7 +192,7 @@ Either:
 Pigeon the Axiom building lane via:
 
 ```bash
-pigeon send 'Axiom' 'claude-lb: <your question>'
+pigeon send 'Axiom' 'roost: <your question>'
 ```
 
 Or leave a `BLOCKERS.md` at repo root. Don't guess on the taxonomy — that's the whole reason to build this.

@@ -82,7 +82,7 @@ into the `auth_dead` state is that the remediation is exactly this
 command. The implicit-invalidation mechanism (mtime-bump on the
 credentials file → cache entry invalidated) is independent of how the
 refresh actually works: as long as `claude login --profile` rewrites
-`.credentials.json`, the next `claude-lb probe` will re-classify.
+`.credentials.json`, the next `roost probe` will re-classify.
 
 **Code path:** `src/claude_lb/cache.py::is_entry_fresh()` compares
 `credentials_mtime` between the cached entry and the current file stat.
@@ -90,7 +90,7 @@ Covered by `test_mtime_change_invalidates_auth_dead`.
 
 **Action for v0.2:** end-to-end test on a live profile — deliberately
 corrupt one credential, observe `auth_dead`, run `claude login --profile`,
-confirm the next `claude-lb probe` returns to `ok`.
+confirm the next `roost probe` returns to `ok`.
 
 ---
 
@@ -141,7 +141,7 @@ Classifier correctly labels this as `auth_dead`, but the built-in
 remediation hint (`claude login --profile <name>`) is wrong: no amount
 of re-logging in will make OAuth tokens work on `/v1/models`.
 
-**Implication for the tool:** claude-lb v0.1 in its current form cannot
+**Implication for the tool:** roost v0.1 in its current form cannot
 actually distinguish healthy from unhealthy OAuth profiles, because the
 probe endpoint rejects every OAuth token unconditionally. The whole
 seven-state taxonomy works correctly for the responses the server
@@ -165,9 +165,9 @@ health.
    currently not supported"` so future shape changes don't silently
    break.
 
-**Workaround for today:** do not rely on `claude-lb` for health routing
+**Workaround for today:** do not rely on `roost` for health routing
 until the probe endpoint is fixed. Tools that need to pick a profile
-can still call `claude-lb list` (discovery works), `claude-lb pick`
+can still call `roost list` (discovery works), `roost pick`
 against an empty cache will return `unknown`-state entries in
 discovery order (first-healthy behaviour), and the rest of the
 plumbing (caching, stickiness, exit codes, JSON envelope) is

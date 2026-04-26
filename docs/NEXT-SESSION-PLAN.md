@@ -15,15 +15,15 @@ need is in this doc. Current state: v0.4.1 on main, commit `084b630`.
 
 ### The Axiom bug report (pigeon #47, resolved)
 
-Axiom reported `claude-lb refresh --expired` crashing with `ModuleNotFoundError: No module named 'filelock'` on their v0.3.0 install. Root cause: editable install drift — v0.4.0 added `filelock` dep + import, but `uv tool install --editable` done against v0.3.0 doesn't re-sync the tool venv when `pyproject.toml` gets new deps. Source changes are picked up live; dep changes are NOT.
+Axiom reported `roost refresh --expired` crashing with `ModuleNotFoundError: No module named 'filelock'` on their v0.3.0 install. Root cause: editable install drift — v0.4.0 added `filelock` dep + import, but `uv tool install --editable` done against v0.3.0 doesn't re-sync the tool venv when `pyproject.toml` gets new deps. Source changes are picked up live; dep changes are NOT.
 
 Three-part fix shipped as v0.4.1:
 
 1. **Lazy-import `filelock` inside `refresh_profile`** — catch `ImportError`, return `RefreshResult(error_code="MISSING_DEPENDENCY", error_message=<reinstall command>)`. Every other subcommand keeps working (graceful per-subcommand degradation).
-2. **`claude-lb doctor` runs a `subcommand_imports` check** — loads every `claude_lb.*` module, reports drift explicitly. Catches the failure *before* the user trips over it.
-3. **`claude-lb update --apply`** — actually runs `git pull --ff-only` + `uv tool install --reinstall --editable <dir>` now. Was status-only before. `--no-pull` flag skips git for dep-only refreshes.
+2. **`roost doctor` runs a `subcommand_imports` check** — loads every `claude_lb.*` module, reports drift explicitly. Catches the failure *before* the user trips over it.
+3. **`roost update --apply`** — actually runs `git pull --ff-only` + `uv tool install --reinstall --editable <dir>` now. Was status-only before. `--no-pull` flag skips git for dep-only refreshes.
 
-Dogfooded the fix by self-upgrading with `claude-lb update --apply --no-pull`. Axiom notified via pigeon reply.
+Dogfooded the fix by self-upgrading with `roost update --apply --no-pull`. Axiom notified via pigeon reply.
 
 ### Key session finding worth remembering
 
@@ -45,8 +45,8 @@ account-b is typically running the hottest; account-a has the most headroom. acc
 
 For the next "what could we add?" conversation:
 
-- **`claude-lb watch`** — live-updating status table (TUI), Rich-based, ~30 lines
-- **`~/.config/claude-lb/usage-log.ndjson` + `claude-lb history`** — append-on-probe, enables burn-rate projection and monthly reports
+- **`roost watch`** — live-updating status table (TUI), Rich-based, ~30 lines
+- **`~/.config/claude-lb/usage-log.ndjson` + `roost history`** — append-on-probe, enables burn-rate projection and monthly reports
 - **`refresh --soon 30m`** — anticipatory refresh for tokens expiring within N
 - **`pick --max-cost <amount>`** — skip profiles near monthly overage cap (we have the data)
 - **`pick --format path|token`** — return creds dir or raw token instead of name
@@ -59,7 +59,7 @@ Skipped (feature creep / premature): MCP server, PyPI publish, profile groups/ta
 ## North-star idiom (v0.5.0 target)
 
 ```bash
-claude-lb exec --count 4 --auto-refresh --strategy least-used \
+roost exec --count 4 --auto-refresh --strategy least-used \
   -- axiom launch-parcel "$@"
 ```
 
@@ -77,12 +77,12 @@ Budget: 90m for auto-refresh + tests, 60m for count + tests, 120m for exec + tes
 
 ---
 
-## Feature 1: `claude-lb pick --auto-refresh`
+## Feature 1: `roost pick --auto-refresh`
 
 ### Contract
 
 ```bash
-claude-lb pick --auto-refresh
+roost pick --auto-refresh
 # stdout: single profile name, newline-terminated (unchanged)
 # exit 0 on success
 # exit 2 if auto-refresh fails AND no other healthy profile exists
@@ -168,12 +168,12 @@ def _attempt_auto_refresh(
 
 ---
 
-## Feature 2: `claude-lb pick --count N`
+## Feature 2: `roost pick --count N`
 
 ### Contract
 
 ```bash
-claude-lb pick --count 3
+roost pick --count 3
 # stdout:
 # account-a
 # account-c
@@ -186,7 +186,7 @@ claude-lb pick --count 3
 JSON variant:
 
 ```bash
-claude-lb pick --count 3 --json
+roost pick --count 3 --json
 # { "data": [ { "name": ..., "health": ..., "rationale": ... }, ... ],
 #   "meta": { "count": 3, "requested": 3, "strategy": "least-used" } }
 ```
@@ -258,17 +258,17 @@ CLI layer emits `chosen_many` in order.
 
 ---
 
-## Feature 3: `claude-lb exec <command...>`
+## Feature 3: `roost exec <command...>`
 
 ### Contract
 
 ```bash
-claude-lb exec claude --dangerously-skip-permissions "write function"
+roost exec claude --dangerously-skip-permissions "write function"
 # → picks a profile
 # → sets AXIOM_CLAUDE_PROFILE (or custom via --var-name)
 # → execs the command
 # → on exit, logs { profile, argv0, duration, exit_code } to picks.log
-# → claude-lb's own exit code = child's exit code
+# → roost's own exit code = child's exit code
 ```
 
 Flags:
@@ -292,7 +292,7 @@ Everything after `--` is the command + args (standard convention). Without `--`,
 6. Measure wall-clock duration. Capture child rc.
 7. Append to picks.log: `{ts}\t{profile}\tEXEC\trc={rc}\tdur={ms}`.
 8. If rc is non-zero AND matches a rate-limit signal AND retry budget left: re-pick (excluding just-used profile), re-run once.
-9. Return child's final rc as claude-lb's exit code.
+9. Return child's final rc as roost's exit code.
 
 ### Rate-limit detection heuristic (tricky)
 
@@ -342,7 +342,7 @@ def exec_cmd(
     strategy: Annotated[str, typer.Option("--strategy")] = "sticky",
     ...,
 ) -> None:
-    command = ctx.args  # everything after `claude-lb exec`
+    command = ctx.args  # everything after `roost exec`
     if not command:
         stderr.print("[red]exec requires a command.[/red]")
         raise typer.Exit(EXIT_VALIDATION)
@@ -352,10 +352,10 @@ def exec_cmd(
 
 ### Tests to add
 
-- `test_exec_happy_path` — profile_factory, stub subprocess.run to return rc=0, assert claude-lb exits 0 and `var_name` ended up in child env.
+- `test_exec_happy_path` — profile_factory, stub subprocess.run to return rc=0, assert roost exits 0 and `var_name` ended up in child env.
 - `test_exec_no_healthy_profile_exits_9` — no profiles, assert exit 9.
 - `test_exec_dry_run_prints_without_running` — `--dry-run`, assert no subprocess call, stdout contains var assignment.
-- `test_exec_propagates_child_exit_code` — stub child rc=42, assert claude-lb exits 42.
+- `test_exec_propagates_child_exit_code` — stub child rc=42, assert roost exits 42.
 - `test_exec_retry_on_rate_limit` — first invocation re-probes profile as RATE_LIMITED, second picks different profile and succeeds. Assert picks.log has two entries with two different profiles.
 - `test_exec_timeout_kills_child` — stub child that sleeps > timeout, assert SIGTERM (or equivalent) and rc != 0.
 - `test_exec_logs_argv0_not_full_argv_by_default` — picks.log contains "claude" but NOT the secret-looking arg.
@@ -364,7 +364,7 @@ def exec_cmd(
 
 - Windows doesn't support `os.execvpe` cleanly; stick with subprocess.run.
 - stdin/stdout/stderr must be inherited (not captured) so the child can be interactive. `subprocess.run` with `stdin=None, stdout=None, stderr=None` does this.
-- Ctrl+C during child execution should forward to the child, not be swallowed by claude-lb. `subprocess.run` handles this on both platforms.
+- Ctrl+C during child execution should forward to the child, not be swallowed by roost. `subprocess.run` handles this on both platforms.
 - picks.log rotation happens inside `append_pick_log`; reuse it.
 
 ---
@@ -390,21 +390,21 @@ Single v0.5.0 entry covering all three features.
 ### AGENTS.md
 
 - Rule #14 update: for multi-pick + auto-refresh, the lock-race advice extends to concurrent auto-refreshes. Each profile's refresh still serializes via the per-profile file lock.
-- Add new rule: "`exec` forwards stdin/stdout/stderr to the child. Don't try to capture claude's output by redirecting claude-lb's stdout — redirect the child directly."
+- Add new rule: "`exec` forwards stdin/stdout/stderr to the child. Don't try to capture claude's output by redirecting roost's stdout — redirect the child directly."
 
 ### Axiom integration note
 
 Ping Axiom (pigeon) when `--auto-refresh` ships — their Conductor OAuth preflight can shrink from:
 
 ```
-claude-lb refresh --expired 2>/dev/null
-profile=$(claude-lb pick 2>/dev/null) || handle_failure $?
+roost refresh --expired 2>/dev/null
+profile=$(roost pick 2>/dev/null) || handle_failure $?
 ```
 
 to:
 
 ```
-profile=$(claude-lb pick --auto-refresh 2>/dev/null) || handle_failure $?
+profile=$(roost pick --auto-refresh 2>/dev/null) || handle_failure $?
 ```
 
 When `exec` ships, their whole spawn-worker wrapper reduces further.
