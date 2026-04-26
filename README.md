@@ -1,8 +1,4 @@
-# roost
-
-![roost](docs/assets/hackathon.gif)
-
-**Built for the Claude Opus 4.7 Hackathon.**
+![roost](docs/assets/roost-banner.png)
 
 [![Forma](https://img.shields.io/badge/forma-experimental-orange.svg)](https://github.com/forma-tools/forma)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -12,6 +8,10 @@
 ![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)
 
 > Pick the healthiest Claude Code OAuth profile — health taxonomy + load balancer for local OAuth profiles. Works with any plan (Max / Pro / Team), with richer usage data on Max.
+
+**Built for the Claude Opus 4.7 Hackathon.**
+
+![roost](docs/assets/hackathon.gif)
 
 ## Why this exists
 
