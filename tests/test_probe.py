@@ -374,3 +374,64 @@ async def test_probe_profile_short_circuits_on_locally_expired(
     result = await probe_profile(expired)
     assert result.health is Health.AUTH_EXPIRED
     assert route.call_count == 0  # network not touched
+
+
+# ---------------------------------------------------------------------------
+# Phase D — consecutive_failures lifecycle in probe_many
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_probe_many_increments_failures_on_network_error(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """A NETWORK_ERROR outcome should bump prev_failures by 1."""
+    profile = _profile("a")
+    respx_mock.get(API_URL).mock(side_effect=httpx.ConnectError("boom"))
+
+    results = await probe_many([profile], prev_failures={"a": 2})
+    assert results[0].health is Health.NETWORK_ERROR
+    assert results[0].consecutive_failures == 3
+
+
+@pytest.mark.asyncio
+async def test_probe_many_resets_failures_on_non_network_outcome(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """Any non-NETWORK_ERROR outcome should reset the counter to 0."""
+    profile = _profile("a")
+    respx_mock.get(API_URL).respond(200, json=_ok_body())
+
+    results = await probe_many([profile], prev_failures={"a": 5})
+    assert results[0].health is Health.OK
+    assert results[0].consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_probe_many_starts_at_one_when_no_prior_failures(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """A first-time NETWORK_ERROR with no prev_failures entry starts at 1."""
+    profile = _profile("a")
+    respx_mock.get(API_URL).mock(side_effect=httpx.ConnectError("boom"))
+
+    results = await probe_many([profile])
+    assert results[0].consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_probe_many_failures_independent_per_profile(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """Each profile's counter advances independently of its peers'."""
+    p1 = _profile("a")
+    p2 = _profile("b")
+    respx_mock.get(API_URL).mock(side_effect=httpx.ConnectError("boom"))
+
+    results = await probe_many(
+        [p1, p2],
+        prev_failures={"a": 0, "b": 4},
+    )
+    by_name = {r.name: r for r in results}
+    assert by_name["a"].consecutive_failures == 1
+    assert by_name["b"].consecutive_failures == 5

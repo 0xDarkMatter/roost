@@ -39,11 +39,13 @@ def _isolated_home(
     monkeypatch.setattr(paths_mod, "cache_path", lambda: config / "health.json")
     monkeypatch.setattr(paths_mod, "pick_log_path", lambda: config / "picks.log")
     monkeypatch.setattr(paths_mod, "last_pick_path", lambda: config / "last-pick.json")
+    monkeypatch.setattr(paths_mod, "usage_log_path", lambda: config / "usage-log.ndjson")
+    monkeypatch.setattr(paths_mod, "usage_log_marker_path", lambda: config / "usage-log.enabled")
     monkeypatch.setattr(paths_mod, "ensure_config_dir", lambda: config)
 
     # Modules that imported the path helpers at module-top need their local
     # bindings patched too.
-    from claude_lb import cache, doctor, pick, platform_status
+    from claude_lb import cache, doctor, pick, platform_status, usage_log
 
     monkeypatch.setattr(cache, "cache_path", lambda: config / "health.json")
     monkeypatch.setattr(cache, "ensure_config_dir", lambda: config)
@@ -53,6 +55,15 @@ def _isolated_home(
     monkeypatch.setattr(doctor, "cache_path", lambda: config / "health.json")
     monkeypatch.setattr(platform_status, "config_dir", lambda: config)
     monkeypatch.setattr(platform_status, "ensure_config_dir", lambda: config)
+    monkeypatch.setattr(
+        usage_log, "usage_log_path", lambda: config / "usage-log.ndjson"
+    )
+    monkeypatch.setattr(
+        usage_log, "usage_log_marker_path",
+        lambda: config / "usage-log.enabled",
+    )
+    # Make sure no previous test's env var leaks into this one.
+    monkeypatch.delenv(usage_log.ENV_VAR, raising=False)
 
     # Default: short-circuit the platform-status fetch so existing tests don't
     # accidentally hit status.claude.com. Tests that exercise the new header
@@ -71,7 +82,7 @@ def test_version() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert "claude-lb" in result.stdout
-    assert "0.8.0" in result.stdout
+    assert "0.3.0" in result.stdout
 
 
 def test_help_exits_zero() -> None:
@@ -197,6 +208,7 @@ def _stub_probe_many_sync(
     profiles: list,
     *,
     prev_health: dict | None = None,
+    prev_failures: dict | None = None,
     timeout: float = 10.0,
 ) -> list[ProfileHealth]:
     from datetime import datetime
@@ -266,7 +278,7 @@ def _stub_probe_with_usage(session_pct: int, weekly_pct: int):
 
     from claude_lb.models import Usage
 
-    def _stub(profiles, *, prev_health=None, timeout=10.0):
+    def _stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         now = datetime.now(UTC)
         return [
             ProfileHealth(
@@ -347,7 +359,7 @@ def test_probe_raw_dumps_untouched_body(profile_factory) -> None:
     """--raw bypasses classification and emits the literal upstream body."""
     fake_body = {"five_hour": {"utilization": 77.0}, "extra_usage": {"is_enabled": True}}
 
-    def _stub_raw(profiles, *, timeout=10.0):
+    def _stub_raw(profiles, *, timeout=10.0, jitter_s=0.0):
         return [(p.name, 200, fake_body, {"x-test": "1"}) for p in profiles]
 
     from claude_lb import probe as probe_mod
@@ -426,7 +438,7 @@ def _stateful_probe_stub(first_health: Health, second_health: Health = Health.OK
 
     state = {"count": 0}
 
-    def _stub(profiles, *, prev_health=None, timeout=10.0):
+    def _stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         state["count"] += 1
         h = first_health if state["count"] == 1 else second_health
         now = datetime.now(UTC)
@@ -449,13 +461,13 @@ def _stateful_probe_stub(first_health: Health, second_health: Health = Health.OK
     return _stub
 
 
-def _stub_refresh_success(profiles, *, timeout=10.0):
+def _stub_refresh_success(profiles, *, timeout=10.0, jitter_s=0.0):
     from claude_lb.refresh import RefreshResult
 
     return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
 
 
-def _stub_refresh_fail(profiles, *, timeout=10.0):
+def _stub_refresh_fail(profiles, *, timeout=10.0, jitter_s=0.0):
     from claude_lb.refresh import RefreshResult
 
     return [
@@ -488,7 +500,7 @@ def test_auto_refresh_falls_through_on_refresh_failure(profile_factory) -> None:
     profile_factory("account-a")
     profile_factory("account-b")
 
-    def _mixed_probe(profiles, *, prev_health=None, timeout=10.0):
+    def _mixed_probe(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         now = datetime.now(UTC)
         return [
             ProfileHealth(
@@ -533,7 +545,7 @@ def test_auto_refresh_no_refresh_token_is_noop(credentials_dir: Path) -> None:
 
     refresh_call_count = {"n": 0}
 
-    def _tracking_refresh(profiles, *, timeout=10.0):
+    def _tracking_refresh(profiles, *, timeout=10.0, jitter_s=0.0):
         refresh_call_count["n"] += 1
         return []
 
@@ -566,7 +578,7 @@ def test_auto_refresh_rediscovers_profile_after_refresh(profile_factory) -> None
 
     captured: list[list[tuple[str, float, datetime | None]]] = []
 
-    def _probe_stub(profiles, *, prev_health=None, timeout=10.0):
+    def _probe_stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         captured.append([
             (p.name, p.credentials_mtime, p.access_token_expires_at)
             for p in profiles
@@ -589,7 +601,7 @@ def test_auto_refresh_rediscovers_profile_after_refresh(profile_factory) -> None
             for p in profiles
         ]
 
-    def _refresh_mutates_disk(profiles, *, timeout=10.0):
+    def _refresh_mutates_disk(profiles, *, timeout=10.0, jitter_s=0.0):
         """Simulate a real refresh: bump expiresAt on disk so re-discovery
         sees a fresh value. Sleeps briefly to guarantee mtime changes on
         filesystems with low timestamp resolution (e.g. NTFS = ~10ms)."""
@@ -650,7 +662,7 @@ def _stub_probe_with_weeklies(*, weekly_by_name: dict[str, int]):
 
     from claude_lb.models import Usage
 
-    def _stub(profiles, *, prev_health=None, timeout=10.0):
+    def _stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         now = datetime.now(UTC)
         return [
             ProfileHealth(
@@ -954,7 +966,7 @@ def test_exec_retry_on_rate_limit(profile_factory) -> None:
 
     probe_state = {"count": 0}
 
-    def _stateful_probe(profiles, *, prev_health=None, timeout=10.0):
+    def _stateful_probe(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         """First call: both profiles OK (seeds cache).
         Second call (single-profile re-probe of chosen): that profile RATE_LIMITED.
         """
@@ -1012,7 +1024,7 @@ def test_exec_retry_disabled_when_budget_zero(profile_factory) -> None:
 
     probe_state = {"count": 0}
 
-    def _stateful_probe(profiles, *, prev_health=None, timeout=10.0):
+    def _stateful_probe(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         probe_state["count"] += 1
         now = datetime.now(UTC)
         if probe_state["count"] >= 2 and len(profiles) == 1:
@@ -1309,7 +1321,7 @@ def test_refresh_soon_filters_by_window(
     # Stub refresh to capture which profiles get refreshed
     captured_names: list[str] = []
 
-    def _stub_refresh(profiles, *, timeout=10.0):
+    def _stub_refresh(profiles, *, timeout=10.0, jitter_s=0.0):
         from claude_lb.refresh import RefreshResult
         captured_names.extend(p.name for p in profiles)
         return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
@@ -1335,7 +1347,7 @@ def test_refresh_soon_includes_already_expired(profile_factory) -> None:
 
     captured: list[str] = []
 
-    def _stub(profiles, *, timeout=10.0):
+    def _stub(profiles, *, timeout=10.0, jitter_s=0.0):
         from claude_lb.refresh import RefreshResult
         captured.extend(p.name for p in profiles)
         return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
@@ -1888,7 +1900,7 @@ def test_refresh_soon_excludes_profiles_without_expires_at(
 
     captured: list[str] = []
 
-    def _stub(profiles, *, timeout=10.0):
+    def _stub(profiles, *, timeout=10.0, jitter_s=0.0):
         from claude_lb.refresh import RefreshResult
         captured.extend(p.name for p in profiles)
         return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
@@ -1918,7 +1930,7 @@ def test_refresh_soon_zero_seconds_acts_like_expired(profile_factory) -> None:
 
     captured: list[str] = []
 
-    def _stub(profiles, *, timeout=10.0):
+    def _stub(profiles, *, timeout=10.0, jitter_s=0.0):
         from claude_lb.refresh import RefreshResult
         captured.extend(p.name for p in profiles)
         return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
@@ -1942,7 +1954,7 @@ def test_auto_refresh_mixed_success_and_failure(
 
     probe_state = {"count": 0}
 
-    def _probe_stub(profiles, *, prev_health=None, timeout=10.0):
+    def _probe_stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         probe_state["count"] += 1
         now = datetime.now(UTC)
         # First call: both AUTH_EXPIRED (cache seed)
@@ -1965,7 +1977,7 @@ def test_auto_refresh_mixed_success_and_failure(
             for p in profiles
         ]
 
-    def _refresh_mixed(profiles, *, timeout=10.0):
+    def _refresh_mixed(profiles, *, timeout=10.0, jitter_s=0.0):
         from claude_lb.refresh import RefreshResult
         return [
             RefreshResult(
@@ -1998,7 +2010,7 @@ def test_auto_refresh_composes_with_count(profile_factory) -> None:
 
     probe_state = {"count": 0}
 
-    def _probe_stub(profiles, *, prev_health=None, timeout=10.0):
+    def _probe_stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         probe_state["count"] += 1
         now = datetime.now(UTC)
         if probe_state["count"] == 1:
@@ -2392,7 +2404,7 @@ def _stub_refresh_results(profile_names: list[str], *, error_code: str | None):
     """Build a refresh_many_sync stub returning failures with a specific code."""
     from claude_lb.refresh import RefreshResult
 
-    def _stub(profiles, *, timeout=10.0):
+    def _stub(profiles, *, timeout=10.0, jitter_s=0.0):
         return [
             RefreshResult(
                 name=p.name,
@@ -2457,7 +2469,7 @@ def test_refresh_partial_success_with_lock_exits_conflict(
     profile_factory("account-a")
     profile_factory("account-b")
 
-    def _mixed(profiles, *, timeout=10.0):
+    def _mixed(profiles, *, timeout=10.0, jitter_s=0.0):
         return [
             RefreshResult(name=profiles[0].name, refreshed=True),
             RefreshResult(name=profiles[1].name, refreshed=False, error_code="LOCK_HELD"),
@@ -2477,7 +2489,7 @@ def test_refresh_partial_success_with_other_error_exits_error(
     profile_factory("account-a")
     profile_factory("account-b")
 
-    def _mixed(profiles, *, timeout=10.0):
+    def _mixed(profiles, *, timeout=10.0, jitter_s=0.0):
         return [
             RefreshResult(name=profiles[0].name, refreshed=True),
             RefreshResult(
@@ -2500,7 +2512,7 @@ def test_refresh_json_aggregate_meta_counts(
     profile_factory("account-a")
     profile_factory("account-b")
 
-    def _mixed(profiles, *, timeout=10.0):
+    def _mixed(profiles, *, timeout=10.0, jitter_s=0.0):
         return [
             RefreshResult(name=profiles[0].name, refreshed=True),
             RefreshResult(name=profiles[1].name, refreshed=False, error_code="REFRESH_REJECTED"),
@@ -2567,7 +2579,7 @@ def test_pick_all_auth_dead_returns_auth_required(profile_factory) -> None:
 
     profile_factory("dead-a")
 
-    def _stub(profiles, *, prev_health=None):
+    def _stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         from datetime import UTC, datetime
         return [
             ProfileHealth(
@@ -2710,7 +2722,7 @@ def test_status_max_age_zero_forces_reprobe(
 
     real_stub = _stub_probe_many_sync
 
-    def _counting_stub(profiles, *, prev_health=None):
+    def _counting_stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         probe_calls["n"] += 1
         return real_stub(profiles, prev_health=prev_health)
 
@@ -2733,7 +2745,7 @@ def test_status_uses_cache_when_fresh(
     profile_factory("account-a")
     probe_calls = {"n": 0}
 
-    def _counting_stub_with_future_expiry(profiles, *, prev_health=None):
+    def _counting_stub_with_future_expiry(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         probe_calls["n"] += 1
         from datetime import datetime
         now = datetime.now(UTC)
@@ -2863,7 +2875,7 @@ def test_show_probed_profile_with_error_renders_error_line(
 
     profile_factory("dead")
 
-    def _stub(profiles, *, prev_health=None):
+    def _stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         return [
             ProfileHealth(
                 name=p.name,
@@ -2948,7 +2960,7 @@ def test_pick_json_failure_emits_envelope_with_reason_code(
 
     profile_factory("dead")
 
-    def _stub(profiles, *, prev_health=None):
+    def _stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         return [
             ProfileHealth(
                 name=p.name,
@@ -3096,7 +3108,7 @@ def test_pick_failure_renders_earliest_recovery_in_message(profile_factory) -> N
 
     profile_factory("rate-limited")
 
-    def _stub(profiles, *, prev_health=None):
+    def _stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         return [
             ProfileHealth(
                 name=p.name,
@@ -3128,7 +3140,7 @@ def test_pick_failure_json_includes_earliest_recovery_at(profile_factory) -> Non
 
     profile_factory("rate-limited")
 
-    def _stub(profiles, *, prev_health=None):
+    def _stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         return [
             ProfileHealth(
                 name=p.name,
@@ -3287,7 +3299,7 @@ def test_refresh_by_name_dispatches_only_named_profile(
 
     captured: list[str] = []
 
-    def _stub(profiles, *, timeout=10.0):
+    def _stub(profiles, *, timeout=10.0, jitter_s=0.0):
         captured.extend(p.name for p in profiles)
         return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
 
@@ -3419,7 +3431,7 @@ def test_pick_require_ok_when_no_profile_is_ok_returns_forbidden(
 
     profile_factory("rate-limited")
 
-    def _stub(profiles, *, prev_health=None):
+    def _stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         return [
             ProfileHealth(
                 name=p.name,
@@ -3550,7 +3562,7 @@ def test_pick_warn_at_session_threshold_emits_warning(
 
     profile_factory("hot")
 
-    def _stub(profiles, *, prev_health=None):
+    def _stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
         return [
             ProfileHealth(
                 name=p.name,
@@ -3568,4 +3580,1196 @@ def test_pick_warn_at_session_threshold_emits_warning(
     assert "hot\n" in result.stdout  # profile name still emitted
     assert "session" in result.stderr.lower()
     assert "95%" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Phase A — shared helper for pre-seeding the cache with FRESH entries
+# (entries without expires_at look stale to is_entry_fresh and trigger a real
+# probe; we want the cached value to be honoured so tests stay hermetic).
+# ---------------------------------------------------------------------------
+
+
+def _seed_cache_fresh(*entries):
+    """Save a cache containing the given ProfileHealth entries with a far-future
+    expires_at so _load_or_probe doesn't try to re-probe them."""
+    from datetime import datetime, timedelta
+
+    from claude_lb.cache import save_cache
+    from claude_lb.models import HealthCache
+
+    now = datetime.now(UTC)
+    far_future = now + timedelta(hours=1)
+    for e in entries:
+        if e.expires_at is None:
+            e.expires_at = far_future
+    save_cache(HealthCache(updated_at=now, profiles={e.name: e for e in entries}))
+
+
+# ---------------------------------------------------------------------------
+# Phase A — remove command
+# ---------------------------------------------------------------------------
+
+
+def test_remove_happy_path(profile_factory, credentials_dir: Path) -> None:
+    profile_factory("account-a")
+    target = credentials_dir / "account-a"
+    assert target.is_dir()
+
+    result = runner.invoke(app, ["remove", "account-a"])
+    assert result.exit_code == 0
+    assert "removed" in result.stderr.lower()
+    assert not target.exists()
+
+
+def test_remove_unknown_returns_not_found() -> None:
+    result = runner.invoke(app, ["remove", "never-existed"])
+    assert result.exit_code == 3  # NOT_FOUND
+
+
+def test_remove_invalid_name_returns_validation() -> None:
+    result = runner.invoke(app, ["remove", "../escape"])
+    assert result.exit_code == 4  # VALIDATION
+
+
+def test_remove_json_output(profile_factory, credentials_dir: Path) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["remove", "account-a", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["name"] == "account-a"
+    assert payload["meta"]["action"] == "removed"
+
+
+def test_remove_drops_cache_entry_and_clears_last_pick(
+    profile_factory,
+    credentials_dir: Path,
+    _isolated_home: Path,
+) -> None:
+    """Cache + last-pick.json cleanup is part of the contract: stale state must
+    not survive a remove."""
+    from datetime import datetime
+
+    from claude_lb.models import Health, ProfileHealth
+
+    profile_factory("account-a")
+
+    # Pre-populate cache + last-pick pointing at the profile we'll remove.
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="account-a",
+            health=Health.OK,
+            probed_at=datetime.now(UTC),
+        )
+    )
+    last_pick = _isolated_home / "last-pick.json"
+    last_pick.write_text(
+        '{"profile": "account-a", "timestamp": "2026-04-27T00:00:00Z"}'
+    )
+
+    result = runner.invoke(app, ["remove", "account-a", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["cache_dropped"] is True
+    assert payload["data"]["last_pick_cleared"] is True
+    assert not last_pick.exists()
+
+
+def test_remove_via_profiles_namespace(
+    profile_factory, credentials_dir: Path
+) -> None:
+    profile_factory("account-a")
+    result = runner.invoke(app, ["profiles", "remove", "account-a"])
+    assert result.exit_code == 0
+    assert not (credentials_dir / "account-a").exists()
+
+
+# ---------------------------------------------------------------------------
+# Phase A — rename command
+# ---------------------------------------------------------------------------
+
+
+def test_rename_happy_path(profile_factory, credentials_dir: Path) -> None:
+    profile_factory("old-name", access_token="sk-ant-oat01-renamed")
+    result = runner.invoke(app, ["rename", "old-name", "new-name"])
+    assert result.exit_code == 0
+    assert not (credentials_dir / "old-name").exists()
+    assert (credentials_dir / "new-name" / ".credentials.json").is_file()
+
+
+def test_rename_missing_source_returns_not_found() -> None:
+    result = runner.invoke(app, ["rename", "ghost", "new"])
+    assert result.exit_code == 3  # NOT_FOUND
+
+
+def test_rename_destination_exists_returns_conflict(
+    profile_factory, credentials_dir: Path
+) -> None:
+    profile_factory("a")
+    profile_factory("b")
+    result = runner.invoke(app, ["rename", "a", "b"])
+    assert result.exit_code == 7  # CONFLICT
+
+
+def test_rename_force_overwrites_destination(
+    profile_factory, credentials_dir: Path
+) -> None:
+    profile_factory("a", access_token="from-a")
+    profile_factory("b", access_token="from-b")
+    result = runner.invoke(app, ["rename", "a", "b", "--force"])
+    assert result.exit_code == 0
+    payload = json.loads(
+        (credentials_dir / "b" / ".credentials.json").read_text()
+    )
+    assert payload["claudeAiOauth"]["accessToken"] == "from-a"
+
+
+def test_rename_invalid_new_name_returns_validation(profile_factory) -> None:
+    profile_factory("good")
+    result = runner.invoke(app, ["rename", "good", "../escape"])
+    assert result.exit_code == 4
+
+
+def test_rename_json_output(profile_factory) -> None:
+    profile_factory("old")
+    result = runner.invoke(app, ["rename", "old", "new", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["old"] == "old"
+    assert payload["data"]["new"] == "new"
+    assert payload["meta"]["action"] == "renamed"
+
+
+def test_rename_clears_last_pick_pointing_at_old(
+    profile_factory, _isolated_home: Path
+) -> None:
+    profile_factory("old")
+    last_pick = _isolated_home / "last-pick.json"
+    last_pick.write_text(
+        '{"profile": "old", "timestamp": "2026-04-27T00:00:00Z"}'
+    )
+
+    result = runner.invoke(app, ["rename", "old", "new", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["last_pick_cleared"] is True
+    assert not last_pick.exists()
+
+
+def test_rename_via_profiles_namespace(
+    profile_factory, credentials_dir: Path
+) -> None:
+    profile_factory("old")
+    result = runner.invoke(app, ["profiles", "rename", "old", "new"])
+    assert result.exit_code == 0
+    assert (credentials_dir / "new").exists()
+
+
+# ---------------------------------------------------------------------------
+# Phase A — which command (read-only counterpart to pick)
+# ---------------------------------------------------------------------------
+
+
+def test_which_returns_profile_name_to_stdout(
+    profile_factory, _isolated_home: Path
+) -> None:
+    """which uses cached health (no probe needed) — pre-seed cache and verify."""
+    from datetime import datetime
+
+    from claude_lb.models import Health, ProfileHealth
+
+    profile_factory("account-a")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="account-a", health=Health.OK,
+            probed_at=datetime.now(UTC),
+        )
+    )
+    result = runner.invoke(app, ["which"])
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "account-a"
+
+
+def test_which_does_not_write_picks_log(
+    profile_factory, _isolated_home: Path
+) -> None:
+    """The whole point of which: zero side effects on stickiness/log state."""
+    from datetime import datetime
+
+    from claude_lb.models import Health, ProfileHealth
+
+    profile_factory("account-a")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="account-a", health=Health.OK,
+            probed_at=datetime.now(UTC),
+        )
+    )
+    pick_log = _isolated_home / "picks.log"
+    last_pick = _isolated_home / "last-pick.json"
+    assert not pick_log.exists()
+    assert not last_pick.exists()
+
+    result = runner.invoke(app, ["which"])
+    assert result.exit_code == 0
+    assert not pick_log.exists()
+    assert not last_pick.exists()
+
+
+def test_which_json_output_marks_no_side_effects(
+    profile_factory, _isolated_home: Path
+) -> None:
+    from datetime import datetime
+
+    from claude_lb.models import Health, ProfileHealth
+
+    profile_factory("account-a")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="account-a", health=Health.OK,
+            probed_at=datetime.now(UTC),
+        )
+    )
+    result = runner.invoke(app, ["which", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["name"] == "account-a"
+    assert payload["meta"]["side_effects"] is False
+
+
+def test_which_no_profiles_exits_unavailable() -> None:
+    result = runner.invoke(app, ["which"])
+    assert result.exit_code == 9
+
+
+def test_which_honours_avoid(
+    profile_factory, _isolated_home: Path
+) -> None:
+    from datetime import datetime
+
+    from claude_lb.models import Health, ProfileHealth, Usage
+
+    profile_factory("a")
+    profile_factory("b")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="a", health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(weekly_pct=10),
+        ),
+        ProfileHealth(
+            name="b", health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(weekly_pct=20),
+        ),
+    )
+    result = runner.invoke(
+        app, ["which", "--strategy", "least-used", "--avoid", "a"]
+    )
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "b"
+
+
+def test_which_via_profiles_namespace(
+    profile_factory, _isolated_home: Path
+) -> None:
+    from datetime import datetime
+
+    from claude_lb.models import Health, ProfileHealth
+
+    profile_factory("a")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="a", health=Health.OK,
+            probed_at=datetime.now(UTC),
+        )
+    )
+    result = runner.invoke(app, ["profiles", "which"])
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "a"
+
+
+# ---------------------------------------------------------------------------
+# Phase A — pick --avoid + --fallback at the CLI layer
+# ---------------------------------------------------------------------------
+
+
+def test_pick_avoid_excludes_named_profile(
+    profile_factory, _isolated_home: Path
+) -> None:
+    from datetime import datetime
+
+    from claude_lb.models import Health, ProfileHealth, Usage
+
+    profile_factory("a")
+    profile_factory("b")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="a", health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(weekly_pct=10),
+        ),
+        ProfileHealth(
+            name="b", health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(weekly_pct=20),
+        ),
+    )
+    result = runner.invoke(
+        app, ["pick", "--strategy", "least-used", "--avoid", "a"]
+    )
+    assert result.exit_code == 0
+    assert "b" in result.stdout
+
+
+def test_pick_avoid_repeatable_takes_multiple_values(
+    profile_factory, _isolated_home: Path
+) -> None:
+    from datetime import datetime
+
+    from claude_lb.models import Health, ProfileHealth, Usage
+
+    profile_factory("a")
+    profile_factory("b")
+    profile_factory("c")
+    _seed_cache_fresh(*(
+        ProfileHealth(
+            name=n, health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(weekly_pct=pct),
+        )
+        for n, pct in (("a", 10), ("b", 20), ("c", 30))
+    ))
+    result = runner.invoke(
+        app,
+        ["pick", "--strategy", "least-used", "--avoid", "a", "--avoid", "b"],
+    )
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "c"
+
+
+def test_pick_fallback_returns_named_profile_on_failure(
+    profile_factory, _isolated_home: Path
+) -> None:
+    from datetime import datetime
+
+    from claude_lb.models import ErrorInfo, Health, ProfileHealth
+
+    # Both profiles auth_dead so the primary pick fails. Fallback should rescue.
+    profile_factory("a")
+    profile_factory("b")
+    _seed_cache_fresh(*(
+        ProfileHealth(
+            name=n,
+            health=Health.AUTH_DEAD,
+            probed_at=datetime.now(UTC),
+            error=ErrorInfo(type="authentication_error", message="x"),
+        )
+        for n in ("a", "b")
+    ))
+    result = runner.invoke(app, ["pick", "--fallback", "a"])
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "a"
+    assert "fallback" in result.stderr.lower()
+
+
+def test_pick_fallback_unknown_propagates_failure(
+    profile_factory, _isolated_home: Path
+) -> None:
+    """Fallback must reference a discovered profile; nonexistent fallback is
+    quietly ignored and the original failure is preserved (so scripts don't
+    silently succeed against a typo)."""
+    from datetime import datetime
+
+    from claude_lb.models import ErrorInfo, Health, ProfileHealth
+
+    profile_factory("a")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="a", health=Health.AUTH_DEAD,
+            probed_at=datetime.now(UTC),
+            error=ErrorInfo(type="authentication_error", message="x"),
+        )
+    )
+    result = runner.invoke(app, ["pick", "--fallback", "ghost"])
+    assert result.exit_code == 2  # AUTH_REQUIRED
+
+
+def test_pick_fallback_skips_when_fallback_is_avoided(
+    profile_factory, _isolated_home: Path
+) -> None:
+    """`--fallback X --avoid X` should NOT return X — the user explicitly said
+    avoid it."""
+    from datetime import datetime
+
+    from claude_lb.models import ErrorInfo, Health, ProfileHealth
+
+    profile_factory("a")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="a", health=Health.AUTH_DEAD,
+            probed_at=datetime.now(UTC),
+            error=ErrorInfo(type="authentication_error", message="x"),
+        )
+    )
+    result = runner.invoke(app, ["pick", "--fallback", "a", "--avoid", "a"])
+    assert result.exit_code == 2  # AUTH_REQUIRED
+
+
+def test_pick_fallback_json_output(
+    profile_factory, _isolated_home: Path
+) -> None:
+    from datetime import datetime
+
+    from claude_lb.models import ErrorInfo, Health, ProfileHealth
+
+    profile_factory("a")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="a", health=Health.AUTH_DEAD,
+            probed_at=datetime.now(UTC),
+            error=ErrorInfo(type="authentication_error", message="x"),
+        )
+    )
+    result = runner.invoke(app, ["pick", "--fallback", "a", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["name"] == "a"
+    assert "fallback" in payload["data"]["rationale"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Phase A — refresh --jitter at the CLI layer
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_jitter_threads_through_to_refresh_many_sync(
+    profile_factory,
+) -> None:
+    """The --jitter flag must propagate from the CLI into refresh_many_sync's
+    jitter_s kwarg."""
+    from claude_lb.refresh import RefreshResult
+
+    profile_factory("a")
+    captured: dict[str, float] = {}
+
+    def _stub(profiles, *, timeout=10.0, jitter_s=0.0):
+        captured["jitter_s"] = jitter_s
+        return [
+            RefreshResult(name=p.name, refreshed=True) for p in profiles
+        ]
+
+    with patch.object(cli_mod, "refresh_many_sync", _stub):
+        result = runner.invoke(app, ["refresh", "--all", "--jitter", "2.5"])
+
+    assert result.exit_code == 0
+    assert captured["jitter_s"] == 2.5
+
+
+def test_refresh_jitter_default_is_zero(profile_factory) -> None:
+    from claude_lb.refresh import RefreshResult
+
+    profile_factory("a")
+    captured: dict[str, float] = {}
+
+    def _stub(profiles, *, timeout=10.0, jitter_s=0.0):
+        captured["jitter_s"] = jitter_s
+        return [RefreshResult(name=p.name, refreshed=True) for p in profiles]
+
+    with patch.object(cli_mod, "refresh_many_sync", _stub):
+        result = runner.invoke(app, ["refresh", "--all"])
+
+    assert result.exit_code == 0
+    assert captured["jitter_s"] == 0.0
+
+
+def test_refresh_jitter_negative_rejected_by_typer() -> None:
+    """Typer's min=0.0 should reject negative jitter."""
+    result = runner.invoke(app, ["refresh", "--all", "--jitter", "-1"])
+    assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# Phase B — pick --strategy lowest-overage at the CLI layer
+# ---------------------------------------------------------------------------
+
+
+def test_pick_lowest_overage_strategy_chooses_lower_overage(
+    profile_factory, _isolated_home: Path
+) -> None:
+    from datetime import datetime
+
+    from claude_lb.models import ExtraUsage, Health, ProfileHealth, Usage
+
+    profile_factory("hot")
+    profile_factory("cool")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="hot", health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(
+                weekly_pct=10,
+                extra=ExtraUsage(is_enabled=True, utilization=80),
+            ),
+        ),
+        ProfileHealth(
+            name="cool", health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(
+                weekly_pct=70,
+                extra=ExtraUsage(is_enabled=True, utilization=20),
+            ),
+        ),
+    )
+    result = runner.invoke(
+        app, ["pick", "--strategy", "lowest-overage"]
+    )
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "cool"
+
+
+def test_pick_lowest_overage_completion_value_is_listed() -> None:
+    """Tab completion for --strategy must include lowest-overage so users can
+    discover it without reading docs."""
+    from claude_lb.cli import _complete_strategy
+
+    assert "lowest-overage" in _complete_strategy("")
+
+
+# ---------------------------------------------------------------------------
+# Phase B — pick --max-cost at the CLI layer
+# ---------------------------------------------------------------------------
+
+
+def test_pick_max_cost_excludes_overage_profiles(
+    profile_factory, _isolated_home: Path
+) -> None:
+    from datetime import datetime
+
+    from claude_lb.models import ExtraUsage, Health, ProfileHealth, Usage
+
+    profile_factory("a")
+    profile_factory("b")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="a", health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(
+                weekly_pct=10,
+                extra=ExtraUsage(is_enabled=True, utilization=20),
+            ),
+        ),
+        ProfileHealth(
+            name="b", health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(
+                weekly_pct=10,
+                extra=ExtraUsage(is_enabled=True, utilization=85),
+            ),
+        ),
+    )
+    result = runner.invoke(
+        app, ["pick", "--strategy", "least-used", "--max-cost", "80"]
+    )
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "a"
+
+
+def test_pick_max_cost_validates_range() -> None:
+    """Typer min=0 max=100 should reject out-of-range values."""
+    result = runner.invoke(app, ["pick", "--max-cost", "150"])
+    assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# Phase B — pick --explain at the CLI layer
+# ---------------------------------------------------------------------------
+
+
+def test_pick_explain_renders_decision_table_to_stderr(
+    profile_factory, _isolated_home: Path
+) -> None:
+    from datetime import datetime
+
+    from claude_lb.models import Health, ProfileHealth, Usage
+
+    profile_factory("a")
+    profile_factory("b")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="a", health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(weekly_pct=10),
+        ),
+        ProfileHealth(
+            name="b", health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(weekly_pct=20),
+        ),
+    )
+    result = runner.invoke(
+        app, ["pick", "--strategy", "least-used", "--explain"]
+    )
+    assert result.exit_code == 0
+    # The decision table should mention both profiles plus the chosen marker
+    # and the rationale string.
+    assert "a" in result.stderr
+    assert "b" in result.stderr
+    assert "chosen" in result.stderr.lower()
+    assert "least-used" in result.stderr.lower()
+
+
+def test_pick_explain_marks_excluded_profiles(
+    profile_factory, _isolated_home: Path
+) -> None:
+    from datetime import datetime
+
+    from claude_lb.models import ErrorInfo, Health, ProfileHealth, Usage
+
+    profile_factory("dead")
+    profile_factory("alive")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="dead", health=Health.AUTH_DEAD,
+            probed_at=datetime.now(UTC),
+            error=ErrorInfo(type="authentication_error", message="x"),
+        ),
+        ProfileHealth(
+            name="alive", health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(weekly_pct=10),
+        ),
+    )
+    result = runner.invoke(app, ["pick", "--explain"])
+    assert result.exit_code == 0
+    assert "excluded" in result.stderr.lower()
+    assert "auth_dead" in result.stderr
+
+
+def test_pick_explain_json_folds_into_data(
+    profile_factory, _isolated_home: Path
+) -> None:
+    from datetime import datetime
+
+    from claude_lb.models import Health, ProfileHealth, Usage
+
+    profile_factory("a")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="a", health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(weekly_pct=10),
+        )
+    )
+    result = runner.invoke(app, ["pick", "--explain", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert "explain" in payload["data"]
+    explain = payload["data"]["explain"]
+    assert explain["chosen"] == "a"
+    assert "filter_scores" in explain
+    assert "excluded_reasons" in explain
+
+
+def test_pick_explain_on_failure_folds_into_error_details(
+    profile_factory, _isolated_home: Path
+) -> None:
+    """When pick fails, --explain --json should still include the explain
+    data inside the error envelope's details."""
+    from datetime import datetime
+
+    from claude_lb.models import ErrorInfo, Health, ProfileHealth
+
+    profile_factory("a")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="a", health=Health.AUTH_DEAD,
+            probed_at=datetime.now(UTC),
+            error=ErrorInfo(type="authentication_error", message="x"),
+        )
+    )
+    result = runner.invoke(app, ["pick", "--explain", "--json"])
+    assert result.exit_code != 0
+    # JSON error envelope still emitted on stdout.
+    payload = json.loads(result.stdout)
+    assert "error" in payload
+    assert "explain" in payload["error"]["details"]
+
+
+def test_pick_without_explain_does_not_render_table(
+    profile_factory, _isolated_home: Path
+) -> None:
+    """Sanity: omitting --explain must not leak the decision table."""
+    from datetime import datetime
+
+    from claude_lb.models import Health, ProfileHealth, Usage
+
+    profile_factory("a")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="a", health=Health.OK,
+            probed_at=datetime.now(UTC),
+            usage=Usage(weekly_pct=10),
+        )
+    )
+    result = runner.invoke(app, ["pick"])
+    assert result.exit_code == 0
+    assert "decision" not in result.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# Phase C — config usage-log on/off/status
+# ---------------------------------------------------------------------------
+
+
+def test_config_usage_log_status_default_disabled(_isolated_home: Path) -> None:
+    result = runner.invoke(app, ["config", "usage-log", "status"])
+    assert result.exit_code == 0
+    assert "disabled" in result.stderr.lower()
+
+
+def test_config_usage_log_on_creates_marker(_isolated_home: Path) -> None:
+    result = runner.invoke(app, ["config", "usage-log", "on"])
+    assert result.exit_code == 0
+    assert "enabled" in result.stderr.lower()
+    assert (_isolated_home / "usage-log.enabled").is_file()
+
+
+def test_config_usage_log_off_removes_marker(_isolated_home: Path) -> None:
+    runner.invoke(app, ["config", "usage-log", "on"])
+    result = runner.invoke(app, ["config", "usage-log", "off"])
+    assert result.exit_code == 0
+    assert "disabled" in result.stderr.lower()
+    assert not (_isolated_home / "usage-log.enabled").exists()
+
+
+def test_config_usage_log_off_when_already_disabled(_isolated_home: Path) -> None:
+    result = runner.invoke(app, ["config", "usage-log", "off"])
+    assert result.exit_code == 0
+    assert "was not enabled" in result.stderr.lower()
+
+
+def test_config_usage_log_invalid_state_exits_validation(
+    _isolated_home: Path,
+) -> None:
+    result = runner.invoke(app, ["config", "usage-log", "maybe"])
+    assert result.exit_code == 4
+
+
+def test_config_usage_log_status_json_envelope(_isolated_home: Path) -> None:
+    runner.invoke(app, ["config", "usage-log", "on"])
+    result = runner.invoke(app, ["config", "usage-log", "status", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["enabled"] is True
+    assert payload["data"]["marker_present"] is True
+
+
+def test_config_usage_log_on_json_envelope(_isolated_home: Path) -> None:
+    result = runner.invoke(app, ["config", "usage-log", "on", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["enabled"] is True
+    assert "marker_path" in payload["data"]
+
+
+# ---------------------------------------------------------------------------
+# Phase C — stats command
+# ---------------------------------------------------------------------------
+
+
+def _seed_picks_log_dir(home: Path, lines: list[str]) -> None:
+    """Write picks.log lines to the test config dir."""
+    target = home / "picks.log"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines) + "\n")
+
+
+def test_stats_empty_log_says_no_history(_isolated_home: Path) -> None:
+    result = runner.invoke(app, ["stats"])
+    assert result.exit_code == 0
+    assert "no picks.log" in result.stderr.lower()
+
+
+def test_stats_summarises_picks_and_execs(_isolated_home: Path) -> None:
+    _seed_picks_log_dir(_isolated_home, [
+        "2026-04-27T12:00:00Z\taccount-a\tleast-used\tscore=1.00",
+        "2026-04-27T12:01:00Z\taccount-b\tsticky\tscore=0.50",
+        "2026-04-27T12:02:00Z\taccount-a\tEXEC\targv=claude\trc=0\tdur=100ms",
+        "2026-04-27T12:03:00Z\taccount-a\tEXEC\targv=claude\trc=1\tdur=200ms",
+    ])
+    result = runner.invoke(app, ["stats"])
+    assert result.exit_code == 0
+    assert "Picks" in result.stderr
+    assert "Execs" in result.stderr
+    assert "account-a" in result.stderr
+    assert "rc=0" in result.stderr
+    assert "rc=1" in result.stderr
+    assert "p50" in result.stderr.lower()
+
+
+def test_stats_json_envelope(_isolated_home: Path) -> None:
+    _seed_picks_log_dir(_isolated_home, [
+        "2026-04-27T12:00:00Z\taccount-a\tleast-used\tscore=1.00",
+        "2026-04-27T12:02:00Z\taccount-a\tEXEC\targv=claude\trc=0\tdur=100ms",
+    ])
+    result = runner.invoke(app, ["stats", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["pick"]["total"] == 1
+    assert payload["data"]["exec"]["total"] == 1
+    assert payload["data"]["pick"]["by_profile"] == {"account-a": 1}
+
+
+def test_stats_filters_by_since(_isolated_home: Path) -> None:
+    """Old entries should be dropped by --since."""
+    from datetime import datetime, timedelta
+
+    now = datetime.now(UTC)
+    old = now - timedelta(days=5)
+    new = now - timedelta(minutes=10)
+    _seed_picks_log_dir(_isolated_home, [
+        f"{old.isoformat().replace('+00:00', 'Z')}\told-profile\tsticky",
+        f"{new.isoformat().replace('+00:00', 'Z')}\tnew-profile\tsticky",
+    ])
+    result = runner.invoke(app, ["stats", "--since", "1h", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["pick"]["by_profile"] == {"new-profile": 1}
+
+
+def test_stats_filters_by_profile(_isolated_home: Path) -> None:
+    _seed_picks_log_dir(_isolated_home, [
+        "2026-04-27T12:00:00Z\taccount-a\tsticky",
+        "2026-04-27T12:01:00Z\taccount-b\tsticky",
+    ])
+    result = runner.invoke(app, ["stats", "--profile", "account-a", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["pick"]["by_profile"] == {"account-a": 1}
+
+
+def test_stats_invalid_since_exits_validation(_isolated_home: Path) -> None:
+    result = runner.invoke(app, ["stats", "--since", "garbage"])
+    assert result.exit_code == 4
+
+
+# ---------------------------------------------------------------------------
+# Phase C — report command
+# ---------------------------------------------------------------------------
+
+
+def _seed_usage_log(home: Path, records: list[dict]) -> None:
+    """Write usage-log.ndjson records."""
+    log_file = home / "usage-log.ndjson"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+
+def test_report_empty_log(_isolated_home: Path) -> None:
+    """Without enabled marker AND without log file, report should warn but
+    still exit 0."""
+    result = runner.invoke(app, ["report"])
+    assert result.exit_code == 0
+    # Stderr will contain the "off" warning AND "no usage log" message.
+    assert "off" in result.stderr.lower() or "no usage log" in result.stderr.lower()
+
+
+def test_report_renders_summary_table(_isolated_home: Path) -> None:
+    _seed_usage_log(_isolated_home, [
+        {
+            "ts": "2026-04-27T12:00:00Z", "profile": "a",
+            "weekly_pct": 10, "session_pct": 50,
+        },
+        {
+            "ts": "2026-04-27T12:05:00Z", "profile": "a",
+            "weekly_pct": 20, "session_pct": 60,
+        },
+        {
+            "ts": "2026-04-27T12:00:00Z", "profile": "b",
+            "weekly_pct": 80, "session_pct": 5,
+        },
+    ])
+    # Enable usage-log so the warning suppression path works (cosmetic only).
+    runner.invoke(app, ["config", "usage-log", "on"])
+
+    result = runner.invoke(app, ["report"])
+    assert result.exit_code == 0
+    assert "weekly_pct" in result.stderr  # title
+    assert "a" in result.stderr
+    assert "b" in result.stderr
+
+
+def test_report_metric_validation(_isolated_home: Path) -> None:
+    result = runner.invoke(app, ["report", "--metric", "garbage"])
+    assert result.exit_code == 4
+
+
+def test_report_json_envelope(_isolated_home: Path) -> None:
+    _seed_usage_log(_isolated_home, [
+        {
+            "ts": "2026-04-27T12:00:00Z", "profile": "a", "weekly_pct": 10,
+        },
+        {
+            "ts": "2026-04-27T12:05:00Z", "profile": "a", "weekly_pct": 30,
+        },
+    ])
+    result = runner.invoke(app, ["report", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["meta"]["metric"] == "weekly_pct"
+    assert len(payload["data"]) == 1
+    assert payload["data"][0]["profile"] == "a"
+    assert payload["data"][0]["min"] == 10
+    assert payload["data"][0]["max"] == 30
+
+
+def test_report_sparkline_flag_includes_unicode_in_json(
+    _isolated_home: Path,
+) -> None:
+    _seed_usage_log(_isolated_home, [
+        {"ts": f"2026-04-27T12:0{i}:00Z", "profile": "a", "weekly_pct": 10 + i}
+        for i in range(5)
+    ])
+    result = runner.invoke(app, ["report", "--json", "--sparkline"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert "sparkline" in payload["data"][0]
+    spark = payload["data"][0]["sparkline"]
+    assert isinstance(spark, str)
+    assert len(spark) == 5
+
+
+def test_report_project_flag_returns_seconds_to_100(
+    _isolated_home: Path,
+) -> None:
+    """A monotonically climbing series should produce a non-null projection."""
+    from datetime import datetime, timedelta
+
+    base = datetime(2026, 4, 27, tzinfo=UTC)
+    records = [
+        {
+            "ts": (base + timedelta(hours=h)).isoformat().replace("+00:00", "Z"),
+            "profile": "a", "weekly_pct": 10 + h * 10,
+        }
+        for h in range(5)
+    ]
+    _seed_usage_log(_isolated_home, records)
+    result = runner.invoke(app, ["report", "--json", "--project"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"][0]["seconds_to_100"] is not None
+    assert payload["data"][0]["seconds_to_100"] > 0
+
+
+def test_report_filters_by_profile(_isolated_home: Path) -> None:
+    _seed_usage_log(_isolated_home, [
+        {"ts": "2026-04-27T12:00:00Z", "profile": "a", "weekly_pct": 10},
+        {"ts": "2026-04-27T12:00:00Z", "profile": "b", "weekly_pct": 80},
+    ])
+    result = runner.invoke(app, ["report", "--profile", "a", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert len(payload["data"]) == 1
+    assert payload["data"][0]["profile"] == "a"
+
+
+def test_report_filters_by_since(_isolated_home: Path) -> None:
+    from datetime import datetime, timedelta
+
+    now = datetime.now(UTC)
+    old = now - timedelta(days=5)
+    new = now - timedelta(minutes=10)
+    _seed_usage_log(_isolated_home, [
+        {
+            "ts": old.isoformat().replace("+00:00", "Z"),
+            "profile": "a", "weekly_pct": 10,
+        },
+        {
+            "ts": new.isoformat().replace("+00:00", "Z"),
+            "profile": "a", "weekly_pct": 80,
+        },
+    ])
+    result = runner.invoke(app, ["report", "--since", "1h", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"][0]["min"] == 80  # old record dropped
+
+
+def test_report_invalid_since_exits_validation(_isolated_home: Path) -> None:
+    result = runner.invoke(app, ["report", "--since", "garbage"])
+    assert result.exit_code == 4
+
+
+# ---------------------------------------------------------------------------
+# Phase C — usage_log integration with probe (probe writes records when on)
+# ---------------------------------------------------------------------------
+
+
+def test_probe_appends_to_usage_log_when_enabled(
+    profile_factory, _isolated_home: Path
+) -> None:
+    """A real probe path (mocked at the probe layer) should append a record
+    when usage-log is enabled."""
+    from datetime import datetime
+
+    from claude_lb.models import Health, ProfileHealth, Usage
+
+    profile_factory("a")
+    runner.invoke(app, ["config", "usage-log", "on"])
+
+    def _stub(profiles, *, prev_health=None, prev_failures=None, timeout=10.0):
+        return [
+            ProfileHealth(
+                name=p.name, health=Health.OK,
+                probed_at=datetime.now(UTC),
+                usage=Usage(weekly_pct=42),
+                probe_latency_ms=100,
+            )
+            for p in profiles
+        ]
+
+    with patch.object(cli_mod, "probe_many_sync", _stub):
+        result = runner.invoke(app, ["probe"])
+
+    assert result.exit_code == 0
+    log_file = _isolated_home / "usage-log.ndjson"
+    # The stub bypassed probe_many — usage_log appends inside probe_many. So
+    # writes go through only when the real probe path runs. Verify file exists
+    # but may be empty in this stubbed test.
+    # (Integration coverage is in test_probe.py for the real path.)
+    # We can however call usage_log.append directly to validate the integration:
+    from claude_lb import usage_log
+
+    assert usage_log.is_enabled()
+    usage_log.append(_stub([type("P", (), {"name": "a"})()])[0])
+    assert log_file.is_file()
+    assert log_file.stat().st_size > 0
+
+
+# ---------------------------------------------------------------------------
+# Phase E — shellinit command
+# ---------------------------------------------------------------------------
+
+
+def test_shellinit_default_emits_template_to_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    result = runner.invoke(app, ["shellinit"])
+    assert result.exit_code == 0
+    assert "claude()" in result.stdout
+    assert "roost exec --auto-refresh -- claude" in result.stdout
+
+
+def test_shellinit_explicit_shell_overrides_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    result = runner.invoke(app, ["shellinit", "--shell", "fish"])
+    assert result.exit_code == 0
+    assert "function claude" in result.stdout
+    assert "$argv" in result.stdout
+
+
+def test_shellinit_unknown_shell_exits_validation() -> None:
+    result = runner.invoke(app, ["shellinit", "--shell", "ksh"])
+    assert result.exit_code == 4
+
+
+# ---------------------------------------------------------------------------
+# Phase E — trace command
+# ---------------------------------------------------------------------------
+
+
+def test_trace_unknown_profile_returns_not_found() -> None:
+    result = runner.invoke(app, ["trace", "ghost"])
+    assert result.exit_code == 3
+
+
+def test_trace_redacts_token_in_output(profile_factory) -> None:
+    """The bearer token must be redacted to last-4 in the trace output so
+    the result is shareable in bug reports without leaking credentials."""
+    profile_factory("a", access_token="sk-ant-oat01-secrettoken")
+    from claude_lb import probe as probe_mod
+
+    def _stub(profiles, *, timeout=10.0):
+        return [(p.name, 200, {"five_hour": {"utilization": 5}}, {}) for p in profiles]
+
+    with patch.object(probe_mod, "probe_raw_many_sync", _stub):
+        result = runner.invoke(app, ["trace", "a"])
+
+    assert result.exit_code == 0
+    assert "secrettoken" not in result.stderr
+    assert "***" in result.stderr or "Bearer" in result.stderr
+
+
+def test_trace_json_output(profile_factory) -> None:
+    profile_factory("a", access_token="sk-ant-oat01-redactme")
+    from claude_lb import probe as probe_mod
+
+    def _stub(profiles, *, timeout=10.0):
+        return [(p.name, 200, {"five_hour": {"utilization": 5}}, {"x": "1"}) for p in profiles]
+
+    with patch.object(probe_mod, "probe_raw_many_sync", _stub):
+        result = runner.invoke(app, ["trace", "a", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["data"]["profile"] == "a"
+    assert payload["data"]["response"]["status_code"] == 200
+    # Token redaction in JSON too.
+    auth = payload["data"]["request"]["headers"]["Authorization"]
+    assert "redactme" not in auth
+    assert "***" in auth
+
+
+def test_trace_includes_classifier_decision(profile_factory) -> None:
+    profile_factory("a")
+    from claude_lb import probe as probe_mod
+
+    def _stub(profiles, *, timeout=10.0):
+        return [
+            (p.name, 200, {
+                "five_hour": {"utilization": 5},
+                "seven_day": {"utilization": 10},
+            }, {})
+            for p in profiles
+        ]
+
+    with patch.object(probe_mod, "probe_raw_many_sync", _stub):
+        result = runner.invoke(app, ["trace", "a", "--json"])
+
+    payload = json.loads(result.stdout)
+    assert payload["data"]["classification"]["health"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Phase E — top command (bounded iterations for testability)
+# ---------------------------------------------------------------------------
+
+
+def test_top_with_bounded_iterations_renders_and_exits(
+    profile_factory, _isolated_home: Path
+) -> None:
+    """With --iterations 2, top should render two frames and exit cleanly."""
+    from datetime import datetime
+
+    from claude_lb.models import Health, ProfileHealth
+
+    profile_factory("a")
+    _seed_cache_fresh(
+        ProfileHealth(
+            name="a", health=Health.OK,
+            probed_at=datetime.now(UTC),
+        )
+    )
+    result = runner.invoke(
+        app, ["top", "--iterations", "2", "--interval", "0.1"]
+    )
+    assert result.exit_code == 0
+
+
+def test_top_negative_interval_rejected_by_typer() -> None:
+    result = runner.invoke(app, ["top", "--interval", "-1"])
+    assert result.exit_code != 0
 

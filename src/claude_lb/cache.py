@@ -105,6 +105,21 @@ def remove_profile(name: str, path: Path | None = None) -> bool:
     return True
 
 
+# Exponential backoff for NETWORK_ERROR. Doubles per consecutive failure,
+# starting at 30s and capped at 480s (8 min). Keeps the "fail open, retry
+# eventually" spirit but prevents thundering-herd against a flapping endpoint
+# without forcing the operator to invalidate the cache by hand.
+NETWORK_BACKOFF_BASE_S = 30
+NETWORK_BACKOFF_CAP_S = 480
+
+
+def network_backoff_seconds(consecutive_failures: int) -> int:
+    """Return the TTL (seconds) for a NETWORK_ERROR entry given its failure
+    counter. 30s, 60s, 120s, 240s, 480s, 480s, ... — capped at 480s."""
+    n = max(0, consecutive_failures)
+    return min(NETWORK_BACKOFF_BASE_S * (2 ** n), NETWORK_BACKOFF_CAP_S)
+
+
 def is_entry_fresh(
     entry: ProfileHealth,
     credentials_mtime: float | None = None,
@@ -113,6 +128,9 @@ def is_entry_fresh(
     """An entry is fresh iff:
       - expires_at is in the future (or None, meaning infinite — auth_dead),
       - AND the credentials file's mtime hasn't changed since the entry was cached.
+      - For NETWORK_ERROR, exponential backoff overrides the static 30s TTL
+        once consecutive_failures > 0 — a flapping endpoint doesn't get
+        re-probed every 30s.
 
     A None expires_at ONLY means "never expires" for AUTH_DEAD. For transient
     states with explicit None expires_at (e.g. shouldn't happen but defensive),
@@ -133,6 +151,16 @@ def is_entry_fresh(
 
     if entry.health is Health.AUTH_DEAD:
         return True
+
+    # NETWORK_ERROR with backoff: extend TTL based on consecutive_failures.
+    # Treats `probed_at + backoff_seconds` as the effective expiry, so a
+    # repeated network failure waits longer before the next probe attempt.
+    if entry.health is Health.NETWORK_ERROR and entry.consecutive_failures > 0:
+        backoff = network_backoff_seconds(entry.consecutive_failures)
+        probed = entry.probed_at
+        if probed.tzinfo is None:
+            probed = probed.replace(tzinfo=UTC)
+        return (now - probed).total_seconds() < backoff
 
     if entry.expires_at is None:
         return False

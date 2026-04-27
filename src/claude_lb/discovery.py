@@ -1,7 +1,11 @@
 """Profile discovery + OAuth token extraction (SPEC §10).
 
 Walks the configured profiles directory, parses each `.credentials.json`,
-and extracts an access token using a three-shape fallback order.
+and extracts an access token using a three-shape fallback order. Also
+provides directory-level mutation helpers (`remove_profile_dir`,
+`rename_profile_dir`) used by the `remove` and `rename` CLI commands —
+both keep the multi-profile layout in sync with the cache and last-pick
+state by leaving cleanup to the caller (see cli.py).
 """
 
 from __future__ import annotations
@@ -9,6 +13,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -177,3 +183,146 @@ def get_profile(name: str) -> Profile | None:
         if profile.name == name:
             return profile
     return None
+
+
+# ---------------------------------------------------------------------------
+# Directory mutation (used by CLI `remove` / `rename`)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MutationResult:
+    """Outcome of a directory-level profile mutation.
+
+    Designed to be JSON-serialisable from the CLI layer without inventing a
+    second result type per command. `error_code` matches the `add` command's
+    vocabulary (NOT_FOUND, CONFLICT, VALIDATION_ERROR, ERROR) so callers can
+    map cleanly to exit codes.
+    """
+
+    ok: bool
+    name: str
+    path: Path | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+def remove_profile_dir(name: str) -> MutationResult:
+    """Recursively delete `<profiles_dir>/<name>/`.
+
+    Symmetric counterpart to the CLI `add` command. Validates the name shape
+    against `PROFILE_NAME_RE` first so a typo can't accidentally rmtree the
+    wrong location, then refuses if the directory is missing or actually a
+    file. Cache invalidation and last-pick cleanup are the caller's job; this
+    helper only owns the filesystem dir.
+    """
+    if not PROFILE_NAME_RE.match(name):
+        return MutationResult(
+            ok=False,
+            name=name,
+            error_code="VALIDATION_ERROR",
+            error_message=f"invalid profile name: {name!r} (must match [A-Za-z0-9_-]+)",
+        )
+    target = profiles_dir() / name
+    if not target.exists():
+        return MutationResult(
+            ok=False,
+            name=name,
+            error_code="NOT_FOUND",
+            error_message=f"no such profile directory: {target}",
+        )
+    if not target.is_dir():
+        return MutationResult(
+            ok=False,
+            name=name,
+            path=target,
+            error_code="VALIDATION_ERROR",
+            error_message=f"profile path is not a directory: {target}",
+        )
+    try:
+        shutil.rmtree(target)
+    except OSError as exc:
+        return MutationResult(
+            ok=False,
+            name=name,
+            path=target,
+            error_code="ERROR",
+            error_message=f"rmtree failed: {exc}",
+        )
+    return MutationResult(ok=True, name=name, path=target)
+
+
+def rename_profile_dir(old: str, new: str, *, force: bool = False) -> MutationResult:
+    """Move `<profiles_dir>/<old>/` to `<profiles_dir>/<new>/`.
+
+    Validates both names. Refuses if `old` is missing, if `new` already
+    exists (unless `force`), or if either name fails the discovery regex.
+    With `force`, an existing destination is removed first so the rename
+    proceeds — this matches the symmetry of `add --force` overwrites.
+
+    Cache invalidation is the caller's job. New name will discover fresh on
+    the next probe cycle (mtime carries over via the move).
+    """
+    if not PROFILE_NAME_RE.match(old):
+        return MutationResult(
+            ok=False,
+            name=old,
+            error_code="VALIDATION_ERROR",
+            error_message=f"invalid old name: {old!r} (must match [A-Za-z0-9_-]+)",
+        )
+    if not PROFILE_NAME_RE.match(new):
+        return MutationResult(
+            ok=False,
+            name=new,
+            error_code="VALIDATION_ERROR",
+            error_message=f"invalid new name: {new!r} (must match [A-Za-z0-9_-]+)",
+        )
+    if old == new:
+        return MutationResult(
+            ok=False,
+            name=new,
+            error_code="VALIDATION_ERROR",
+            error_message="old and new names are identical",
+        )
+    base = profiles_dir()
+    src = base / old
+    dst = base / new
+    if not src.is_dir():
+        return MutationResult(
+            ok=False,
+            name=old,
+            error_code="NOT_FOUND",
+            error_message=f"no such profile directory: {src}",
+        )
+    if dst.exists():
+        if not force:
+            return MutationResult(
+                ok=False,
+                name=new,
+                path=dst,
+                error_code="CONFLICT",
+                error_message=(
+                    f"destination already exists: {dst}. Pass --force to overwrite."
+                ),
+            )
+        try:
+            shutil.rmtree(dst)
+        except OSError as exc:
+            return MutationResult(
+                ok=False,
+                name=new,
+                path=dst,
+                error_code="ERROR",
+                error_message=f"could not remove existing destination: {exc}",
+            )
+    try:
+        src.rename(dst)
+    except OSError as exc:
+        return MutationResult(
+            ok=False,
+            name=new,
+            path=dst,
+            error_code="ERROR",
+            error_message=f"rename failed: {exc}",
+        )
+    return MutationResult(ok=True, name=new, path=dst)

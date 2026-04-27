@@ -43,14 +43,23 @@ def _entry(
     *,
     weekly_pct: int | None = None,
     session_pct: int | None = None,
+    overage_pct: int | None = None,
     expires_at: datetime | None = None,
     weekly_reset_at: datetime | None = None,
     session_reset_at: datetime | None = None,
     probed_at: datetime | None = None,
 ) -> ProfileHealth:
+    from claude_lb.models import ExtraUsage
+
     usage = None
-    if weekly_pct is not None or session_pct is not None:
-        usage = Usage(weekly_pct=weekly_pct, session_pct=session_pct)
+    if weekly_pct is not None or session_pct is not None or overage_pct is not None:
+        extra = (
+            ExtraUsage(is_enabled=True, utilization=overage_pct)
+            if overage_pct is not None else None
+        )
+        usage = Usage(
+            weekly_pct=weekly_pct, session_pct=session_pct, extra=extra,
+        )
     error = None
     if health is Health.AUTH_DEAD:
         error = ErrorInfo(type="authentication_error", message="x")
@@ -714,8 +723,8 @@ def test_read_last_pick_returns_none_for_wrong_shape(tmp_path) -> None:
 def test_diagnose_failure_with_empty_entries_returns_no_profiles() -> None:
     """Filter ladder yielded zero candidates because there are no profiles
     at all (vs. all-filtered) — should return NO_PROFILES."""
-    from claude_lb.pick import _diagnose_failure
     from claude_lb.pick import PickFailureReason as PFR
+    from claude_lb.pick import _diagnose_failure
 
     outcome = _diagnose_failure([], require_ok=False)
     assert outcome.reason is PFR.NO_PROFILES
@@ -728,8 +737,8 @@ def test_diagnose_failure_with_mixed_dead_and_expired_returns_all_auth_expired()
     from datetime import UTC, datetime
 
     from claude_lb.models import ErrorInfo, Health, ProfileHealth
-    from claude_lb.pick import _diagnose_failure
     from claude_lb.pick import PickFailureReason as PFR
+    from claude_lb.pick import _diagnose_failure
 
     now = datetime.now(UTC)
     entries = [
@@ -773,3 +782,376 @@ def test_is_selectable_rejects_non_ok_when_require_ok_is_true() -> None:
     assert _is_selectable(entry, now, require_ok=True) is False
     # Without require_ok, NETWORK_ERROR passes
     assert _is_selectable(entry, now, require_ok=False) is True
+
+
+# ---------------------------------------------------------------------------
+# --avoid (Phase A)
+# ---------------------------------------------------------------------------
+
+
+def test_avoid_excludes_named_profile() -> None:
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=10),
+        _entry("b", Health.OK, weekly_pct=20),
+        _entry("c", Health.OK, weekly_pct=30),
+    )
+    outcome = pick(
+        cache,
+        ["a", "b", "c"],
+        strategy=Strategy.LEAST_USED,
+        avoid={"a"},
+        now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "b"
+
+
+def test_avoid_multiple_profiles() -> None:
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=10),
+        _entry("b", Health.OK, weekly_pct=20),
+        _entry("c", Health.OK, weekly_pct=30),
+    )
+    outcome = pick(
+        cache,
+        ["a", "b", "c"],
+        strategy=Strategy.LEAST_USED,
+        avoid={"a", "b"},
+        now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "c"
+
+
+def test_avoid_all_falls_through_to_diagnose_failure() -> None:
+    cache = _cache(
+        _entry("a", Health.OK),
+        _entry("b", Health.OK),
+    )
+    outcome = pick(
+        cache,
+        ["a", "b"],
+        strategy=Strategy.LEAST_USED,
+        avoid={"a", "b"},
+        now=FIXED_NOW,
+    )
+    # Both healthy entries avoided -> failure. Reason is whatever diagnose
+    # returns when health is fine but avoidance excluded everyone — it
+    # falls through to ALL_TERMINAL because health is OK so no ALL_AUTH_*
+    # categorical match.
+    assert outcome.chosen is None
+    assert outcome.reason is not None
+
+
+def test_avoid_skips_sticky_pick_and_falls_through_to_strategy(
+    _isolate_pick_paths: Path,
+) -> None:
+    """If the sticky pick is in the avoid list, the sticky shortcut is skipped
+    and the underlying strategy (least-used as fallback) runs instead."""
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=80),  # sticky pin
+        _entry("b", Health.OK, weekly_pct=10),
+    )
+    _write_last_pick_at("a", FIXED_NOW - timedelta(seconds=30))
+
+    outcome = pick(
+        cache,
+        ["a", "b"],
+        strategy=Strategy.STICKY,
+        avoid={"a"},
+        now=FIXED_NOW,
+    )
+
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "b"
+    # Strategy used in this fallthrough should be the underlying STICKY
+    # default (which routes to LEAST_USED) — see pick.py:419 for the rule
+    # that surfaces STICKY in strategy_used when sticky was the request.
+    assert outcome.strategy_used in (Strategy.LEAST_USED, Strategy.STICKY)
+
+
+def test_avoid_composes_with_count(_isolate_pick_paths: Path) -> None:
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=10),
+        _entry("b", Health.OK, weekly_pct=20),
+        _entry("c", Health.OK, weekly_pct=30),
+        _entry("d", Health.OK, weekly_pct=40),
+    )
+    outcome = pick(
+        cache,
+        ["a", "b", "c", "d"],
+        strategy=Strategy.LEAST_USED,
+        avoid={"a"},
+        count=2,
+        now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    names = [e.name for e in outcome.chosen_many]
+    assert names == ["b", "c"]
+    assert "a" not in names
+
+
+def test_avoid_with_count_returns_partial_when_too_few_remain() -> None:
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=10),
+        _entry("b", Health.OK, weekly_pct=20),
+    )
+    outcome = pick(
+        cache,
+        ["a", "b"],
+        strategy=Strategy.LEAST_USED,
+        avoid={"a"},
+        count=5,
+        now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert [e.name for e in outcome.chosen_many] == ["b"]
+
+
+def test_empty_avoid_set_is_noop() -> None:
+    """Passing avoid=set() (or omitting) must behave identically."""
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=10),
+        _entry("b", Health.OK, weekly_pct=20),
+    )
+    out_with = pick(
+        cache, ["a", "b"], strategy=Strategy.LEAST_USED, avoid=set(), now=FIXED_NOW,
+    )
+    out_without = pick(
+        cache, ["a", "b"], strategy=Strategy.LEAST_USED, now=FIXED_NOW,
+    )
+    assert out_with.chosen is not None
+    assert out_without.chosen is not None
+    assert out_with.chosen.name == out_without.chosen.name == "a"
+
+
+def test_sticky_unaffected_when_sticky_pick_not_in_avoid(
+    _isolate_pick_paths: Path,
+) -> None:
+    """Sanity: --avoid b shouldn't impact sticky pin to a."""
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=99),
+        _entry("b", Health.OK, weekly_pct=10),
+        _entry("c", Health.OK, weekly_pct=15),
+    )
+    _write_last_pick_at("a", FIXED_NOW - timedelta(seconds=30))
+    outcome = pick(
+        cache,
+        ["a", "b", "c"],
+        strategy=Strategy.STICKY,
+        avoid={"b"},
+        now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "a"
+    assert outcome.strategy_used is Strategy.STICKY
+
+
+# ---------------------------------------------------------------------------
+# Phase B — lowest-overage strategy
+# ---------------------------------------------------------------------------
+
+
+def test_lowest_overage_prefers_minimum_utilization() -> None:
+    cache = _cache(
+        _entry("hot", Health.OK, weekly_pct=10, overage_pct=80),
+        _entry("cool", Health.OK, weekly_pct=70, overage_pct=20),
+    )
+    outcome = pick(
+        cache, ["hot", "cool"],
+        strategy=Strategy.LOWEST_OVERAGE, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "cool"
+    assert outcome.strategy_used is Strategy.LOWEST_OVERAGE
+
+
+def test_lowest_overage_treats_missing_data_as_zero() -> None:
+    """Profiles without overage data should rank as low (best) — the absence
+    of cost signal isn't a reason to deprioritise them."""
+    cache = _cache(
+        _entry("with-overage", Health.OK, weekly_pct=10, overage_pct=50),
+        _entry("no-overage", Health.OK, weekly_pct=70),
+    )
+    outcome = pick(
+        cache, ["with-overage", "no-overage"],
+        strategy=Strategy.LOWEST_OVERAGE, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "no-overage"
+
+
+def test_lowest_overage_with_count_returns_top_n() -> None:
+    cache = _cache(
+        _entry("a", Health.OK, overage_pct=50),
+        _entry("b", Health.OK, overage_pct=10),
+        _entry("c", Health.OK, overage_pct=30),
+    )
+    outcome = pick(
+        cache, ["a", "b", "c"],
+        strategy=Strategy.LOWEST_OVERAGE, count=2, now=FIXED_NOW,
+    )
+    assert [e.name for e in outcome.chosen_many] == ["b", "c"]
+
+
+def test_lowest_overage_unhealthy_profiles_filtered_first() -> None:
+    cache = _cache(
+        _entry("dead", Health.AUTH_DEAD, overage_pct=0),
+        _entry("alive", Health.OK, overage_pct=99),
+    )
+    outcome = pick(
+        cache, ["dead", "alive"],
+        strategy=Strategy.LOWEST_OVERAGE, now=FIXED_NOW,
+    )
+    # AUTH_DEAD is filtered before lowest-overage even sees it.
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "alive"
+
+
+# ---------------------------------------------------------------------------
+# Phase B — --max-cost filter
+# ---------------------------------------------------------------------------
+
+
+def test_max_cost_excludes_profiles_at_or_above_threshold() -> None:
+    cache = _cache(
+        _entry("cheap", Health.OK, weekly_pct=10, overage_pct=20),
+        _entry("expensive", Health.OK, weekly_pct=10, overage_pct=85),
+    )
+    outcome = pick(
+        cache, ["cheap", "expensive"],
+        strategy=Strategy.LEAST_USED, max_cost=80, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "cheap"
+    # The excluded one shows up in the diagnostic dict.
+    assert "expensive" in outcome.excluded_reasons
+    assert "85%" in outcome.excluded_reasons["expensive"]
+
+
+def test_max_cost_does_not_exclude_profiles_without_overage_data() -> None:
+    """Pro/Team plans (no extra) should pass through max_cost unchallenged."""
+    cache = _cache(
+        _entry("pro-plan", Health.OK, weekly_pct=10),  # no overage
+        _entry("max-plan", Health.OK, weekly_pct=20, overage_pct=99),
+    )
+    outcome = pick(
+        cache, ["pro-plan", "max-plan"],
+        strategy=Strategy.LEAST_USED, max_cost=50, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "pro-plan"
+    assert "max-plan" in outcome.excluded_reasons
+    assert "pro-plan" not in outcome.excluded_reasons
+
+
+def test_max_cost_zero_excludes_any_profile_with_overage_at_all() -> None:
+    """max_cost=0 should reject any profile reporting non-zero overage."""
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=10, overage_pct=1),
+        _entry("b", Health.OK, weekly_pct=10),  # no overage
+    )
+    outcome = pick(
+        cache, ["a", "b"],
+        strategy=Strategy.LEAST_USED, max_cost=0, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "b"
+    assert "a" in outcome.excluded_reasons
+
+
+def test_max_cost_failure_when_all_excluded() -> None:
+    cache = _cache(
+        _entry("a", Health.OK, overage_pct=99),
+        _entry("b", Health.OK, overage_pct=85),
+    )
+    outcome = pick(
+        cache, ["a", "b"],
+        strategy=Strategy.LEAST_USED, max_cost=50, now=FIXED_NOW,
+    )
+    assert outcome.chosen is None
+    assert "a" in outcome.excluded_reasons
+    assert "b" in outcome.excluded_reasons
+
+
+# ---------------------------------------------------------------------------
+# Phase B — explain population (excluded_reasons + filter_scores)
+# ---------------------------------------------------------------------------
+
+
+def test_pick_populates_filter_scores_for_candidates() -> None:
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=10),
+        _entry("b", Health.OK, weekly_pct=20),
+        _entry("c", Health.OK, weekly_pct=30),
+    )
+    outcome = pick(
+        cache, ["a", "b", "c"],
+        strategy=Strategy.LEAST_USED, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert set(outcome.filter_scores.keys()) == {"a", "b", "c"}
+    assert outcome.filter_scores["a"] == 10.0
+    assert outcome.filter_scores["b"] == 20.0
+
+
+def test_pick_populates_excluded_reasons_for_health_failures() -> None:
+    cache = _cache(
+        _entry("dead", Health.AUTH_DEAD),
+        _entry("ok", Health.OK, weekly_pct=10),
+    )
+    outcome = pick(
+        cache, ["dead", "ok"],
+        strategy=Strategy.LEAST_USED, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert "dead" in outcome.excluded_reasons
+    assert "auth_dead" in outcome.excluded_reasons["dead"]
+    assert "ok" in outcome.filter_scores
+
+
+def test_pick_populates_excluded_reasons_for_avoid_filter() -> None:
+    cache = _cache(
+        _entry("a", Health.OK, weekly_pct=10),
+        _entry("b", Health.OK, weekly_pct=20),
+    )
+    outcome = pick(
+        cache, ["a", "b"],
+        strategy=Strategy.LEAST_USED, avoid={"a"}, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert "a" in outcome.excluded_reasons
+    assert "avoid" in outcome.excluded_reasons["a"].lower()
+
+
+def test_pick_populates_excluded_reasons_for_max_cost_filter() -> None:
+    cache = _cache(
+        _entry("ok", Health.OK, weekly_pct=10, overage_pct=10),
+        _entry("hot", Health.OK, weekly_pct=10, overage_pct=90),
+    )
+    outcome = pick(
+        cache, ["ok", "hot"],
+        strategy=Strategy.LEAST_USED, max_cost=80, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert "hot" in outcome.excluded_reasons
+    assert "overage" in outcome.excluded_reasons["hot"].lower()
+
+
+def test_pick_filter_scores_present_in_sticky_path(
+    _isolate_pick_paths: Path,
+) -> None:
+    """Even on the sticky shortcut, filter_scores should be populated for the
+    chosen profile so --explain rendering works in that path too."""
+    cache = _cache(
+        _entry("sticky", Health.OK, weekly_pct=50),
+        _entry("other", Health.OK, weekly_pct=10),
+    )
+    _write_last_pick_at("sticky", FIXED_NOW - timedelta(seconds=30))
+    outcome = pick(
+        cache, ["sticky", "other"],
+        strategy=Strategy.STICKY, now=FIXED_NOW,
+    )
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "sticky"
+    assert "sticky" in outcome.filter_scores

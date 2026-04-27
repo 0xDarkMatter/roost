@@ -432,7 +432,8 @@ def test_json_default_handles_naive_datetime() -> None:
 
 
 def test_json_default_handles_aware_datetime() -> None:
-    from datetime import UTC as _UTC, datetime as _dt
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
 
     serialised = output._json_default(_dt(2026, 4, 25, 10, 30, 0, tzinfo=_UTC))
     assert serialised == "2026-04-25T10:30:00Z"
@@ -638,7 +639,8 @@ def test_discover_in_skips_files_in_profiles_dir(tmp_path) -> None:
 def test_humanize_until_handles_naive_target_and_naive_now() -> None:
     """Both `target` and `now` without tzinfo should be coerced to UTC for
     the delta calculation — covers the two `if .tzinfo is None` guards."""
-    from datetime import datetime as _dt, timedelta
+    from datetime import datetime as _dt
+    from datetime import timedelta
 
     naive_now = _dt(2026, 4, 25, 10, 0, 0)  # naive
     naive_target = naive_now + timedelta(minutes=5)  # naive

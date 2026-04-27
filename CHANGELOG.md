@@ -5,6 +5,125 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+### Added
+
+**Symmetric profile management**
+
+- **`roost remove <name>`** — symmetric counterpart to `add`. Recursively
+  removes the profile directory, drops its cache entry, and clears
+  `last-pick.json` if it pointed at the removed profile. Top-level + `profiles
+  remove` namespace alias. The original `~/.claude/.credentials.json` is
+  never touched.
+- **`roost rename <old> <new>`** — atomic dir rename, drops old cache entry
+  (new name re-discovers fresh on next probe), clears stale stickiness.
+  `--force` overwrites an existing destination.
+- **`roost which`** — read-only counterpart to `pick`. Returns what `pick`
+  *would* choose right now without writing to `picks.log` or
+  `last-pick.json`. Useful for debugging "why is it choosing X?" without
+  contaminating stickiness state. Pairs naturally with `pick --explain`.
+
+**Pick algorithm**
+
+- **`pick --avoid <name>`** — repeatable. Excludes named profiles from
+  selection. Composes with all strategies and with `--count`. Bypasses
+  stickiness if the sticky pick is in the avoid list.
+- **`pick --fallback <name>`** — if the primary pick fails for any reason,
+  return this profile name with a stderr warning. Useful for scripts that
+  prefer "any profile" over "no profile". Non-existent fallbacks
+  propagate the original failure (so typos don't silently succeed).
+- **`pick --max-cost <pct>`** — skip profiles whose monthly overage
+  utilization is ≥ N%. Profiles without overage data (Pro/Team plans, or
+  Max plans with overage disabled) are NEVER excluded — they have no
+  cost signal to gate against.
+- **`pick --strategy lowest-overage`** — new strategy: minimum monthly
+  overage utilization wins. Different signal from `least-used` (weekly%);
+  meaningful for users on Max overage budgets where the monthly cap
+  matters more than rolling weekly use.
+- **`pick --explain`** — render the pick decision tree to stderr (or fold
+  into `data.explain` in JSON mode): discovered names, ladder exclusions
+  with reasons, surviving candidates with strategy scores, plus the
+  rationale string. Works for both success and failure paths.
+
+**Observability**
+
+- **`roost stats [--since] [--profile]`** — aggregate over `picks.log`:
+  pick counts by profile + strategy, exec counts by rc, p50/p95
+  duration, failure rate. JSON-first; text mode renders a summary.
+- **`roost report --metric <m> [--sparkline] [--project]`** — aggregate
+  over the new `usage-log.ndjson`: per-profile min/max/avg/latest for
+  one metric, optional Unicode sparkline of the time-series, optional
+  linear burn-rate projection of when each profile will reach 100%.
+  Metrics: `weekly_pct | session_pct | sonnet_pct | opus_pct | overage_pct`.
+- **`roost config usage-log {on|off|status}`** — opt-in toggle for the
+  per-probe usage log at `<config>/usage-log.ndjson`. Disabled by
+  default for privacy. Marker file at `<config>/usage-log.enabled`
+  persists the toggle across daemon restarts; `CLAUDE_LB_USAGE_LOG=1`
+  env var also enables. Once on, every successful probe appends one
+  JSON record (ts, profile, health, percentages, latency).
+
+**Reliability**
+
+- **Per-profile `network_error` exponential backoff** — 30s → 60s → 120s →
+  240s → 480s, capped. Stops thundering-herd against a flapping endpoint
+  without forcing operators to invalidate the cache by hand. Counter
+  resets to 0 on any non-NETWORK_ERROR outcome. New
+  `ProfileHealth.consecutive_failures` field (Pydantic default 0 keeps
+  backwards-compat with v0.3.0 cache files).
+- **`refresh --jitter <seconds>`** — random 0..N second delay before
+  each per-profile refresh. Cron-friendly: spreads concurrent
+  invocations across the window so N machines don't all hit Anthropic's
+  OAuth endpoint at the top of the minute.
+
+**Integration surfaces**
+
+- **`roost shellinit [--shell <name>]`** — emit a shell function
+  definition that wraps `claude` through `roost exec --auto-refresh --
+  claude ...`. One-time setup; afterwards every `claude` invocation
+  routes through roost transparently. Templates for bash, zsh, fish,
+  PowerShell. Auto-detects shell from `$SHELL` or `$PSModulePath`.
+- **`roost trace <name>`** — verbose probe with full request/response
+  envelope dump + classifier reasoning. Bearer token redacted to last 4
+  characters in both text and JSON modes so traces are shareable in bug
+  reports.
+- **`roost top [--interval N]`** — live-refreshing TUI of the status
+  table. Rich `Live` loop, Ctrl+C to exit. Hidden `--iterations N`
+  flag bounds the loop for tests.
+
+**Testing**
+
+- **Live integration test suite** — `tests/test_live.py`, marked with
+  `pytest.mark.live`, default-skipped via the `-m 'not live'` addopts.
+  Run with `pytest -m live` against a real `~/.claude-profiles/` fleet.
+  Mirrors major mocked tests: probe, status, pick (each strategy),
+  pick --auto-refresh, pick --explain, refresh --soon, doctor, update,
+  trace, stats, list, show. Asserts shape (not specific values) so
+  fleet drift doesn't cause flakiness.
+
+### Changed
+
+- **`pick` JSON envelope** now includes `data.explain` (or
+  `error.details.explain`) when `--explain` is set. Existing scripts that
+  don't pass `--explain` see no change.
+- **`PickOutcome`** dataclass gains `excluded_reasons: dict[str, str]`
+  and `filter_scores: dict[str, float]` fields, populated on every
+  `pick()` call regardless of `--explain` mode (cost is negligible).
+- **`probe_many` / `probe_many_sync`** signatures gain `prev_failures:
+  dict[str, int] | None` for backoff state propagation. Backwards-compat
+  default is `None`.
+
+### Internal
+
+- New modules: `usage_log.py` (NDJSON append/read + opt-in toggle),
+  `stats.py` (picks.log aggregation + metric summaries + sparkline +
+  projection), `shell_init.py` (shell templates), `top.py` (Rich Live
+  loop).
+- New `discovery.MutationResult` + helpers (`remove_profile_dir`,
+  `rename_profile_dir`).
+- `cli._parse_pick_log` is now a thin alias for `stats.parse_pick_log`
+  (refactored for reuse by `stats` command).
+- Test count: **723 mocked + 28 live = 751 total** (up from 534 baseline).
+  Coverage maintained.
+
 ## [0.3.0] - 2026-04-25
 
 ### Added

@@ -516,3 +516,140 @@ async def test_refresh_profile_write_failed_when_atomic_write_raises(
     assert result.refreshed is False
     assert result.error_code == "WRITE_FAILED"
     assert "disk full" in (result.error_message or "")
+
+
+# ---------------------------------------------------------------------------
+# --jitter (Phase A)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refresh_jitter_zero_does_not_sleep(
+    tmp_path: Path,
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """jitter_s=0.0 (default) must skip the sleep entirely so existing behaviour
+    is preserved bit-for-bit."""
+    from claude_lb import refresh as refresh_mod
+
+    cred = tmp_path / "account-a" / ".credentials.json"
+    _write_credentials(cred)
+    respx_mock.post(TOKEN_URL).respond(
+        200,
+        json={"access_token": "x", "refresh_token": "y", "expires_in": 60},
+    )
+
+    sleeps: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(refresh_mod.asyncio, "sleep", _record_sleep)
+
+    result = await refresh_profile(_profile(cred), jitter_s=0.0)
+    assert result.refreshed is True
+    assert sleeps == []  # no sleep call at all
+
+
+@pytest.mark.asyncio
+async def test_refresh_jitter_positive_sleeps_within_window(
+    tmp_path: Path,
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """jitter_s>0 must call asyncio.sleep with a value in [0, jitter_s)."""
+    from claude_lb import refresh as refresh_mod
+
+    cred = tmp_path / "account-a" / ".credentials.json"
+    _write_credentials(cred)
+    respx_mock.post(TOKEN_URL).respond(
+        200,
+        json={"access_token": "x", "refresh_token": "y", "expires_in": 60},
+    )
+
+    captured: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        captured.append(seconds)
+
+    monkeypatch.setattr(refresh_mod.asyncio, "sleep", _record_sleep)
+    # Pin random.uniform for determinism — assert the value lands in
+    # [0, jitter_s) and that we DID call it with the right window.
+    captured_uniform: list[tuple[float, float]] = []
+    real_uniform = refresh_mod.random.uniform
+
+    def _record_uniform(a: float, b: float) -> float:
+        captured_uniform.append((a, b))
+        return real_uniform(a, b)
+
+    monkeypatch.setattr(refresh_mod.random, "uniform", _record_uniform)
+
+    result = await refresh_profile(_profile(cred), jitter_s=2.5)
+    assert result.refreshed is True
+    assert captured_uniform == [(0.0, 2.5)]
+    assert len(captured) == 1
+    assert 0.0 <= captured[0] < 2.5
+
+
+@pytest.mark.asyncio
+async def test_refresh_many_propagates_jitter_to_each_profile(
+    tmp_path: Path,
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """refresh_many's jitter_s must be threaded into each per-profile call."""
+    from claude_lb import refresh as refresh_mod
+
+    cred_a = tmp_path / "a" / ".credentials.json"
+    cred_b = tmp_path / "b" / ".credentials.json"
+    _write_credentials(cred_a)
+    _write_credentials(cred_b)
+    respx_mock.post(TOKEN_URL).respond(
+        200,
+        json={"access_token": "x", "refresh_token": "y", "expires_in": 60},
+    )
+
+    sleeps: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(refresh_mod.asyncio, "sleep", _record_sleep)
+    monkeypatch.setattr(refresh_mod.random, "uniform", lambda a, b: 1.5)
+
+    results = await refresh_many(
+        [_profile(cred_a, name="a"), _profile(cred_b, name="b")],
+        jitter_s=3.0,
+    )
+    assert all(r.refreshed for r in results)
+    # Each profile slept once with the same uniform draw.
+    assert sleeps == [1.5, 1.5]
+
+
+@pytest.mark.asyncio
+async def test_refresh_many_default_no_jitter(
+    tmp_path: Path,
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backwards-compat: refresh_many without jitter_s argument must not sleep."""
+    from claude_lb import refresh as refresh_mod
+
+    cred_a = tmp_path / "a" / ".credentials.json"
+    _write_credentials(cred_a)
+    respx_mock.post(TOKEN_URL).respond(
+        200,
+        json={"access_token": "x", "refresh_token": "y", "expires_in": 60},
+    )
+
+    sleeps: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(refresh_mod.asyncio, "sleep", _record_sleep)
+
+    results = await refresh_many([_profile(cred_a, name="a")])
+    assert all(r.refreshed for r in results)
+    assert sleeps == []

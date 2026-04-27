@@ -174,14 +174,21 @@ async def probe_many(
     profiles: list[Profile],
     *,
     prev_health: dict[str, Health] | None = None,
+    prev_failures: dict[str, int] | None = None,
     timeout: float = DEFAULT_TIMEOUT_S,
 ) -> list[ProfileHealth]:
     """Probe all profiles concurrently; returns results in input order.
 
     Profiles whose stored access token has already expired are classified
     as AUTH_EXPIRED locally, without a network round-trip.
+
+    `prev_failures` carries each profile's previous consecutive_failures
+    counter so this probe can update it: incremented on NETWORK_ERROR, reset
+    to 0 on any other outcome. The CLI passes the pre-probe cache values; the
+    counter is then persisted via the cache write that follows.
     """
     prev_health = prev_health or {}
+    prev_failures = prev_failures or {}
     if not profiles:
         return []
 
@@ -207,20 +214,44 @@ async def probe_many(
                 prev_health.get(profile.name),
             )
 
-    return [
+    results = [
         expired_results.get(p.name) or network_results[p.name]
         for p in profiles
     ]
+    # Per-profile consecutive_failures lifecycle: increment on NETWORK_ERROR,
+    # reset on anything else. The CLI saves the cache after this returns, so
+    # the updated counter persists for the next probe cycle's TTL calculation.
+    for r in results:
+        prior = prev_failures.get(r.name, 0)
+        if r.health is Health.NETWORK_ERROR:
+            r.consecutive_failures = prior + 1
+        else:
+            r.consecutive_failures = 0
+    # Best-effort opt-in usage log append. is_enabled() short-circuits when
+    # the feature is off so the import + check cost is negligible.
+    try:
+        from . import usage_log
+
+        usage_log.append_many(results)
+    except Exception:  # pragma: no cover  -- usage_log is best-effort
+        pass
+    return results
 
 
 def probe_many_sync(
     profiles: list[Profile],
     *,
     prev_health: dict[str, Health] | None = None,
+    prev_failures: dict[str, int] | None = None,
     timeout: float = DEFAULT_TIMEOUT_S,
 ) -> list[ProfileHealth]:
     """Blocking wrapper around probe_many(). Convenient for CLI callers."""
-    return asyncio.run(probe_many(profiles, prev_health=prev_health, timeout=timeout))
+    return asyncio.run(probe_many(
+        profiles,
+        prev_health=prev_health,
+        prev_failures=prev_failures,
+        timeout=timeout,
+    ))
 
 
 async def probe_raw_many(

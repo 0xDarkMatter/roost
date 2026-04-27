@@ -33,6 +33,26 @@ def last_pick_path() -> Path:
     return config_dir() / "last-pick.json"
 
 
+def usage_log_path() -> Path:
+    """Full path to usage-log.ndjson (per-probe usage trail; opt-in).
+
+    Append-only, no rotation. NDJSON one-record-per-line so it streams
+    cleanly without loading the whole file. Disabled by default — see
+    usage_log_marker_path() for the opt-in mechanism.
+    """
+    return config_dir() / "usage-log.ndjson"
+
+
+def usage_log_marker_path() -> Path:
+    """Full path to usage-log.enabled (opt-in marker file).
+
+    Existence of this file (or the CLAUDE_LB_USAGE_LOG=1 env var) enables
+    the per-probe usage logger. The marker file is preferred over an env var
+    for daemon contexts where preserving env across restarts is fragile.
+    """
+    return config_dir() / "usage-log.enabled"
+
+
 def profiles_dir() -> Path:
     """Directory to walk for profile discovery.
 

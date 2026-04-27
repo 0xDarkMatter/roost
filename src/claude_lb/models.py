@@ -98,6 +98,10 @@ class ProfileHealth(BaseModel):
     probe_latency_ms: int | None = None
     credentials_mtime: float | None = None
     subscription_type: str | None = None  # e.g. "max", "team", "pro"
+    # Counter for per-profile network_error backoff. Incremented on every
+    # consecutive NETWORK_ERROR probe, reset to 0 on any non-NETWORK_ERROR
+    # outcome. Default 0 keeps backwards-compat with v0.3.0 cache files.
+    consecutive_failures: int = 0
 
 
 class HealthCache(BaseModel):

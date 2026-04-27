@@ -152,3 +152,129 @@ def test_subscription_type_normalised_to_lowercase(
     profile = discovery.get_profile(name)
     assert profile is not None
     assert profile.subscription_type == "team"
+
+
+# ---------------------------------------------------------------------------
+# remove_profile_dir / rename_profile_dir (Phase A)
+# ---------------------------------------------------------------------------
+
+
+def test_remove_profile_dir_happy_path(profile_factory, credentials_dir: Path) -> None:
+    profile_factory("account-a")
+    target = credentials_dir / "account-a"
+    assert target.is_dir()
+
+    result = discovery.remove_profile_dir("account-a")
+
+    assert result.ok is True
+    assert result.name == "account-a"
+    assert result.path == target
+    assert not target.exists()
+
+
+def test_remove_profile_dir_unknown_returns_not_found(credentials_dir: Path) -> None:
+    result = discovery.remove_profile_dir("never-existed")
+    assert result.ok is False
+    assert result.error_code == "NOT_FOUND"
+    assert result.error_message and "no such profile directory" in result.error_message
+
+
+def test_remove_profile_dir_rejects_invalid_name() -> None:
+    result = discovery.remove_profile_dir("../escape")
+    assert result.ok is False
+    assert result.error_code == "VALIDATION_ERROR"
+
+
+def test_remove_profile_dir_refuses_when_path_is_file(credentials_dir: Path) -> None:
+    """Defensive: rmtree on a regular file would raise; we want a clean error."""
+    bogus = credentials_dir / "bogus"
+    bogus.write_text("not a dir")
+    result = discovery.remove_profile_dir("bogus")
+    assert result.ok is False
+    assert result.error_code == "VALIDATION_ERROR"
+    assert bogus.exists()  # untouched
+
+
+def test_remove_profile_dir_recursively_drops_extra_files(
+    profile_factory, credentials_dir: Path
+) -> None:
+    """A profile dir may contain a lock file or user-added cruft; remove takes
+    everything."""
+    profile_factory("account-a")
+    extra = credentials_dir / "account-a" / "extra.txt"
+    extra.write_text("scratch")
+    lock = credentials_dir / "account-a" / ".credentials.json.lock"
+    lock.write_text("")
+
+    result = discovery.remove_profile_dir("account-a")
+
+    assert result.ok is True
+    assert not (credentials_dir / "account-a").exists()
+
+
+def test_rename_profile_dir_happy_path(profile_factory, credentials_dir: Path) -> None:
+    profile_factory("old-name")
+    result = discovery.rename_profile_dir("old-name", "new-name")
+    assert result.ok is True
+    assert result.name == "new-name"
+    assert not (credentials_dir / "old-name").exists()
+    assert (credentials_dir / "new-name" / ".credentials.json").is_file()
+
+
+def test_rename_profile_dir_missing_source_returns_not_found(
+    credentials_dir: Path,
+) -> None:
+    result = discovery.rename_profile_dir("nope", "newname")
+    assert result.ok is False
+    assert result.error_code == "NOT_FOUND"
+
+
+def test_rename_profile_dir_destination_exists_without_force(
+    profile_factory, credentials_dir: Path
+) -> None:
+    profile_factory("a")
+    profile_factory("b")
+    result = discovery.rename_profile_dir("a", "b")
+    assert result.ok is False
+    assert result.error_code == "CONFLICT"
+    # Both still present.
+    assert (credentials_dir / "a").is_dir()
+    assert (credentials_dir / "b").is_dir()
+
+
+def test_rename_profile_dir_destination_exists_with_force(
+    profile_factory, credentials_dir: Path
+) -> None:
+    profile_factory("src", access_token="from-src")
+    profile_factory("dst", access_token="from-dst")
+    result = discovery.rename_profile_dir("src", "dst", force=True)
+    assert result.ok is True
+    # dst now contains src's credentials.
+    payload = json.loads(
+        (credentials_dir / "dst" / ".credentials.json").read_text()
+    )
+    assert payload["claudeAiOauth"]["accessToken"] == "from-src"
+    assert not (credentials_dir / "src").exists()
+
+
+def test_rename_profile_dir_rejects_invalid_old_name() -> None:
+    result = discovery.rename_profile_dir("bad/name", "valid")
+    assert result.ok is False
+    assert result.error_code == "VALIDATION_ERROR"
+    assert result.error_message and "old name" in result.error_message
+
+
+def test_rename_profile_dir_rejects_invalid_new_name(profile_factory) -> None:
+    profile_factory("good")
+    result = discovery.rename_profile_dir("good", "bad/name")
+    assert result.ok is False
+    assert result.error_code == "VALIDATION_ERROR"
+    assert result.error_message and "new name" in result.error_message
+
+
+def test_rename_profile_dir_rejects_identical_names(profile_factory) -> None:
+    profile_factory("same")
+    result = discovery.rename_profile_dir("same", "same")
+    assert result.ok is False
+    assert result.error_code == "VALIDATION_ERROR"
+    assert result.error_message and "identical" in result.error_message

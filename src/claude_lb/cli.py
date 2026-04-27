@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import sys
 from datetime import UTC
 from typing import Annotated, Any
@@ -13,12 +15,14 @@ from . import __version__
 from .cache import is_entry_fresh, load_cache, remove_profile, save_cache
 from .discovery import discover_profiles, get_profile
 from .doctor import report_to_dict, run_doctor
+from .exec_cmd import RC_NOT_FOUND, RC_TIMEOUT, ExecResult, run_child
 from .models import Health, HealthCache, ProfileHealth
 from .output import (
     build_status_payload,
     emit_error_json,
     emit_json,
     emit_text,
+    render_pick_explanation,
     render_status_table,
     stderr,
 )
@@ -29,10 +33,13 @@ from .pick import (
     pick,
     write_last_pick,
 )
-from .exec_cmd import RC_NOT_FOUND, RC_TIMEOUT, ExecResult, run_child
 from .platform_status import (
     format_status_line as _format_platform_status_line,
+)
+from .platform_status import (
     load_or_fetch as _load_platform_status,
+)
+from .platform_status import (
     to_json_meta as _platform_status_to_meta,
 )
 from .probe import probe_many_sync
@@ -235,7 +242,12 @@ def _load_or_probe(
     if to_probe:
         targets = [now_profiles[n] for n in to_probe]
         prev = {n: cache.profiles[n].health for n in to_probe if n in cache.profiles}
-        results = probe_many_sync(targets, prev_health=prev)
+        # Carry consecutive_failures across the probe so backoff can advance.
+        prev_failures = {
+            n: cache.profiles[n].consecutive_failures
+            for n in to_probe if n in cache.profiles
+        }
+        results = probe_many_sync(targets, prev_health=prev, prev_failures=prev_failures)
         for h in results:
             cache.profiles[h.name] = h
         save_cache(cache)
@@ -697,6 +709,58 @@ def profiles_pick(
             min=1,
         ),
     ] = 1,
+    avoid: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--avoid",
+            help=(
+                "Exclude this profile from selection. Repeatable: "
+                "`--avoid a --avoid b`. Composes with all strategies and with "
+                "--count. Stickiness is bypassed if the sticky pick is avoided."
+            ),
+            autocompletion=_complete_profile_names,
+        ),
+    ] = None,
+    fallback: Annotated[
+        str | None,
+        typer.Option(
+            "--fallback",
+            help=(
+                "If the primary pick fails for any reason, return this profile "
+                "name with a stderr warning. Useful for scripts that prefer "
+                "'any profile' over 'no profile'. The fallback is returned only "
+                "when it exists in discovery — non-existent fallbacks propagate "
+                "the original failure."
+            ),
+            autocompletion=_complete_profile_names,
+        ),
+    ] = None,
+    max_cost: Annotated[
+        int | None,
+        typer.Option(
+            "--max-cost",
+            help=(
+                "Skip profiles whose monthly overage utilization is >= N%%. "
+                "Profiles without overage data (Pro/Team plans, or Max plans "
+                "with overage disabled) are NEVER excluded — they have no "
+                "cost signal to gate against."
+            ),
+            min=0,
+            max=100,
+        ),
+    ] = None,
+    explain: Annotated[
+        bool,
+        typer.Option(
+            "--explain",
+            help=(
+                "Render the pick decision tree to stderr: discovered names, "
+                "ladder exclusions with reasons, surviving candidates with "
+                "strategy scores. In --json mode the same data is folded into "
+                "data.explain instead."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Pick the best healthy profile for scripting."""
     chosen_strategy = _validate_strategy(strategy)
@@ -709,6 +773,7 @@ def profiles_pick(
             "(can't export N vars with one name). Use --json instead."
         )
         raise typer.Exit(EXIT_VALIDATION)
+    avoid_set = set(avoid or [])
     cache, names = _load_or_probe(refresh=no_cache, max_age=max_age)
 
     if auto_refresh:
@@ -721,9 +786,78 @@ def profiles_pick(
         stickiness_s=stickiness,
         require_ok=require_ok,
         count=count,
+        avoid=avoid_set,
+        max_cost=max_cost,
     )
 
+    # --explain rendering kicks in regardless of success/failure. In text mode
+    # it prints a Rich table to stderr; in JSON mode it's folded into the
+    # data.explain block (success) or error.details.explain (failure).
+    explain_payload: dict[str, Any] | None = None
+    if explain:
+        explain_payload = {
+            "discovered": names,
+            "chosen": outcome.chosen.name if outcome.chosen else None,
+            "strategy_used": (
+                outcome.strategy_used.value
+                if outcome.strategy_used else chosen_strategy.value
+            ),
+            "rationale": outcome.rationale,
+            "excluded_reasons": outcome.excluded_reasons,
+            "filter_scores": outcome.filter_scores,
+        }
+        if not json_output:
+            render_pick_explanation(
+                discovered_names=names,
+                chosen=outcome.chosen.name if outcome.chosen else None,
+                strategy=(
+                    outcome.strategy_used.value
+                    if outcome.strategy_used else chosen_strategy.value
+                ),
+                rationale=outcome.rationale,
+                excluded_reasons=outcome.excluded_reasons,
+                filter_scores=outcome.filter_scores,
+            )
+
     if not outcome.ok:
+        # --fallback intercepts failure before any error rendering: if the
+        # fallback name is in discovery (and not itself avoided), use it with
+        # a stderr warning. Cache health is not consulted — fallback's whole
+        # job is "give me SOMETHING" when the ladder + strategy say no.
+        if fallback is not None and fallback in names and fallback not in avoid_set:
+            stderr.print(
+                f"[yellow]fallback:[/yellow] primary pick failed "
+                f"({(outcome.reason or PickFailureReason.NO_PROFILES).value}); "
+                f"using {fallback}"
+            )
+            from datetime import datetime as _dt_fallback
+
+            entry = cache.profiles.get(fallback) or ProfileHealth(
+                name=fallback,
+                health=Health.UNKNOWN,
+                probed_at=_dt_fallback.now(UTC),
+            )
+            write_last_pick(fallback)
+            score = 1.0 if entry.health is Health.OK else 0.5
+            append_pick_log(fallback, chosen_strategy, score)
+            if json_output:
+                payload: dict[str, Any] = {
+                    "data": {
+                        "name": fallback,
+                        "health": entry.health.value,
+                        "score": score,
+                        "rationale": "fallback: primary pick failed",
+                        "strategy": chosen_strategy.value,
+                    }
+                }
+                if explain_payload is not None:
+                    payload["data"]["explain"] = explain_payload
+                emit_json(payload)
+            elif export:
+                emit_text(f"{var_name}={fallback}")
+            else:
+                emit_text(fallback)
+            return
         reason = outcome.reason or PickFailureReason.NO_PROFILES
         exit_code = REASON_TO_EXIT.get(reason, EXIT_ERROR)
         message = REASON_MESSAGES.get(reason, "Pick failed.")
@@ -733,14 +867,15 @@ def profiles_pick(
                 f"{outcome.earliest_recovery_at.isoformat().replace('+00:00', 'Z')}"
             )
         if json_output:
-            emit_error_json(
-                reason.value.upper(),
-                message,
-                {"earliest_recovery_at": (
+            details: dict[str, Any] = {
+                "earliest_recovery_at": (
                     outcome.earliest_recovery_at.isoformat().replace("+00:00", "Z")
                     if outcome.earliest_recovery_at else None
-                )},
-            )
+                ),
+            }
+            if explain_payload is not None:
+                details["explain"] = explain_payload
+            emit_error_json(reason.value.upper(), message, details)
         stderr.print(f"[red]{message}[/red]")
         raise typer.Exit(exit_code)
 
@@ -778,16 +913,25 @@ def profiles_pick(
         # array {"data": [...], "meta": {...}} for count > 1.
         if count == 1:
             primary_score = 1.0 if chosen.health is Health.OK else 0.5
-            emit_json({
-                "data": {
-                    "name": chosen.name,
-                    "health": chosen.health.value,
-                    "score": primary_score,
-                    "rationale": outcome.rationale,
-                    "strategy": strategy_used.value,
-                }
-            })
+            data: dict[str, Any] = {
+                "name": chosen.name,
+                "health": chosen.health.value,
+                "score": primary_score,
+                "rationale": outcome.rationale,
+                "strategy": strategy_used.value,
+            }
+            if explain_payload is not None:
+                data["explain"] = explain_payload
+            emit_json({"data": data})
         else:
+            meta: dict[str, Any] = {
+                "count": len(picks),
+                "requested": count,
+                "strategy": strategy_used.value,
+                "rationale": outcome.rationale,
+            }
+            if explain_payload is not None:
+                meta["explain"] = explain_payload
             emit_json({
                 "data": [
                     {
@@ -797,12 +941,7 @@ def profiles_pick(
                     }
                     for e in picks
                 ],
-                "meta": {
-                    "count": len(picks),
-                    "requested": count,
-                    "strategy": strategy_used.value,
-                    "rationale": outcome.rationale,
-                },
+                "meta": meta,
             })
         return
     if export:
@@ -828,6 +967,18 @@ def top_pick(
     warn_at: Annotated[int | None, typer.Option("--warn-at")] = None,
     auto_refresh: Annotated[bool, typer.Option("--auto-refresh")] = False,
     count: Annotated[int, typer.Option("--count", "-n", min=1)] = 1,
+    avoid: Annotated[
+        list[str] | None,
+        typer.Option("--avoid", autocompletion=_complete_profile_names),
+    ] = None,
+    fallback: Annotated[
+        str | None,
+        typer.Option("--fallback", autocompletion=_complete_profile_names),
+    ] = None,
+    max_cost: Annotated[
+        int | None, typer.Option("--max-cost", min=0, max=100)
+    ] = None,
+    explain: Annotated[bool, typer.Option("--explain")] = False,
 ) -> None:
     """Alias for `profiles pick`."""
     profiles_pick(
@@ -842,6 +993,10 @@ def top_pick(
         warn_at=warn_at,
         auto_refresh=auto_refresh,
         count=count,
+        avoid=avoid,
+        fallback=fallback,
+        max_cost=max_cost,
+        explain=explain,
     )
 
 
@@ -899,6 +1054,7 @@ def _run_refresh(
     expired_only: bool,
     soon_seconds: int | None,
     timeout: float,
+    jitter_s: float,
     json_output: bool,
 ) -> None:
     from datetime import UTC, datetime, timedelta
@@ -975,7 +1131,7 @@ def _run_refresh(
         stderr.print("[green]Nothing to refresh.[/green]")
         return
 
-    results = refresh_many_sync(targets, timeout=timeout)
+    results = refresh_many_sync(targets, timeout=timeout, jitter_s=jitter_s)
     refreshed_count = sum(1 for r in results if r.refreshed)
     failed_count = len(results) - refreshed_count
 
@@ -1089,6 +1245,19 @@ def profiles_refresh(
     timeout: Annotated[
         float, typer.Option("--timeout", help="HTTP timeout per refresh, seconds.")
     ] = 10.0,
+    jitter: Annotated[
+        float,
+        typer.Option(
+            "--jitter",
+            help=(
+                "Random delay 0..N seconds before each refresh (per profile). "
+                "Cron-friendly: spreads concurrent invocations across the "
+                "window so N machines don't all hit Anthropic's OAuth endpoint "
+                "at the top of the minute. Default 0 (no jitter)."
+            ),
+            min=0.0,
+        ),
+    ] = 0.0,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Exchange stored refresh tokens for fresh access tokens (SPEC §10)."""
@@ -1113,6 +1282,7 @@ def profiles_refresh(
         expired_only=expired_only,
         soon_seconds=soon_secs,
         timeout=timeout,
+        jitter_s=jitter,
         json_output=json_output,
     )
 
@@ -1127,6 +1297,7 @@ def top_refresh(
     expired_only: Annotated[bool, typer.Option("--expired")] = False,
     soon: Annotated[str | None, typer.Option("--soon")] = None,
     timeout: Annotated[float, typer.Option("--timeout")] = 10.0,
+    jitter: Annotated[float, typer.Option("--jitter", min=0.0)] = 0.0,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Alias for `profiles refresh`."""
@@ -1136,6 +1307,7 @@ def top_refresh(
         expired_only=expired_only,
         soon=soon,
         timeout=timeout,
+        jitter=jitter,
         json_output=json_output,
     )
 
@@ -1612,55 +1784,350 @@ def add(
 
 
 # ---------------------------------------------------------------------------
+# remove — symmetric counterpart to `add`; deletes a profile dir + cache entry
+# ---------------------------------------------------------------------------
+
+
+def _clear_last_pick_if_matches(name: str) -> bool:
+    """Drop last-pick.json when it points at `name`. Returns True if cleared.
+
+    Used by `remove` and `rename` so stickiness can't reference a profile that
+    no longer exists. Best-effort — a write failure on cleanup must not block
+    the primary mutation, since the next pick will discard the stale entry
+    naturally.
+    """
+    from .paths import last_pick_path
+    from .pick import read_last_pick
+
+    last = read_last_pick()
+    if last is None or last[0] != name:
+        return False
+    target = last_pick_path()
+    try:
+        target.unlink()
+    except OSError:  # pragma: no cover  -- cleanup is best-effort; missing file fine
+        pass
+    return True
+
+
+def _do_remove(
+    name: str,
+    *,
+    json_output: bool,
+) -> None:
+    """Shared implementation for `remove` (top-level + profiles namespace)."""
+    from .discovery import remove_profile_dir
+
+    result = remove_profile_dir(name)
+    if not result.ok:
+        code = result.error_code or "ERROR"
+        msg = result.error_message or f"failed to remove {name}"
+        exit_map = {
+            "VALIDATION_ERROR": EXIT_VALIDATION,
+            "NOT_FOUND": EXIT_NOT_FOUND,
+        }
+        exit_code = exit_map.get(code, EXIT_ERROR)
+        if json_output:
+            emit_error_json(code, msg)
+        stderr.print(f"[red]{msg}[/red]")
+        raise typer.Exit(exit_code)
+
+    cache_dropped = remove_profile(name)
+    last_pick_cleared = _clear_last_pick_if_matches(name)
+
+    if json_output:
+        emit_json({
+            "data": {
+                "name": name,
+                "path": str(result.path) if result.path else None,
+                "cache_dropped": cache_dropped,
+                "last_pick_cleared": last_pick_cleared,
+            },
+            "meta": {"action": "removed"},
+        })
+        return
+    stderr.print(f"[green]removed[/green] profile {name!r} → {result.path}")
+    if cache_dropped:
+        stderr.print("  cache entry dropped")
+    if last_pick_cleared:
+        stderr.print("  last-pick reset (was pointing at the removed profile)")
+
+
+@app.command("remove")
+def remove(
+    name: Annotated[
+        str,
+        typer.Argument(
+            help="Profile to remove (matches `add <name>`).",
+            autocompletion=_complete_profile_names,
+        ),
+    ],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Delete a profile directory + its cache entry.
+
+    Symmetric counterpart to `claude-lb add`. The profile directory under
+    ~/.claude-profiles/<name>/ is recursively removed; the health cache entry
+    is invalidated; and last-pick.json is cleared if it pointed at this
+    profile. The original credentials at ~/.claude/.credentials.json (the
+    source `add` copies from) are NOT touched.
+    """
+    _do_remove(name, json_output=json_output)
+
+
+@profiles_app.command("remove")
+def profiles_remove(
+    name: Annotated[
+        str, typer.Argument(autocompletion=_complete_profile_names)
+    ],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Alias for `remove`."""
+    _do_remove(name, json_output=json_output)
+
+
+# ---------------------------------------------------------------------------
+# rename — move a profile dir to a new name; refresh last-pick + cache
+# ---------------------------------------------------------------------------
+
+
+def _do_rename(
+    old: str,
+    new: str,
+    *,
+    force: bool,
+    json_output: bool,
+) -> None:
+    """Shared implementation for `rename` (top-level + profiles namespace)."""
+    from .discovery import rename_profile_dir
+
+    result = rename_profile_dir(old, new, force=force)
+    if not result.ok:
+        code = result.error_code or "ERROR"
+        msg = result.error_message or f"failed to rename {old} -> {new}"
+        exit_map = {
+            "VALIDATION_ERROR": EXIT_VALIDATION,
+            "NOT_FOUND": EXIT_NOT_FOUND,
+            "CONFLICT": EXIT_CONFLICT,
+        }
+        exit_code = exit_map.get(code, EXIT_ERROR)
+        if json_output:
+            emit_error_json(code, msg)
+        stderr.print(f"[red]{msg}[/red]")
+        raise typer.Exit(exit_code)
+
+    # Cache: drop the old entry; the new name will be re-probed naturally on
+    # the next status/pick. We don't try to migrate the entry under the new
+    # key — the credentials_mtime invariant in is_entry_fresh would correctly
+    # detect a "new" profile, but a fresh probe is cleaner than guessing.
+    cache_dropped = remove_profile(old)
+    last_pick_cleared = _clear_last_pick_if_matches(old)
+
+    if json_output:
+        emit_json({
+            "data": {
+                "old": old,
+                "new": new,
+                "path": str(result.path) if result.path else None,
+                "cache_dropped": cache_dropped,
+                "last_pick_cleared": last_pick_cleared,
+            },
+            "meta": {"action": "renamed"},
+        })
+        return
+    stderr.print(
+        f"[green]renamed[/green] {old!r} → {new!r} ({result.path})"
+    )
+    stderr.print(
+        f"  next: claude-lb probe {new}  (re-classify health under the new name)"
+    )
+
+
+@app.command("rename")
+def rename(
+    old: Annotated[
+        str,
+        typer.Argument(
+            help="Existing profile name.",
+            autocompletion=_complete_profile_names,
+        ),
+    ],
+    new: Annotated[
+        str,
+        typer.Argument(help="New profile name (must match [A-Za-z0-9_-]+)."),
+    ],
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            "-f",
+            help="If a profile with the new name already exists, replace it.",
+        ),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Rename a profile directory and reset its cached health.
+
+    The credentials file is moved (preserving its mtime so already-cached
+    health for OTHER profiles is unaffected). The OLD profile's cache entry
+    is dropped; the NEW name will discover fresh on the next probe cycle.
+    """
+    _do_rename(old, new, force=force, json_output=json_output)
+
+
+@profiles_app.command("rename")
+def profiles_rename(
+    old: Annotated[
+        str, typer.Argument(autocompletion=_complete_profile_names)
+    ],
+    new: Annotated[str, typer.Argument()],
+    force: Annotated[bool, typer.Option("--force", "-f")] = False,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Alias for `rename`."""
+    _do_rename(old, new, force=force, json_output=json_output)
+
+
+# ---------------------------------------------------------------------------
+# which — read-only counterpart to `pick`: returns the would-be pick
+# ---------------------------------------------------------------------------
+
+
+def _do_which(
+    *,
+    strategy: Strategy,
+    stickiness: int | None,
+    require_ok: bool,
+    no_cache: bool,
+    max_age: int | None,
+    avoid: list[str] | None,
+    json_output: bool,
+) -> None:
+    """Shared implementation for `which` (top-level + profiles namespace).
+
+    Mirrors `pick`'s decision logic exactly but skips both side effects:
+    last-pick.json is NOT updated, picks.log is NOT appended. Useful for
+    debugging ("what would pick return right now?") without contaminating
+    stickiness state. Probing IS allowed — that's freshness, not state.
+    """
+    avoid_set = set(avoid or [])
+    cache, names = _load_or_probe(refresh=no_cache, max_age=max_age)
+    outcome = pick(
+        cache,
+        names,
+        strategy=strategy,
+        stickiness_s=stickiness,
+        require_ok=require_ok,
+        count=1,
+        avoid=avoid_set,
+    )
+    if not outcome.ok:
+        reason = outcome.reason or PickFailureReason.NO_PROFILES
+        exit_code = REASON_TO_EXIT.get(reason, EXIT_ERROR)
+        message = REASON_MESSAGES.get(reason, "Pick failed.")
+        if json_output:
+            emit_error_json(reason.value.upper(), message)
+        stderr.print(f"[red]{message}[/red]")
+        raise typer.Exit(exit_code)
+    assert outcome.chosen is not None
+    chosen = outcome.chosen
+    if json_output:
+        emit_json({
+            "data": {
+                "name": chosen.name,
+                "health": chosen.health.value,
+                "rationale": outcome.rationale,
+                "strategy": (outcome.strategy_used or strategy).value,
+            },
+            "meta": {"side_effects": False},
+        })
+        return
+    emit_text(chosen.name)
+
+
+@app.command("which")
+def which(
+    strategy: Annotated[
+        str,
+        typer.Option("--strategy", autocompletion=_complete_strategy),
+    ] = "sticky",
+    stickiness: Annotated[int | None, typer.Option("--stickiness")] = None,
+    require_ok: Annotated[bool, typer.Option("--require-ok")] = False,
+    no_cache: Annotated[bool, typer.Option("--no-cache")] = False,
+    max_age: Annotated[int | None, typer.Option("--max-age")] = None,
+    avoid: Annotated[
+        list[str] | None,
+        typer.Option("--avoid", autocompletion=_complete_profile_names),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Return the profile that `pick` WOULD choose right now — without side effects.
+
+    Identical decision logic to `pick`, but skips the side effects that `pick`
+    writes:
+      - last-pick.json is NOT updated (stickiness state preserved)
+      - picks.log is NOT appended (no audit-trail noise)
+
+    Useful for debugging ("why is it choosing X?"), pre-flight checks, or
+    pairing with `--explain` (Phase B) to understand the decision tree
+    without committing to it. Cache may still be probed if stale (that's
+    freshness, not state).
+    """
+    chosen_strategy = _validate_strategy(strategy)
+    _do_which(
+        strategy=chosen_strategy,
+        stickiness=stickiness,
+        require_ok=require_ok,
+        no_cache=no_cache,
+        max_age=max_age,
+        avoid=avoid,
+        json_output=json_output,
+    )
+
+
+@profiles_app.command("which")
+def profiles_which(
+    strategy: Annotated[
+        str, typer.Option("--strategy", autocompletion=_complete_strategy)
+    ] = "sticky",
+    stickiness: Annotated[int | None, typer.Option("--stickiness")] = None,
+    require_ok: Annotated[bool, typer.Option("--require-ok")] = False,
+    no_cache: Annotated[bool, typer.Option("--no-cache")] = False,
+    max_age: Annotated[int | None, typer.Option("--max-age")] = None,
+    avoid: Annotated[
+        list[str] | None,
+        typer.Option("--avoid", autocompletion=_complete_profile_names),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Alias for `which`."""
+    chosen_strategy = _validate_strategy(strategy)
+    _do_which(
+        strategy=chosen_strategy,
+        stickiness=stickiness,
+        require_ok=require_ok,
+        no_cache=no_cache,
+        max_age=max_age,
+        avoid=avoid,
+        json_output=json_output,
+    )
+
+
+# ---------------------------------------------------------------------------
 # history — read picks.log
 # ---------------------------------------------------------------------------
 
 
+# _parse_pick_log lives in stats.py for re-use by the `stats` command. Kept as
+# a thin alias here so the original symbol stays importable for backwards-compat
+# with any external callers.
 def _parse_pick_log(path: Any) -> list[dict[str, Any]]:
-    """Parse picks.log into structured entries.
-
-    Lines are tab-separated:
-        {ts}\\t{profile}\\t{action}\\t{key=value}...
-    Where action is a strategy name (`sticky`, `least-used`, ...) for picks
-    or `EXEC` for child runs. Malformed lines are skipped silently — the log
-    is rotated under load and a partial last line is plausible.
-    """
-    from datetime import UTC, datetime as _dt
+    """Backwards-compat alias for stats.parse_pick_log."""
     from pathlib import Path as _Path
 
-    entries: list[dict[str, Any]] = []
-    if not _Path(str(path)).is_file():
-        return entries
-    try:
-        text = _Path(str(path)).read_text(encoding="utf-8")
-    except OSError:
-        return entries
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 3:
-            continue
-        ts_raw, profile, action = parts[0], parts[1], parts[2]
-        try:
-            iso = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
-            ts = _dt.fromisoformat(iso)
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=UTC)
-        except ValueError:
-            continue
-        details: dict[str, str] = {}
-        for chunk in parts[3:]:
-            if "=" in chunk:
-                k, v = chunk.split("=", 1)
-                details[k] = v
-        entries.append({
-            "timestamp": ts,
-            "profile": profile,
-            "action": action,
-            "details": details,
-        })
-    return entries
+    from .stats import parse_pick_log
+
+    return parse_pick_log(_Path(str(path)))
 
 
 @app.command("history")
@@ -1697,7 +2164,8 @@ def history(
     Filters compose: `--profile account-a --since 1h --tail 5` shows the last
     five entries for account-a within the past hour.
     """
-    from datetime import UTC, datetime as _dt, timedelta
+    from datetime import UTC, timedelta
+    from datetime import datetime as _dt
 
     from .pick import pick_log_path
 
@@ -1770,7 +2238,7 @@ def history(
             dur = e["details"].get("dur", "")
             detail = f"argv={argv} rc={rc} dur={dur}".strip()
             action_style = (
-                f"[green]EXEC[/green]" if rc == "0" else f"[red]EXEC[/red]"
+                "[green]EXEC[/green]" if rc == "0" else "[red]EXEC[/red]"
             )
         else:
             detail = " ".join(f"{k}={v}" for k, v in e["details"].items())
@@ -1779,6 +2247,617 @@ def history(
 
     stderr.print(table)
     emit_text(f"{len(final)} of {len(all_entries)} entries")
+
+
+# ---------------------------------------------------------------------------
+# stats — aggregate over picks.log
+# ---------------------------------------------------------------------------
+
+
+@app.command("stats")
+def stats(
+    since: Annotated[
+        str | None,
+        typer.Option(
+            "--since",
+            help=(
+                "Aggregate only entries within this window: '30m', '1h', '2d', "
+                "'1w', or seconds. Default: all-time."
+            ),
+        ),
+    ] = None,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            help="Filter to one profile only.",
+            autocompletion=_complete_profile_names,
+        ),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Aggregate picks.log into pick + exec counts and exec-duration percentiles.
+
+    Reads from `<config>/picks.log` (the audit trail every `pick` and `exec`
+    invocation appends to). Useful for "what's been happening lately?"
+    without grepping a tab-separated file by hand.
+
+    Output (text mode) is a compact summary on stdout; JSON mode emits
+    `{data: ..., meta: ...}` for scripting. No mutation — purely read-side.
+    """
+    from datetime import UTC, timedelta
+    from datetime import datetime as _dt
+
+    from .paths import pick_log_path
+    from .stats import aggregate_stats, parse_pick_log
+
+    cutoff: _dt | None = None
+    if since is not None:
+        secs = _parse_duration(since)
+        if secs is None:
+            if json_output:
+                emit_error_json(
+                    "VALIDATION_ERROR",
+                    f"invalid --since value: {since!r}",
+                )
+            stderr.print(
+                f"[red]invalid --since value:[/red] {since!r}"
+            )
+            raise typer.Exit(EXIT_VALIDATION)
+        cutoff = _dt.now(UTC) - timedelta(seconds=secs)
+
+    log_path = pick_log_path()
+    entries = parse_pick_log(log_path)
+    if cutoff is not None:
+        entries = [e for e in entries if e["timestamp"] >= cutoff]
+    if profile:
+        entries = [e for e in entries if e["profile"] == profile]
+
+    report = aggregate_stats(entries)
+
+    if json_output:
+        emit_json({
+            "data": report.to_json(),
+            "meta": {
+                "log_path": str(log_path),
+                "filters": {"since": since, "profile": profile},
+            },
+        })
+        return
+
+    if report.pick_total == 0 and report.exec_total == 0:
+        if not log_path.is_file():
+            stderr.print("[yellow]No picks.log yet.[/yellow]")
+        else:
+            stderr.print("[yellow]No matching entries.[/yellow]")
+        return
+
+    stderr.print(f"[bold]picks.log stats[/bold]  ({log_path})")
+    if report.window_start and report.window_end:
+        stderr.print(
+            f"  window: {report.window_start.isoformat()} → "
+            f"{report.window_end.isoformat()}"
+        )
+    if report.pick_total:
+        stderr.print(f"\n[bold]Picks[/bold]  total={report.pick_total}")
+        for p, n in report.pick_by_profile.most_common():
+            stderr.print(f"  {p:<20} {n}")
+        stderr.print("  by strategy:")
+        for s, n in report.pick_by_strategy.most_common():
+            stderr.print(f"    {s:<18} {n}")
+    if report.exec_total:
+        stderr.print(f"\n[bold]Execs[/bold]  total={report.exec_total}")
+        for p, n in report.exec_by_profile.most_common():
+            stderr.print(f"  {p:<20} {n}")
+        stderr.print("  by rc:")
+        for rc, n in report.exec_by_rc.most_common():
+            colour = "[green]" if rc == "0" else "[red]"
+            stderr.print(f"    {colour}rc={rc}[/]  {n}")
+        if report.exec_p50_ms is not None:
+            stderr.print(
+                f"  duration: p50={report.exec_p50_ms:.0f}ms "
+                f"p95={report.exec_p95_ms:.0f}ms"
+            )
+        if report.exec_failure_rate is not None:
+            stderr.print(
+                f"  failure rate: {report.exec_failure_rate * 100:.1f}%"
+            )
+
+
+# ---------------------------------------------------------------------------
+# report — aggregate over usage-log.ndjson (per-probe history)
+# ---------------------------------------------------------------------------
+
+
+@app.command("report")
+def report(
+    metric: Annotated[
+        str,
+        typer.Option(
+            "--metric",
+            help=(
+                "Which metric to aggregate. Options: weekly_pct, session_pct, "
+                "sonnet_pct, opus_pct, overage_pct."
+            ),
+        ),
+    ] = "weekly_pct",
+    since: Annotated[
+        str | None,
+        typer.Option(
+            "--since",
+            help="Aggregate only records within this window (default: all).",
+        ),
+    ] = None,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            help="Filter to one profile only.",
+            autocompletion=_complete_profile_names,
+        ),
+    ] = None,
+    sparkline_flag: Annotated[
+        bool,
+        typer.Option(
+            "--sparkline",
+            help="Include a Unicode sparkline of the time-series per profile.",
+        ),
+    ] = False,
+    project: Annotated[
+        bool,
+        typer.Option(
+            "--project",
+            help=(
+                "Show a linear burn-rate projection for when each profile's "
+                "metric will reach 100%%. Best-effort hint, not a guarantee."
+            ),
+        ),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Aggregate `<config>/usage-log.ndjson` into per-profile metric summaries.
+
+    Requires usage logging to be enabled (off by default — see
+    `claude-lb config usage-log on`). Reports min/max/avg/latest per profile
+    for the chosen metric, optionally rendering a Unicode sparkline of the
+    time-series and a linear burn-rate projection.
+    """
+    from datetime import UTC, timedelta
+    from datetime import datetime as _dt
+
+    from . import usage_log
+    from .stats import project_exhaustion, sparkline, summarise_metric
+
+    valid_metrics = {
+        "weekly_pct", "session_pct", "sonnet_pct", "opus_pct", "overage_pct",
+    }
+    if metric not in valid_metrics:
+        msg = (
+            f"invalid --metric: {metric!r}. "
+            f"Pick one of: {', '.join(sorted(valid_metrics))}"
+        )
+        if json_output:
+            emit_error_json("VALIDATION_ERROR", msg)
+        stderr.print(f"[red]{msg}[/red]")
+        raise typer.Exit(EXIT_VALIDATION)
+
+    cutoff: _dt | None = None
+    if since is not None:
+        secs = _parse_duration(since)
+        if secs is None:
+            msg = f"invalid --since: {since!r}"
+            if json_output:
+                emit_error_json("VALIDATION_ERROR", msg)
+            stderr.print(f"[red]{msg}[/red]")
+            raise typer.Exit(EXIT_VALIDATION)
+        cutoff = _dt.now(UTC) - timedelta(seconds=secs)
+
+    if not usage_log.is_enabled():
+        # The log file may still exist from a prior enabled period — so don't
+        # block, just warn.
+        stderr.print(
+            "[yellow]usage logging is off[/yellow] — "
+            "enable with `claude-lb config usage-log on` "
+            "for fresh data going forward."
+        )
+
+    records = list(usage_log.iter_records(since=cutoff, profile=profile))
+    summaries = summarise_metric(records, metric=metric)
+
+    payload_data: list[dict[str, Any]] = []
+    for s in summaries:
+        d = s.to_json()
+        if sparkline_flag:
+            d["sparkline"] = sparkline([v for _, v in s.series])
+        if project:
+            secs = project_exhaustion(s)
+            d["seconds_to_100"] = secs
+        payload_data.append(d)
+
+    if json_output:
+        emit_json({
+            "data": payload_data,
+            "meta": {
+                "metric": metric,
+                "records_total": len(records),
+                "filters": {
+                    "since": since,
+                    "profile": profile,
+                },
+                "log_path": str(usage_log.usage_log_path()),
+            },
+        })
+        return
+
+    log_path = usage_log.usage_log_path()
+    if not summaries:
+        if not log_path.is_file():
+            stderr.print(f"[yellow]No usage log yet.[/yellow] ({log_path})")
+        else:
+            stderr.print("[yellow]No matching records.[/yellow]")
+        return
+
+    from rich.table import Table
+
+    table = Table(
+        title=f"Usage report — {metric}",
+        title_justify="left",
+        show_lines=False,
+        expand=False,
+    )
+    table.add_column("Profile", no_wrap=True)
+    table.add_column("Samples", justify="right")
+    table.add_column("Min", justify="right")
+    table.add_column("Max", justify="right")
+    table.add_column("Avg", justify="right")
+    table.add_column("Latest", justify="right")
+    if sparkline_flag:
+        table.add_column("Trend", no_wrap=True)
+    if project:
+        table.add_column("ETA → 100%", no_wrap=True)
+
+    for s in summaries:
+        row = [
+            s.profile,
+            str(s.samples),
+            f"{s.minimum:.1f}" if s.minimum is not None else "—",
+            f"{s.maximum:.1f}" if s.maximum is not None else "—",
+            f"{s.average:.1f}" if s.average is not None else "—",
+            f"{s.latest:.1f}" if s.latest is not None else "—",
+        ]
+        if sparkline_flag:
+            row.append(sparkline([v for _, v in s.series]))
+        if project:
+            secs = project_exhaustion(s)
+            if secs is None:
+                row.append("—")
+            else:
+                row.append(_humanize_elapsed(secs).replace(" ago", ""))
+        table.add_row(*row)
+    stderr.print(table)
+    emit_text(f"{len(records)} records across {len(summaries)} profile(s)")
+
+
+# ---------------------------------------------------------------------------
+# config — opt-in toggles (currently: usage-log on/off/status)
+# ---------------------------------------------------------------------------
+
+config_app = typer.Typer(help="Configuration toggles (opt-in features).")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("usage-log")
+def config_usage_log(
+    state: Annotated[
+        str,
+        typer.Argument(
+            help="One of: on, off, status.",
+        ),
+    ],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Enable, disable, or check the per-probe usage log.
+
+    Disabled by default for privacy. When enabled, every successful probe
+    appends one JSON record to `<config>/usage-log.ndjson`, which `report`
+    reads back. The toggle persists via a marker file at
+    `<config>/usage-log.enabled` so daemons/cron survive across restarts.
+
+    The CLAUDE_LB_USAGE_LOG=1 env var also enables the log without writing a
+    marker — useful for one-off scripts or container envs.
+    """
+    from . import usage_log
+
+    state_lower = state.strip().lower()
+    if state_lower == "status":
+        currently = usage_log.is_enabled()
+        marker = usage_log.usage_log_marker_path()
+        env_set = os.environ.get(usage_log.ENV_VAR, "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if json_output:
+            emit_json({
+                "data": {
+                    "enabled": currently,
+                    "marker_present": marker.is_file(),
+                    "env_var_set": env_set,
+                    "log_path": str(usage_log.usage_log_path()),
+                    "marker_path": str(marker),
+                }
+            })
+            return
+        stderr.print(
+            f"usage-log: [{'green' if currently else 'yellow'}]"
+            f"{'enabled' if currently else 'disabled'}[/]"
+        )
+        stderr.print(f"  marker: {'present' if marker.is_file() else 'absent'} ({marker})")
+        stderr.print(f"  env:    {'set' if env_set else 'unset'} ({usage_log.ENV_VAR})")
+        stderr.print(f"  log:    {usage_log.usage_log_path()}")
+        return
+
+    if state_lower == "on":
+        path = usage_log.enable_marker()
+        if json_output:
+            emit_json({"data": {"enabled": True, "marker_path": str(path)}})
+            return
+        stderr.print(f"[green]usage-log enabled[/green] → marker at {path}")
+        stderr.print(
+            "  next probe will start appending to "
+            f"{usage_log.usage_log_path()}"
+        )
+        return
+
+    if state_lower == "off":
+        removed = usage_log.disable_marker()
+        if json_output:
+            emit_json({"data": {"enabled": False, "marker_removed": removed}})
+            return
+        if removed:
+            stderr.print("[yellow]usage-log disabled[/yellow] (marker removed)")
+        else:
+            stderr.print("[yellow]usage-log was not enabled[/yellow] (no marker present)")
+        return
+
+    msg = f"invalid state: {state!r}. Use one of: on, off, status."
+    if json_output:
+        emit_error_json("VALIDATION_ERROR", msg)
+    stderr.print(f"[red]{msg}[/red]")
+    raise typer.Exit(EXIT_VALIDATION)
+
+
+# ---------------------------------------------------------------------------
+# shellinit — emit shell function templates for `claude` wrapper integration
+# ---------------------------------------------------------------------------
+
+
+@app.command("shellinit")
+def shellinit(
+    shell: Annotated[
+        str | None,
+        typer.Option(
+            "--shell",
+            help=(
+                "Override the auto-detected shell. One of: bash, zsh, fish, "
+                "pwsh. Default: detect from $SHELL (POSIX) or $PSModulePath "
+                "(Windows)."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Emit a shell function definition that wraps `claude` through `roost exec`.
+
+    Designed to be evaluated into the user's shell rc:
+
+        # bash/zsh
+        eval "$(claude-lb shellinit)"
+
+        # fish
+        claude-lb shellinit | source
+
+        # PowerShell
+        claude-lb shellinit | Out-String | Invoke-Expression
+
+    Once installed, every `claude` invocation routes through `roost exec
+    --auto-refresh -- claude ...` — so profile selection, auth refresh, and
+    audit logging happen transparently. Remove the function from your rc to
+    revert.
+    """
+    from .shell_init import SUPPORTED_SHELLS, detect_shell, template_for
+
+    target = (shell or detect_shell()).strip().lower()
+    if target not in SUPPORTED_SHELLS:
+        msg = (
+            f"unknown shell: {target!r}. "
+            f"Supported: {', '.join(SUPPORTED_SHELLS)}"
+        )
+        stderr.print(f"[red]{msg}[/red]")
+        raise typer.Exit(EXIT_VALIDATION)
+    template = template_for(target)
+    sys.stdout.write(template)
+    if not template.endswith("\n"):
+        sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# trace — verbose probe with full request/response + classifier reasoning
+# ---------------------------------------------------------------------------
+
+
+def _redact_token(token: str) -> str:
+    """Show only the last 4 characters of a token; everything else as `***`."""
+    if not token:
+        return "***"
+    if len(token) <= 4:
+        return "***" + token
+    return "Bearer ***..." + token[-4:]
+
+
+@app.command("trace")
+def trace(
+    name: Annotated[
+        str,
+        typer.Argument(
+            help="Profile to trace.",
+            autocompletion=_complete_profile_names,
+        ),
+    ],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Verbose-probe one profile and dump request/response + classifier reasoning.
+
+    Like `roost probe --raw`, but also runs the classifier and explains its
+    decision. The bearer token is redacted to its last 4 characters in both
+    text and JSON output so the trace is shareable in bug reports.
+    """
+    from .probe import ANTHROPIC_BETA, ANTHROPIC_VERSION, API_URL, probe_raw_many_sync
+    from .taxonomy import classify
+
+    profile = get_profile(name)
+    if profile is None:
+        if json_output:
+            emit_error_json("NOT_FOUND", f"No such profile: {name}")
+        stderr.print(f"[red]No such profile:[/red] {name}")
+        raise typer.Exit(EXIT_NOT_FOUND)
+
+    raw_results = probe_raw_many_sync([profile])
+    if not raw_results:
+        msg = "trace produced no result"
+        if json_output:
+            emit_error_json("ERROR", msg)
+        stderr.print(f"[red]{msg}[/red]")
+        raise typer.Exit(EXIT_ERROR)
+
+    _name, status_code, body, headers = raw_results[0]
+
+    # Reconstruct the request envelope for display.
+    req_headers = {
+        "Authorization": _redact_token(profile.access_token),
+        "anthropic-beta": ANTHROPIC_BETA,
+        "anthropic-version": ANTHROPIC_VERSION,
+    }
+
+    # Run classifier explicitly to get the same decision the cache write would.
+    from .models import ClassificationResult
+
+    # We don't have the original ProbeInput; build one from the raw response.
+    from .probe import (  # type: ignore[attr-defined]
+        ProbeInput,
+    )
+
+    probe_input = ProbeInput(
+        status_code=status_code,
+        body=body if isinstance(body, dict) else None,
+        headers=headers,
+        exception_kind=None,
+    )
+    classification: ClassificationResult = classify(probe_input)
+
+    if json_output:
+        emit_json({
+            "data": {
+                "profile": name,
+                "request": {
+                    "method": "GET",
+                    "url": API_URL,
+                    "headers": req_headers,
+                },
+                "response": {
+                    "status_code": status_code,
+                    "headers": headers,
+                    "body": body,
+                },
+                "classification": {
+                    "health": classification.health.value,
+                    "error": (
+                        classification.error.model_dump()
+                        if classification.error else None
+                    ),
+                    "retry_after_s": classification.retry_after_s,
+                    "session_reset_at": (
+                        classification.session_reset_at.isoformat().replace("+00:00", "Z")
+                        if classification.session_reset_at else None
+                    ),
+                    "weekly_reset_at": (
+                        classification.weekly_reset_at.isoformat().replace("+00:00", "Z")
+                        if classification.weekly_reset_at else None
+                    ),
+                },
+            }
+        })
+        return
+
+    from rich.panel import Panel
+
+    stderr.print(Panel(
+        f"GET {API_URL}\n"
+        + "\n".join(f"  {k}: {v}" for k, v in req_headers.items()),
+        title=f"Request — {name}",
+        title_align="left",
+    ))
+    stderr.print(Panel(
+        f"Status: {status_code}\n"
+        + "\n".join(f"  {k}: {v}" for k, v in (headers or {}).items())
+        + ("\n\nBody:\n" + json.dumps(body, indent=2) if body is not None else ""),
+        title="Response",
+        title_align="left",
+    ))
+    err_line = (
+        f"  error: {classification.error.type} — {classification.error.message}"
+        if classification.error else ""
+    )
+    stderr.print(Panel(
+        f"  health: {classification.health.value}"
+        + (("\n" + err_line) if err_line else ""),
+        title="Classifier",
+        title_align="left",
+    ))
+
+
+# ---------------------------------------------------------------------------
+# top — live-refreshing TUI of the status table
+# ---------------------------------------------------------------------------
+
+
+@app.command("top")
+def top(
+    interval: Annotated[
+        float,
+        typer.Option(
+            "--interval",
+            help="Refresh interval in seconds.",
+            min=0.1,
+        ),
+    ] = 2.0,
+    iterations: Annotated[
+        int | None,
+        typer.Option(
+            "--iterations",
+            help=(
+                "(Test seam) Stop after N frames. Default: infinite (Ctrl+C to "
+                "exit)."
+            ),
+            hidden=True,
+        ),
+    ] = None,
+) -> None:
+    """Live-refreshing status table. Ctrl+C to exit.
+
+    Reads the cache on every tick; if a profile's entry is stale, the next
+    tick re-probes it (same logic as `claude-lb status`). For one-shot
+    snapshots, use `claude-lb status` — `top` is for "leave on a side
+    monitor" workflows, especially during incidents.
+    """
+    from .top import run_live
+
+    def _refresh() -> tuple[HealthCache, list[str]]:
+        return _load_or_probe(refresh=False, max_age=None)
+
+    run_live(
+        refresh_fn=_refresh,
+        interval_s=interval,
+        max_iterations=iterations,
+    )
 
 
 # ---------------------------------------------------------------------------

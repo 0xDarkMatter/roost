@@ -329,3 +329,125 @@ def test_doctor_cache_readable_handles_oserror_on_read(
     result = doctor_mod._check_cache_readable()
     assert result.passed is False
     assert "cannot be read" in result.detail.lower()
+
+
+# ---------------------------------------------------------------------------
+# Phase D — exponential network_error backoff
+# ---------------------------------------------------------------------------
+
+
+def test_network_backoff_seconds_progression() -> None:
+    """30s -> 60s -> 120s -> 240s -> 480s, then capped at 480s."""
+    from claude_lb.cache import network_backoff_seconds
+
+    assert network_backoff_seconds(0) == 30
+    assert network_backoff_seconds(1) == 60
+    assert network_backoff_seconds(2) == 120
+    assert network_backoff_seconds(3) == 240
+    assert network_backoff_seconds(4) == 480
+    assert network_backoff_seconds(5) == 480
+    assert network_backoff_seconds(50) == 480
+
+
+def test_network_backoff_negative_clamped_to_zero() -> None:
+    from claude_lb.cache import network_backoff_seconds
+
+    assert network_backoff_seconds(-1) == 30
+    assert network_backoff_seconds(-100) == 30
+
+
+def test_is_entry_fresh_network_error_with_zero_failures_uses_static_ttl() -> None:
+    """consecutive_failures=0 keeps the original behaviour: expires_at drives
+    freshness, no backoff override."""
+    from datetime import UTC, datetime, timedelta
+
+    from claude_lb.cache import is_entry_fresh
+    from claude_lb.models import Health, ProfileHealth
+
+    now = datetime.now(UTC)
+    entry = ProfileHealth(
+        name="x",
+        health=Health.NETWORK_ERROR,
+        probed_at=now,
+        expires_at=now + timedelta(seconds=20),
+        consecutive_failures=0,
+    )
+    assert is_entry_fresh(entry, now=now) is True
+    # Past expires_at -> stale
+    assert is_entry_fresh(entry, now=now + timedelta(seconds=25)) is False
+
+
+def test_is_entry_fresh_network_error_backoff_extends_ttl() -> None:
+    """consecutive_failures > 0 extends TTL beyond the static expires_at."""
+    from datetime import UTC, datetime, timedelta
+
+    from claude_lb.cache import is_entry_fresh
+    from claude_lb.models import Health, ProfileHealth
+
+    now = datetime.now(UTC)
+    # 1 prior failure -> 60s backoff
+    entry = ProfileHealth(
+        name="x",
+        health=Health.NETWORK_ERROR,
+        probed_at=now,
+        expires_at=now + timedelta(seconds=10),  # ignored when backoff active
+        consecutive_failures=1,
+    )
+    # 30s in: backoff says 60s, so still fresh.
+    assert is_entry_fresh(entry, now=now + timedelta(seconds=30)) is True
+    # 70s in: past 60s backoff -> stale.
+    assert is_entry_fresh(entry, now=now + timedelta(seconds=70)) is False
+
+
+def test_is_entry_fresh_network_error_backoff_caps_at_480s() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from claude_lb.cache import is_entry_fresh
+    from claude_lb.models import Health, ProfileHealth
+
+    now = datetime.now(UTC)
+    entry = ProfileHealth(
+        name="x",
+        health=Health.NETWORK_ERROR,
+        probed_at=now,
+        consecutive_failures=10,
+    )
+    # Just under 480s -> still fresh.
+    assert is_entry_fresh(entry, now=now + timedelta(seconds=479)) is True
+    # Just over 480s -> stale.
+    assert is_entry_fresh(entry, now=now + timedelta(seconds=481)) is False
+
+
+def test_is_entry_fresh_non_network_state_unaffected_by_failures_field() -> None:
+    """consecutive_failures should only affect NETWORK_ERROR entries."""
+    from datetime import UTC, datetime, timedelta
+
+    from claude_lb.cache import is_entry_fresh
+    from claude_lb.models import Health, ProfileHealth
+
+    now = datetime.now(UTC)
+    entry = ProfileHealth(
+        name="x",
+        health=Health.OK,
+        probed_at=now,
+        expires_at=now + timedelta(seconds=10),
+        consecutive_failures=99,  # ignored for non-NETWORK_ERROR
+    )
+    assert is_entry_fresh(entry, now=now + timedelta(seconds=5)) is True
+    assert is_entry_fresh(entry, now=now + timedelta(seconds=20)) is False
+
+
+def test_consecutive_failures_default_zero_for_backwards_compat() -> None:
+    """Old health.json files written by v0.3.0 lack consecutive_failures.
+    Pydantic should default the missing field to 0 without raising."""
+    from datetime import UTC, datetime
+
+    from claude_lb.models import ProfileHealth
+
+    raw = {
+        "name": "x",
+        "health": "ok",
+        "probed_at": datetime.now(UTC).isoformat(),
+    }
+    entry = ProfileHealth.model_validate(raw)
+    assert entry.consecutive_failures == 0

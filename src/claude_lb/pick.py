@@ -66,6 +66,10 @@ class Strategy(str, Enum):
     ROUND_ROBIN = "round-robin"
     WEIGHTED = "weighted"
     FIRST_HEALTHY = "first-healthy"
+    # Lowest monthly overage utilization wins. Different signal from least-used
+    # (which is weekly%) — meaningful for users on Max overage budgets where
+    # the monthly cap matters more than the rolling weekly cap.
+    LOWEST_OVERAGE = "lowest-overage"
 
 
 class PickFailureReason(str, Enum):
@@ -85,6 +89,11 @@ class PickOutcome:
     `chosen` is the primary (first) pick; `chosen_many` is the ordered list of
     all picks (length 1 for single-pick, up to `count` for multi-pick). The
     two fields always agree: `chosen == chosen_many[0]` when ok is True.
+
+    `excluded_reasons` and `filter_scores` are populated for observability,
+    consumed by the CLI `--explain` flag. They are populated regardless of
+    explain mode (the cost is one dict per pick — negligible) so that the
+    JSON envelope always carries the same shape.
     """
 
     chosen: ProfileHealth | None = None
@@ -93,6 +102,8 @@ class PickOutcome:
     reason: PickFailureReason | None = None
     earliest_recovery_at: datetime | None = None
     rationale: str = ""
+    excluded_reasons: dict[str, str] = field(default_factory=dict)
+    filter_scores: dict[str, float] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -321,6 +332,65 @@ def _sort_round_robin(
     return sorted(entries, key=key)
 
 
+def _overage_pct(entry: ProfileHealth) -> int:
+    """Monthly overage utilization as 0-100 int. Treats missing data as 0
+    (lowest = best), so profiles without overage configured naturally win
+    the lowest-overage race over profiles that have any overage usage."""
+    if entry.usage is None or entry.usage.extra is None:
+        return 0
+    val = entry.usage.extra.utilization
+    return val if val is not None else 0
+
+
+def _sort_lowest_overage(entries: list[ProfileHealth]) -> list[ProfileHealth]:
+    """Sort by monthly overage utilization ascending (lower = better)."""
+    def key(e: ProfileHealth) -> tuple[int, int, float]:
+        health_rank = 0 if e.health is Health.OK else 1
+        return (health_rank, _overage_pct(e), -(e.probed_at.timestamp()))
+
+    return sorted(entries, key=key)
+
+
+# ---------------------------------------------------------------------------
+# Score helpers — surfaced via PickOutcome.filter_scores for --explain
+# ---------------------------------------------------------------------------
+
+
+def _score_for_strategy(entry: ProfileHealth, strategy: Strategy) -> float:
+    """Numeric score (lower=better, except FIRST_HEALTHY where order=value).
+
+    Used purely for `--explain` rendering — the actual sort uses the dedicated
+    sort functions above. Centralising the score derivation keeps the explain
+    output consistent with what each strategy actually optimises for.
+    """
+    if strategy is Strategy.LEAST_USED:
+        return float(
+            entry.usage.weekly_pct
+            if (entry.usage and entry.usage.weekly_pct is not None)
+            else 0
+        )
+    if strategy is Strategy.WEIGHTED:
+        weekly = float(
+            entry.usage.weekly_pct
+            if (entry.usage and entry.usage.weekly_pct is not None)
+            else 0
+        )
+        session = float(
+            entry.usage.session_pct
+            if (entry.usage and entry.usage.session_pct is not None)
+            else 0
+        )
+        return weekly / (session + 1.0)
+    if strategy is Strategy.LOWEST_OVERAGE:
+        return float(_overage_pct(entry))
+    if strategy is Strategy.ROUND_ROBIN:
+        # Rank by recency (more recent = higher score = sorted later).
+        return entry.probed_at.timestamp()
+    # FIRST_HEALTHY / STICKY don't have a numeric score — treat health as the
+    # signal: 0 for OK, 1 otherwise.
+    return 0.0 if entry.health is Health.OK else 1.0
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -334,6 +404,8 @@ def pick(
     stickiness_s: int | None = None,
     require_ok: bool = False,
     count: int = 1,
+    avoid: set[str] | None = None,
+    max_cost: int | None = None,
     now: datetime | None = None,
     last_pick_path_override: Path | None = None,
 ) -> PickOutcome:
@@ -348,10 +420,22 @@ def pick(
     the same profile" semantic that doesn't compose with multi-pick. If fewer
     than `count` candidates pass the filter ladder, returns what we have; the
     caller decides whether partial fulfilment is acceptable.
+
+    `avoid` is an optional set of profile names to exclude. Composes with all
+    strategies and with `count > 1`. When stickiness would otherwise pin to an
+    avoided name, the sticky shortcut is skipped and the strategy sort runs.
+
+    `max_cost` (0-100) excludes profiles whose monthly overage utilization is
+    >= max_cost. Profiles without overage data (Pro/Team plans, or Max plans
+    with overage disabled) are NEVER excluded by this filter — they have no
+    monetary cost signal and would otherwise be punished for being on the
+    cheaper plan.
     """
     now = now or _now()
     if count < 1:
         count = 1
+    avoid_set = avoid or set()
+    excluded_reasons: dict[str, str] = {}
 
     # Materialise ProfileHealth entries in discovery order, including stubs
     # for profiles without a cache record.
@@ -365,11 +449,47 @@ def pick(
     if not entries:
         return PickOutcome(reason=PickFailureReason.NO_PROFILES)
 
-    # Failure-mode diagnostics if no one passes the ladder.
-    selectable = [e for e in entries if _is_selectable(e, now, require_ok)]
+    # Failure-mode diagnostics if no one passes the ladder. Filters are layered
+    # so the `--explain` output can attribute each exclusion to the specific
+    # filter that dropped it (health vs avoid vs max_cost).
+    health_passing: list[ProfileHealth] = []
+    for e in entries:
+        if _is_selectable(e, now, require_ok):
+            health_passing.append(e)
+        else:
+            excluded_reasons[e.name] = f"health={e.health.value}"
+
+    after_avoid: list[ProfileHealth] = []
+    for e in health_passing:
+        if e.name in avoid_set:
+            excluded_reasons[e.name] = "avoid (--avoid)"
+        else:
+            after_avoid.append(e)
+
+    if max_cost is not None:
+        after_cost: list[ProfileHealth] = []
+        for e in after_avoid:
+            # Only profiles with measurable overage data are gated. Profiles
+            # without overage info pass through — see docstring.
+            if (
+                e.usage is not None
+                and e.usage.extra is not None
+                and e.usage.extra.utilization is not None
+                and e.usage.extra.utilization >= max_cost
+            ):
+                excluded_reasons[e.name] = (
+                    f"overage {e.usage.extra.utilization}% >= {max_cost}%"
+                )
+            else:
+                after_cost.append(e)
+        selectable = after_cost
+    else:
+        selectable = after_avoid
 
     if not selectable:
-        return _diagnose_failure(entries, require_ok)
+        outcome = _diagnose_failure(entries, require_ok)
+        outcome.excluded_reasons = excluded_reasons
+        return outcome
 
     # Stickiness pre-check — only when strategy is STICKY AND single-pick.
     # Multi-pick (count > 1) ignores stickiness: "keep returning the same
@@ -381,7 +501,9 @@ def pick(
             if last is not None:
                 last_name, last_ts = last
                 delta = (now - last_ts).total_seconds()
-                if 0 <= delta < stickiness:
+                # Skip the sticky shortcut entirely if the last pick is in the
+                # avoid set — otherwise we'd return the avoided name.
+                if 0 <= delta < stickiness and last_name not in avoid_set:
                     for entry in selectable:
                         if entry.name == last_name and entry.health is Health.OK:
                             return PickOutcome(
@@ -391,6 +513,8 @@ def pick(
                                 rationale=(
                                     f"sticky: last pick within {stickiness}s window"
                                 ),
+                                excluded_reasons=excluded_reasons,
+                                filter_scores={entry.name: 0.0},
                             )
 
     # Fall through to the underlying sort.
@@ -407,9 +531,18 @@ def pick(
     elif fallback is Strategy.FIRST_HEALTHY:
         ordered = _sort_first_healthy(selectable)
         rationale = "first-healthy: first ok in discovery order"
+    elif fallback is Strategy.LOWEST_OVERAGE:
+        ordered = _sort_lowest_overage(selectable)
+        rationale = "lowest-overage: minimum monthly overage utilization"
     else:
         ordered = _sort_least_used(selectable)
         rationale = "least-used: lowest weekly usage among healthy"
+
+    # Filter scores for --explain. Computed on the entries that survived the
+    # ladder so noise from excluded entries doesn't pollute the rendering.
+    filter_scores = {
+        e.name: _score_for_strategy(e, fallback) for e in ordered
+    }
 
     top = ordered[:count]
     chosen = top[0]
@@ -418,6 +551,8 @@ def pick(
         chosen_many=top,
         strategy_used=fallback if strategy is Strategy.STICKY else strategy,
         rationale=rationale,
+        excluded_reasons=excluded_reasons,
+        filter_scores=filter_scores,
     )
 
 

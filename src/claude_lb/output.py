@@ -319,3 +319,60 @@ def _iso(value: datetime | None) -> str | None:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
     return value.isoformat().replace("+00:00", "Z")
+
+
+def render_pick_explanation(
+    *,
+    discovered_names: list[str],
+    chosen: str | None,
+    strategy: str,
+    rationale: str,
+    excluded_reasons: dict[str, str],
+    filter_scores: dict[str, float],
+) -> None:
+    """Render a pick decision tree to stderr.
+
+    Layout (Rich tables, no color noise):
+
+        Pick decision (strategy=least-used)
+        ┌─────────────┬──────────────┬───────────────┐
+        │ Profile     │ Status       │ Score / why   │
+        ├─────────────┼──────────────┼───────────────┤
+        │ account-a   │ excluded     │ health=...    │
+        │ account-b   │ candidate    │ score=12.0    │
+        │ account-c   │ ◀ chosen     │ score=8.0     │
+        └─────────────┴──────────────┴───────────────┘
+          Rationale: least-used: lowest weekly usage among healthy
+
+    The whole table is one render call (no incremental redraw) so it stays
+    readable when stderr is redirected to a file.
+    """
+    table = Table(
+        title=f"Pick decision (strategy={strategy})",
+        show_lines=False,
+        expand=False,
+        title_justify="left",
+    )
+    table.add_column("Profile", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Score / why", overflow="fold")
+
+    for name in discovered_names:
+        if name == chosen:
+            status = "[bold green]◀ chosen[/bold green]"
+            score = filter_scores.get(name)
+            detail = f"score={score:.2f}" if score is not None else "—"
+        elif name in excluded_reasons:
+            status = "[red]excluded[/red]"
+            detail = excluded_reasons[name]
+        elif name in filter_scores:
+            status = "candidate"
+            detail = f"score={filter_scores[name]:.2f}"
+        else:
+            status = "[dim]not considered[/dim]"
+            detail = "—"
+        table.add_row(name, status, detail)
+
+    stderr.print(table)
+    if rationale:
+        stderr.print(f"  Rationale: {rationale}")

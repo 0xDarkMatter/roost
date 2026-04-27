@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -246,7 +246,7 @@ def format_status_line(status: PlatformStatus) -> str:
         )
         parts.append(f"[yellow]degraded[/yellow]: {names}{more}")
 
-    return f"[cyan]·[/cyan] " + "  ".join(parts) + age_suffix
+    return "[cyan]·[/cyan] " + "  ".join(parts) + age_suffix
 
 
 def to_json_meta(status: PlatformStatus) -> dict[str, Any]:

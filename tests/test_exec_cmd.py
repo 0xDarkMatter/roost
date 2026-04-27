@@ -11,8 +11,6 @@ from __future__ import annotations
 import sys
 import time
 
-import pytest
-
 from claude_lb.exec_cmd import RC_NOT_FOUND, RC_TIMEOUT, ExecResult, run_child
 
 

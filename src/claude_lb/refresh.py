@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -180,6 +181,7 @@ async def refresh_profile(
     *,
     timeout: float = DEFAULT_TIMEOUT_S,
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT_S,
+    jitter_s: float = 0.0,
     client: httpx.AsyncClient | None = None,
 ) -> RefreshResult:
     """Refresh one profile's OAuth token. Rewrites .credentials.json on success.
@@ -188,6 +190,12 @@ async def refresh_profile(
     reading the refresh token, so two parallel `claude-lb refresh` invocations
     against the same profile serialize. Parallel refreshes of DIFFERENT
     profiles still fan out concurrently — each profile has its own lock file.
+
+    `jitter_s > 0` sleeps a random fraction of [0, jitter_s) seconds *before*
+    lock acquisition. Designed for cron contexts where many machines share one
+    credential set and `*/15 * * * *` would otherwise hammer Anthropic's OAuth
+    endpoint at the top of the minute. Applied per-profile, not per call —
+    parallel refreshes of N profiles each get their own random delay.
     """
     # Lazy-import filelock here so that a stale install (pyproject declares
     # the dep but tool venv hasn't been re-synced) fails with a clean
@@ -207,6 +215,12 @@ async def refresh_profile(
                 f"Reinstall with: uv tool install --reinstall --editable <repo-path>"
             ),
         )
+
+    if jitter_s > 0:
+        # Spread concurrent invocations across the jitter window. Sleep is
+        # cooperative (asyncio.sleep), so peer refreshes against OTHER
+        # profiles still proceed in parallel.
+        await asyncio.sleep(random.uniform(0.0, jitter_s))
 
     path = Path(profile.credentials_path)
     lock_file = _lock_path(path)
@@ -330,12 +344,16 @@ async def refresh_many(
     profiles: list[Profile],
     *,
     timeout: float = DEFAULT_TIMEOUT_S,
+    jitter_s: float = 0.0,
 ) -> list[RefreshResult]:
-    """Refresh multiple profiles concurrently."""
+    """Refresh multiple profiles concurrently. `jitter_s` propagates per-profile."""
     if not profiles:
         return []
     async with httpx.AsyncClient() as client:
-        tasks = [refresh_profile(p, timeout=timeout, client=client) for p in profiles]
+        tasks = [
+            refresh_profile(p, timeout=timeout, jitter_s=jitter_s, client=client)
+            for p in profiles
+        ]
         return list(await asyncio.gather(*tasks, return_exceptions=False))
 
 
@@ -343,6 +361,7 @@ def refresh_many_sync(
     profiles: list[Profile],
     *,
     timeout: float = DEFAULT_TIMEOUT_S,
+    jitter_s: float = 0.0,
 ) -> list[RefreshResult]:
     """Blocking wrapper for CLI callers."""
-    return asyncio.run(refresh_many(profiles, timeout=timeout))
+    return asyncio.run(refresh_many(profiles, timeout=timeout, jitter_s=jitter_s))

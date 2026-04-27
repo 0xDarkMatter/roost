@@ -157,6 +157,25 @@ roost list                           # Names of discovered profiles
 roost list --json                    # {data: [...], meta: {count}}
 ```
 
+### Profile management
+
+```bash
+roost add personal                   # Import ~/.claude/.credentials.json as 'personal'
+roost remove personal                # Delete a profile dir + drop cache entry
+roost rename old new                 # Move profile dir + reset cached health
+roost rename old new --force         # Overwrite an existing destination
+```
+
+`add` / `remove` are symmetric. `remove` recursively deletes the directory
+under `~/.claude-profiles/<name>/`, drops the health-cache entry, and clears
+`last-pick.json` if it pointed at the removed profile. The standard
+`~/.claude/.credentials.json` (the source `add` copies from) is **never**
+touched by either command.
+
+`rename` moves the directory atomically and drops the old cache entry; the
+new name re-classifies on the next probe. `--force` removes an existing
+destination first, matching the symmetry of `add --force`.
+
 ### Health
 
 ```bash
@@ -176,6 +195,7 @@ roost pick                           # Default: sticky (cache-locality)
 roost pick --strategy least-used     # Lowest weekly % wins
 roost pick --strategy round-robin    # Rotate through profiles
 roost pick --strategy weighted       # Combine weekly + session usage
+roost pick --strategy lowest-overage # Lowest monthly overage % wins
 roost pick --require-ok              # Exit 5 if none are ok
 roost pick --export                  # Shell-sourceable VAR=value
 roost pick --json                    # {data: {name, health, rationale}}
@@ -183,6 +203,11 @@ roost pick --warn-at 80              # Stderr warning when session/weekly ≥80%
 roost pick --auto-refresh            # Refresh auth_expired profiles inline, then pick
 roost pick --count 3                 # Return up to 3 profiles (newline-separated)
 roost pick -n 3 --strategy least-used  # Short form; lowest-3 weekly%
+roost pick --avoid account-b         # Exclude a profile (repeatable)
+roost pick --avoid a --avoid b       # Exclude multiple
+roost pick --max-cost 80             # Skip profiles ≥ 80% monthly overage
+roost pick --fallback account-a      # If primary pick fails, return this profile
+roost pick --explain                 # Render the decision tree to stderr
 ```
 
 `--auto-refresh` folds the `refresh --expired` preflight into `pick` itself:
@@ -203,6 +228,50 @@ roost pick --count 3 --json
 # {"data": [{...}, {...}, {...}], "meta": {"count": 3, "requested": 3, ...}}
 ```
 
+`--avoid <name>` is repeatable; composes with all strategies and with
+`--count`. If the sticky pick is in the avoid set, the sticky shortcut is
+skipped and the underlying strategy runs.
+
+`--max-cost N` excludes profiles whose monthly overage utilization is ≥ N%.
+Profiles **without** overage data (Pro/Team plans, or Max plans with overage
+disabled) are NEVER excluded — they have no cost signal to gate against.
+
+`--fallback <name>` is a script-friendly safety net: if the primary pick
+fails, return this profile name (with a stderr warning) instead of exiting
+non-zero. The fallback is honoured only when the named profile exists in
+discovery and is not also in `--avoid` — non-existent fallbacks propagate
+the original failure so typos don't silently succeed.
+
+`--explain` renders a decision tree to stderr (or, in `--json` mode, folds
+the same data into `data.explain`/`error.details.explain`):
+
+```text
+Pick decision (strategy=least-used)
+┌────────────┬────────────┬───────────────┐
+│ Profile    │ Status     │ Score / why   │
+├────────────┼────────────┼───────────────┤
+│ account-a  │ excluded   │ avoid (--avoid)│
+│ account-b  │ ◀ chosen   │ score=10.00   │
+│ account-c  │ candidate  │ score=20.00   │
+└────────────┴────────────┴───────────────┘
+  Rationale: least-used: lowest weekly usage among healthy
+```
+
+### Which (read-only pick)
+
+```bash
+roost which                          # What pick WOULD return — no side effects
+roost which --strategy least-used    # Honours all pick flags
+roost which --avoid account-a        # Including --avoid
+roost which --json                   # {data: ..., meta: {side_effects: false}}
+```
+
+`which` mirrors `pick`'s decision logic exactly but **does not** write to
+`picks.log` or update `last-pick.json`. Useful for "why is it choosing X?"
+debugging — pair with `--explain` to see the full decision tree without
+contaminating stickiness state. Probing is still allowed (that's freshness,
+not state).
+
 ### Refresh
 
 ```bash
@@ -211,12 +280,18 @@ roost refresh --all                  # Refresh every discovered profile
 roost refresh --expired              # Refresh only past-expiry profiles
 roost refresh --soon 30m             # Refresh anything expiring within 30 min
 roost refresh --soon 1h --json       # Cron-friendly: */15 * * * * <-- this
+roost refresh --all --jitter 5       # Random 0-5s delay before each refresh
 ```
 
 `--soon DURATION` is anticipatory: it covers already-expired tokens AND tokens
 expiring within the window. Combined with a 15-min cron, it keeps the fleet
 warm without `--auto-refresh` having to fire mid-spawn (with the latency cost
 that implies).
+
+`--jitter <seconds>` adds a per-profile random delay 0..N before each refresh.
+Cron-friendly: spreads concurrent invocations across the window so N machines
+sharing one credential set don't all hit Anthropic's OAuth endpoint at the
+top of the minute.
 
 `refresh` POSTs the stored refresh token to Anthropic's OAuth endpoint,
 atomically rewrites `.credentials.json` (preserving non-oauth fields), and
@@ -287,6 +362,48 @@ Reads `picks.log` (the audit trail every pick + exec writes to). Useful for
 "what did the daemon dispatch in the last hour?" without grepping a
 tab-separated file.
 
+### Stats & reporting
+
+Two complementary aggregations: `stats` summarises the **picks.log** audit
+trail; `report` summarises the **usage-log.ndjson** time-series of probe
+outcomes (opt-in — see `roost config usage-log on`).
+
+```bash
+roost stats                          # Pick + exec totals, p50/p95 dur, failure rate
+roost stats --since 1h               # Last hour only
+roost stats --profile account-a      # Filter to one profile
+roost stats --json                   # Structured envelope
+
+roost config usage-log on            # Enable per-probe NDJSON logging
+roost config usage-log status        # Check current state
+roost config usage-log off           # Disable
+
+roost report                         # Per-profile min/max/avg of weekly_pct
+roost report --metric session_pct    # Other metrics: session_pct | sonnet_pct | opus_pct | overage_pct
+roost report --sparkline             # Add a Unicode sparkline of the time-series
+roost report --project               # Linear burn-rate forecast: ETA → 100%
+roost report --since 1d --json       # Filter + structured output
+```
+
+Sample report output (with `--sparkline --project`):
+
+```text
+Usage report — weekly_pct
+┌────────────┬─────────┬─────┬─────┬──────┬────────┬──────────┬───────────┐
+│ Profile    │ Samples │ Min │ Max │ Avg  │ Latest │ Trend    │ ETA → 100%│
+├────────────┼─────────┼─────┼─────┼──────┼────────┼──────────┼───────────┤
+│ account-a  │     112 │ 5.0 │ 73.0│ 41.2 │   72.0 │ ▁▂▄▆▇█   │ 2h 14m    │
+│ account-b  │      98 │10.0 │ 22.0│ 16.8 │   18.0 │ ▃▅▄▄▃▂   │ —         │
+└────────────┴─────────┴─────┴─────┴──────┴────────┴──────────┴───────────┘
+```
+
+The usage log is **opt-in** — disabled by default. Enable via `roost config
+usage-log on` (writes a marker at `<config>/usage-log.enabled`) or set
+`CLAUDE_LB_USAGE_LOG=1`. Once enabled, every successful probe appends one
+JSON record to `<config>/usage-log.ndjson`. The file is append-only with no
+rotation; truncate manually (`> usage-log.ndjson`) or via the API
+(`usage_log.truncate()`).
+
 ### Shell completion
 
 ```bash
@@ -295,18 +412,62 @@ roost --show-completion              # Print the script without installing
 ```
 
 Once installed, `<TAB>` completes commands, flags, profile names (for `show`,
-`probe`, `refresh`, `invalidate`, `history --profile`), and `--strategy`
-values (`sticky | least-used | round-robin | weighted | first-healthy`).
+`probe`, `refresh`, `invalidate`, `history --profile`, `--avoid`,
+`--fallback`), and `--strategy` values (`sticky | least-used | round-robin |
+weighted | first-healthy | lowest-overage`).
+
+### Shell integration (transparent `claude` wrapper)
+
+```bash
+# bash / zsh — install once into your shell rc
+eval "$(roost shellinit)"
+
+# fish
+roost shellinit | source
+
+# PowerShell
+roost shellinit | Out-String | Invoke-Expression
+
+# Override auto-detection
+roost shellinit --shell fish
+```
+
+`shellinit` emits a shell function that wraps `claude` to call
+`roost exec --auto-refresh -- claude "$@"`. After eval, every `claude`
+invocation routes through roost transparently — profile selection, auth
+refresh, and audit logging all happen automatically. Remove the function
+from your shell rc to revert.
+
+### Live status TUI
+
+```bash
+roost top                            # Live-refreshing status table; Ctrl+C to exit
+roost top --interval 5               # Refresh every 5 seconds (default 2s)
+```
+
+`top` is a thin Rich `Live` wrapper around the same status data as
+`roost status`. Designed to leave on a side monitor during incidents — for
+one-shot snapshots, use `status` instead.
 
 ### Diagnostics
 
 ```bash
 roost probe --raw                    # Dump untouched /api/oauth/usage body
 roost probe --raw --json             # Machine-readable raw dump
+roost trace account-a                # Verbose probe + classifier reasoning
+roost trace account-a --json         # Same, structured output
 ```
 
 `--raw` bypasses classification and the cache write; useful for inspecting
 unknown fields Anthropic might add, or for capturing test fixtures.
+
+`trace <name>` runs a single full probe and dumps:
+- the request envelope (URL, headers — bearer token redacted to last 4 chars)
+- the raw response (status, headers, body)
+- the classifier's decision (health, error, reset timestamps)
+
+Designed to be shareable in bug reports — the token redaction is enforced in
+both text and JSON modes.
 
 ## Health Taxonomy
 
@@ -335,8 +496,19 @@ Classification order: network exception → local-expiry → 200+utilization →
 | `round-robin` | Rotate past the last-picked profile. |
 | `weighted` | `weekly_pct / (session_pct + 1)` — lower is better. |
 | `first-healthy` | First `ok` in discovery order. Deterministic for tests. |
+| `lowest-overage` | Lowest monthly overage `utilization` wins. Profiles without overage data rank as 0 (best) so Pro/Team plans are preferred over a Max plan with active overage. |
 
 Stickiness window: `--stickiness <s>` or `CLAUDE_LB_STICKINESS=<s>`. Set to `0` to disable.
+
+### Composing filters with strategies
+
+| Flag | Effect |
+|------|--------|
+| `--avoid <name>` (repeatable) | Exclude named profiles. Composes with all strategies + `--count`. Bypasses sticky if the sticky pick is avoided. |
+| `--max-cost <pct>` | Drop profiles with monthly overage `utilization >= pct`. Profiles without overage data are not gated. |
+| `--require-ok` | Drop anything that isn't currently `ok`. |
+| `--fallback <name>` | Last-resort safety net at the CLI layer: when the primary pick fails, return this name (with stderr warning) instead of exiting non-zero. |
+| `--explain` | Stream the decision tree to stderr (text mode) or fold it into `data.explain` / `error.details.explain` (JSON mode). |
 
 ## Exit Codes
 
@@ -359,6 +531,7 @@ Stickiness window: `--stickiness <s>` or `CLAUDE_LB_STICKINESS=<s>`. Set to `0` 
 |----------|---------|--------|
 | `CLAUDE_LB_STICKINESS` | `300` | Stickiness window in seconds. `0` disables. Overridden by `--stickiness <s>`. |
 | `CLAUDE_LB_PROFILES_DIR` | `~/.claude-profiles` | Absolute path to the profiles tree. Useful for testing or multi-tenant setups. |
+| `CLAUDE_LB_USAGE_LOG` | unset | Set to `1`/`true`/`yes`/`on` to enable per-probe NDJSON logging without writing the marker file. Equivalent to `roost config usage-log on` for the current process. |
 | `CLAUDE_CONFIG_DIR` | unset | Single-profile fallback: if set to a dir containing a direct `.credentials.json`, loaded as profile `default`. |
 | `XDG_CONFIG_HOME` | unset | Linux/macOS: overrides `~/.config/claude-lb/`. Windows uses `%APPDATA%\claude-lb\`. |
 
@@ -397,6 +570,8 @@ POSIX platforms (macOS, Linux) are unaffected — inode-swap semantics let
 | Pick log | `<config>/picks.log` (tab-separated, 10 MB rotation) |
 | Last-pick state | `<config>/last-pick.json` |
 | Platform-status cache | `<config>/platform-status.json` (60s TTL, used by `status`) |
+| Usage log (opt-in) | `<config>/usage-log.ndjson` (one JSON record per probe; no rotation) |
+| Usage-log marker | `<config>/usage-log.enabled` (presence enables the log) |
 | Profiles source | `~/.claude-profiles/<name>/.credentials.json` |
 
 Cache writes are atomic (tempfile + `os.replace`). A credentials file's
@@ -500,6 +675,31 @@ scripts that don't want any extra HTTP on the hot path). `--no-cache` /
 
 [**Releases on GitHub**](https://github.com/0xDarkMatter/roost/releases) ·
 [Full CHANGELOG](CHANGELOG.md)
+
+### Unreleased — symmetric API, observability, integration surfaces
+
+- **Symmetric profile management** — `roost remove`, `roost rename`, plus
+  the read-only `roost which` (returns what `pick` *would* choose without
+  side effects on `picks.log` / `last-pick.json`).
+- **Pick algorithm** — `--avoid <name>` (repeatable), `--max-cost <pct>`
+  (gate by monthly overage), `--fallback <name>` (last-resort safety net),
+  `--explain` (decision-tree rendering), and a new `lowest-overage`
+  strategy.
+- **Observability** — `roost stats` aggregates `picks.log` (totals,
+  durations, failure rates); opt-in `roost report` aggregates a new
+  `usage-log.ndjson` per-probe time-series with sparklines + linear
+  burn-rate projection. Toggle via `roost config usage-log {on|off|status}`
+  or `CLAUDE_LB_USAGE_LOG=1`.
+- **Reliability** — per-profile exponential backoff for `network_error`
+  (30s → 60s → 120s → 240s → 480s, capped) so a flapping endpoint stops
+  thundering-herd. `refresh --jitter <s>` for cron-spread.
+- **Integration surfaces** — `roost shellinit` emits a transparent
+  `claude` wrapper for bash/zsh/fish/pwsh; `roost trace <name>` dumps
+  request/response + classifier reasoning (token redacted); `roost top`
+  is a Rich `Live` TUI of the status table.
+- **Live integration tests** — `pytest -m live` exercises the full CLI
+  against the local fleet; default `pytest` keeps the mocked suite
+  hermetic.
 
 ### v0.3.0 — onboarding + observability
 
