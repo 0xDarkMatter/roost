@@ -10,8 +10,8 @@ Auto-loaded by `/sync`. Notes that should survive across sessions.
 
 ## Current state (last update: 2026-04-25)
 
-- **Version:** v0.8.0 on `main`.
-- **Remote:** `origin` = https://github.com/0xDarkMatter/roost (private). v0.5.0 / v0.6.0 / v0.7.0 / v0.8.0 tags pushed.
+- **Version:** v0.3.0 on `main` (squashed from v0.8.0 — all versions built in one 48h sprint).
+- **Remote:** `origin` = https://github.com/0xDarkMatter/roost (private). Old tags v0.1.0–v0.8.0 pushed; new tags for consolidated v0.1.0–v0.3.0 not yet pushed.
 - **Tests:** 328 passing (`uv run pytest`). Doctor now covers `exec_cmd` and `platform_status` in its `subcommand_imports` check.
 - **Live fleet:** 3 profiles under `~/.claude-profiles/` — `account-a`, `account-b`, `account-c`. All `max` plan. Variety of overage/usage states — useful as a real-world testbed.
 - **v0.8.0 highlights:** platform-status awareness — `status` and `doctor` consult `https://status.claude.com/api/v2/summary.json`, surfaced as a one-line stderr header above the `status` table when there's a non-resolved incident. Cache at `<config>/platform-status.json`, 60s TTL with stale-fallback. Shared module `src/claude_lb/platform_status.py`. AGENTS.md rule 20 codifies "best-effort, never load-bearing".

@@ -1,6 +1,6 @@
 [project]
 name = "roost"
-version = "0.8.0"
+version = "0.3.0"
 description = "Pick the healthiest Claude Code profile — health taxonomy + load balancer"
 readme = "README.md"
 requires-python = ">=3.11"

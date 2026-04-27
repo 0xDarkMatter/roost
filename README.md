@@ -3,7 +3,7 @@
 [![Forma](https://img.shields.io/badge/forma-experimental-orange.svg)](https://github.com/forma-tools/forma)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.8.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](CHANGELOG.md)
 [![Hackathon](https://img.shields.io/badge/Claude%20Opus%204.7-Hackathon-blueviolet?logo=anthropic)](https://www.anthropic.com/)
 ![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)
 
@@ -68,7 +68,7 @@ git clone https://github.com/0xDarkMatter/roost.git
 cd roost
 uv tool install --editable .
 
-roost --version    # → roost 0.8.0
+roost --version    # → roost 0.3.0
 ```
 
 To upgrade later, pull + reinstall:
@@ -501,48 +501,21 @@ scripts that don't want any extra HTTP on the hot path). `--no-cache` /
 [**Releases on GitHub**](https://github.com/0xDarkMatter/roost/releases) ·
 [Full CHANGELOG](CHANGELOG.md)
 
-### v0.8.0 — platform-status awareness
-
-- **`roost status` now surfaces Anthropic-side incidents** above the
-  profile table by polling `https://status.claude.com/api/v2/summary.json`
-  (60s cache at `<config>/platform-status.json`, stale-fallback when the
-  fetch fails). Catches the case where misbehaviour you'd otherwise blame
-  on a profile is actually a platform-wide event — e.g. "Elevated errors
-  on Claude Opus 4.7" while everything else is operational. Silent when
-  all clean. JSON envelope folds the data into `meta.platform_status`.
-  Opt out per-call with `--no-platform-status`; `--no-cache` propagates
-  through.
-- **`roost doctor` adds a status.claude.com check** — same source,
-  always-fresh (no cache), WARN-level. Designed to never fail the doctor
-  run since roost can't *fix* an Anthropic-side incident; it just
-  helps operators distinguish "my setup is broken" from "Anthropic is
-  degraded right now". Skipped under `--skip-network`.
-- Doctor's stale-install check (`subcommand_imports`) now covers
-  `exec_cmd` and `platform_status` — previously absent, would have
-  hidden import-drift in either subcommand.
-
-### v0.7.0 — onboarding helper
+### v0.3.0 — onboarding + observability
 
 - **`roost add <name>`** — import an existing `.credentials.json` (default
   source: `~/.claude/.credentials.json`) into the multi-profile layout. Cuts
   onboarding from "manually copy files into a directory I haven't created"
   to one command.
-- Audience widened: docs no longer assume Max-only — works for any Claude
-  Code OAuth account (Max / Pro / Team), with richer usage data on Max.
-- Identifying account names stripped from documentation and examples.
+- **`roost status` surfaces Anthropic-side incidents** above the profile table
+  by polling `https://status.claude.com/api/v2/summary.json` (60s cache,
+  stale-fallback). Silent when all clean; folds into `meta.platform_status`
+  on `--json`. Opt out with `--no-platform-status`.
+- **`roost doctor` status.claude.com check** — always-fresh, WARN-level.
+  Helps distinguish "my setup is broken" from "Anthropic is degraded".
+- Audience widened: any Claude Code OAuth account (Max / Pro / Team).
 
-### v0.6.0 — operational polish
-
-- **Shell completion** (`roost --install-completion`) — bash/zsh/fish/pwsh,
-  with profile-name + strategy completion.
-- **`roost history`** — read the picks.log audit trail with `--profile`,
-  `--since 30m`, `--tail N` filters.
-- **`refresh --soon DURATION`** — anticipatory refresh; cron-friendly
-  (`*/15 * * * * roost refresh --soon 30m --json`).
-- **doctor refresh-token check** — warns on profiles missing a refreshToken
-  (won't auto-heal at expiry).
-
-### v0.5.0 — exec, auto-refresh, multi-pick
+### v0.2.0 — exec, multi-pick, operational tooling
 
 - **`roost exec <cmd...>`** — pick a profile, set `AXIOM_CLAUDE_PROFILE`,
   exec the command, propagate child rc. With `--auto-refresh` and
@@ -551,6 +524,11 @@ scripts that don't want any extra HTTP on the hot path). `--no-cache` /
   picking. Folds the two-step preflight into one call.
 - **`roost pick --count N` (alias `-n N`)** — multi-pick for parallel
   dispatch workflows.
+- **Shell completion** (`roost --install-completion`) — bash/zsh/fish/pwsh.
+- **`roost history`** — read the picks.log audit trail with `--profile`,
+  `--since 30m`, `--tail N` filters.
+- **`refresh --soon DURATION`** — anticipatory refresh; cron-friendly
+  (`*/15 * * * * roost refresh --soon 30m --json`).
 
 ## Non-goals
 
