@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-27
+
 ### Added
 
 **Symmetric profile management**

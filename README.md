@@ -3,7 +3,7 @@
 [![Forma](https://img.shields.io/badge/forma-experimental-orange.svg)](https://github.com/forma-tools/forma)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](CHANGELOG.md)
 [![Hackathon](https://img.shields.io/badge/Claude%20Opus%204.7-Hackathon-blueviolet?logo=anthropic)](https://www.anthropic.com/)
 ![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)
 
@@ -68,7 +68,7 @@ git clone https://github.com/0xDarkMatter/roost.git
 cd roost
 uv tool install --editable .
 
-roost --version    # → roost 0.3.0
+roost --version    # → roost 0.4.0
 ```
 
 To upgrade later, pull + reinstall:

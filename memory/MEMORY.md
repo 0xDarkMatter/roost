@@ -10,8 +10,8 @@ Auto-loaded by `/sync`. Notes that should survive across sessions.
 
 ## Current state (last update: 2026-04-27)
 
-- **Version:** v0.3.0 on `main`. The `[Unreleased]` block in CHANGELOG.md now covers a substantial Tier 1–4 batch (next bump candidate: v0.4.0).
-- **Remote:** `origin` = https://github.com/0xDarkMatter/roost (private). Tags pushed: v0.1.0, v0.2.0, v0.3.0, plus `hackathon-submission` (annotated, points at the v0.3.0 squash commit).
+- **Version:** v0.4.0 on `main`. Released 2026-04-27 with the Tier 1–4 batch (symmetric API, observability, integration surfaces, reliability).
+- **Remote:** `origin` = https://github.com/0xDarkMatter/roost (private). Tags pushed: v0.1.0, v0.2.0, v0.3.0, v0.4.0, plus `hackathon-submission` (annotated, points at the v0.3.0 squash commit).
 - **Tests:** 723 mocked + 28 live = **751 total** (`uv run pytest` for the mocked suite, `uv run pytest -m live` for the integration suite). All green at last check.
 - **Live fleet:** 3 profiles under `~/.claude-profiles/` — `account-a`, `account-b`, `account-c`. All `max` plan. Variety of overage/usage states — useful as a real-world testbed for `pytest -m live`.
 - **v0.3.0 highlights:** platform-status awareness — `status` and `doctor` consult `https://status.claude.com/api/v2/summary.json`, surfaced as a one-line stderr header above the `status` table when there's a non-resolved incident. Cache at `<config>/platform-status.json`, 60s TTL with stale-fallback. Shared module `src/claude_lb/platform_status.py`. AGENTS.md rule 20 codifies "best-effort, never load-bearing".
