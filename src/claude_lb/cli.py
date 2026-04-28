@@ -2001,6 +2001,8 @@ def _do_which(
     no_cache: bool,
     max_age: int | None,
     avoid: list[str] | None,
+    max_cost: int | None,
+    explain: bool,
     json_output: bool,
 ) -> None:
     """Shared implementation for `which` (top-level + profiles namespace).
@@ -2020,25 +2022,64 @@ def _do_which(
         require_ok=require_ok,
         count=1,
         avoid=avoid_set,
+        max_cost=max_cost,
     )
+
+    # --explain rendering (mirrors profiles_pick): always populates the
+    # explain block on the outcome (cheap), then renders to stderr in text
+    # mode or folds into data.explain / error.details.explain in JSON mode.
+    explain_payload: dict[str, Any] | None = None
+    if explain:
+        explain_payload = {
+            "discovered": names,
+            "chosen": outcome.chosen.name if outcome.chosen else None,
+            "strategy_used": (
+                outcome.strategy_used.value
+                if outcome.strategy_used else strategy.value
+            ),
+            "rationale": outcome.rationale,
+            "excluded_reasons": outcome.excluded_reasons,
+            "filter_scores": outcome.filter_scores,
+        }
+        if not json_output:
+            render_pick_explanation(
+                discovered_names=names,
+                chosen=outcome.chosen.name if outcome.chosen else None,
+                strategy=(
+                    outcome.strategy_used.value
+                    if outcome.strategy_used else strategy.value
+                ),
+                rationale=outcome.rationale,
+                excluded_reasons=outcome.excluded_reasons,
+                filter_scores=outcome.filter_scores,
+            )
+
     if not outcome.ok:
         reason = outcome.reason or PickFailureReason.NO_PROFILES
         exit_code = REASON_TO_EXIT.get(reason, EXIT_ERROR)
         message = REASON_MESSAGES.get(reason, "Pick failed.")
         if json_output:
-            emit_error_json(reason.value.upper(), message)
+            details: dict[str, Any] = {}
+            if explain_payload is not None:
+                details["explain"] = explain_payload
+            emit_error_json(
+                reason.value.upper(), message, details if details else None,
+            )
         stderr.print(f"[red]{message}[/red]")
         raise typer.Exit(exit_code)
     assert outcome.chosen is not None
     chosen = outcome.chosen
     if json_output:
+        data: dict[str, Any] = {
+            "name": chosen.name,
+            "health": chosen.health.value,
+            "rationale": outcome.rationale,
+            "strategy": (outcome.strategy_used or strategy).value,
+        }
+        if explain_payload is not None:
+            data["explain"] = explain_payload
         emit_json({
-            "data": {
-                "name": chosen.name,
-                "health": chosen.health.value,
-                "rationale": outcome.rationale,
-                "strategy": (outcome.strategy_used or strategy).value,
-            },
+            "data": data,
             "meta": {"side_effects": False},
         })
         return
@@ -2059,6 +2100,26 @@ def which(
         list[str] | None,
         typer.Option("--avoid", autocompletion=_complete_profile_names),
     ] = None,
+    max_cost: Annotated[
+        int | None,
+        typer.Option(
+            "--max-cost",
+            help="Skip profiles with monthly overage utilization >= N%%.",
+            min=0,
+            max=100,
+        ),
+    ] = None,
+    explain: Annotated[
+        bool,
+        typer.Option(
+            "--explain",
+            help=(
+                "Render the would-be pick decision tree to stderr (or fold "
+                "into data.explain in JSON mode). Pairs naturally with the "
+                "read-only nature of `which` for debugging."
+            ),
+        ),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Return the profile that `pick` WOULD choose right now — without side effects.
@@ -2069,9 +2130,9 @@ def which(
       - picks.log is NOT appended (no audit-trail noise)
 
     Useful for debugging ("why is it choosing X?"), pre-flight checks, or
-    pairing with `--explain` (Phase B) to understand the decision tree
-    without committing to it. Cache may still be probed if stale (that's
-    freshness, not state).
+    pairing with `--explain` to understand the decision tree without
+    committing to it. Cache may still be probed if stale (that's freshness,
+    not state).
     """
     chosen_strategy = _validate_strategy(strategy)
     _do_which(
@@ -2081,6 +2142,8 @@ def which(
         no_cache=no_cache,
         max_age=max_age,
         avoid=avoid,
+        max_cost=max_cost,
+        explain=explain,
         json_output=json_output,
     )
 
@@ -2098,6 +2161,10 @@ def profiles_which(
         list[str] | None,
         typer.Option("--avoid", autocompletion=_complete_profile_names),
     ] = None,
+    max_cost: Annotated[
+        int | None, typer.Option("--max-cost", min=0, max=100)
+    ] = None,
+    explain: Annotated[bool, typer.Option("--explain")] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Alias for `which`."""
@@ -2109,6 +2176,8 @@ def profiles_which(
         no_cache=no_cache,
         max_age=max_age,
         avoid=avoid,
+        max_cost=max_cost,
+        explain=explain,
         json_output=json_output,
     )
 
