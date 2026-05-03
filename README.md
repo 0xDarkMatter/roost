@@ -20,11 +20,12 @@
 
 ### v0.5.0 — credential rotation safety
 
-- **Credential rotation safety** — `roost exec` now auto-leases the picked profile
-  for the child's lifetime by default (`--no-lease` to opt out, `--lease-for` to
-  set TTL). A leased profile blocks `roost refresh` (`LEASE_HELD`, exit 7) until
-  the child exits — preventing the OAuth token rotation race where a background
-  probe invalidates a token held by a long-running workload.
+- **`roost exec --lease` (default on)** — pins the picked profile against
+  `roost refresh` for the child's lifetime. A background probe can no longer
+  rotate the OAuth token under a long-running child (`LEASE_HELD`, exit 7).
+  `--no-lease` opts out; `--lease-for <dur>` overrides the TTL (default:
+  `timeout * 1.2` or 30m). Released in a `finally` block — Ctrl+C and
+  exceptions both clean up.
 - **`roost snapshot <profile> <out-path>`** — documented point-in-time credential
   copy with a stderr warning. Makes the "copy once, use for duration" pattern
   discoverable for external consumers (containers, sub-processes) that can't
