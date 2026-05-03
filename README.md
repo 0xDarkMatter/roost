@@ -3,7 +3,7 @@
 [![Forma](https://img.shields.io/badge/forma-experimental-orange.svg)](https://github.com/forma-tools/forma)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](CHANGELOG.md)
 [![Hackathon](https://img.shields.io/badge/Claude%20Opus%204.7-Hackathon-blueviolet?logo=anthropic)](https://www.anthropic.com/)
 ![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)
 
@@ -68,7 +68,7 @@ git clone https://github.com/0xDarkMatter/roost.git
 cd roost
 uv tool install --editable .
 
-roost --version    # → roost 0.4.0
+roost --version    # → roost 0.5.0
 ```
 
 To upgrade later, pull + reinstall:
@@ -327,6 +327,35 @@ Key flags:
 - `--dry-run` — print the env + command, don't execute
 - `--var-name NAME` — override `AXIOM_CLAUDE_PROFILE`
 - `--log-full-argv` — log the full child argv instead of just argv[0] (may leak secrets)
+- `--lease` (default on) / `--no-lease` — acquire an expiring lock on the picked
+  profile before spawning the child. While held, `roost refresh` returns `LEASE_HELD`
+  (exit 7) without rotating the credential, so a background probe can't invalidate
+  the token under a long-running child. Released unconditionally on exit (Ctrl+C
+  included). Use `--no-lease` for short-lived one-shot children where the overhead
+  is unwanted.
+- `--lease-for <duration>` — override the lease TTL (e.g. `30m`, `2h`). Defaults
+  to `timeout * 1.2` when `--timeout` is set, else 30 minutes.
+
+### Credential rotation safety
+
+```bash
+# Exec leases automatically — nothing to do.
+roost exec -- claude --dangerously-skip-permissions "long task"
+
+# Opt out for throwaway commands where the overhead is unwanted:
+roost exec --no-lease -- claude --version
+
+# Snapshot: copy credentials once to a stable path for external consumers.
+roost snapshot personal /tmp/creds-personal.json
+# → stderr: "Snapshot written. roost will NEVER touch this file."
+# Use the snapshot in your workload; it doesn't rotate under you.
+```
+
+`roost snapshot <profile> <out-path>` copies the profile's live `credentials.json`
+to a stable path. External consumers (Docker containers, subprocesses) that mount
+or reference that path get a frozen copy that will never be rotated. The snapshot
+does not participate in the lease system — it's just a documented `cp` with a
+prominent warning that the copy is not kept fresh.
 
 ### Scripting (lower-level)
 
@@ -521,7 +550,7 @@ Stickiness window: `--stickiness <s>` or `CLAUDE_LB_STICKINESS=<s>`. Set to `0` 
 | 4 | `VALIDATION` — bad flag (e.g. unknown strategy, or `refresh` with no args) |
 | 5 | `FORBIDDEN` — `--require-ok` but no profile is `ok` |
 | 6 | `RATE_LIMITED` — all profiles throttled |
-| 7 | `CONFLICT` — `refresh` lost a lock race; another process is refreshing |
+| 7 | `CONFLICT` — `refresh` blocked: either a file-lock race (another process is refreshing the same profile), or the profile is leased by an active `roost exec` child (`LEASE_HELD`). Retry after the child exits. |
 | 8 | `TIMEOUT` |
 | 9 | `UNAVAILABLE` — no profiles, or all terminal-bad |
 
@@ -572,6 +601,7 @@ POSIX platforms (macOS, Linux) are unaffected — inode-swap semantics let
 | Platform-status cache | `<config>/platform-status.json` (60s TTL, used by `status`) |
 | Usage log (opt-in) | `<config>/usage-log.ndjson` (one JSON record per probe; no rotation) |
 | Usage-log marker | `<config>/usage-log.enabled` (presence enables the log) |
+| Lease store | `<config>/leases.json` (active exec leases; auto-expiring at read time) |
 | Profiles source | `~/.claude-profiles/<name>/.credentials.json` |
 
 Cache writes are atomic (tempfile + `os.replace`). A credentials file's
@@ -676,7 +706,19 @@ scripts that don't want any extra HTTP on the hot path). `--no-cache` /
 [**Releases on GitHub**](https://github.com/0xDarkMatter/roost/releases) ·
 [Full CHANGELOG](CHANGELOG.md)
 
-### Unreleased — symmetric API, observability, integration surfaces
+### v0.5.0 — credential rotation safety
+
+- **Credential rotation safety** — `roost exec` now auto-leases the picked profile
+  for the child's lifetime by default (`--no-lease` to opt out, `--lease-for` to
+  set TTL). A leased profile blocks `roost refresh` (`LEASE_HELD`, exit 7) until
+  the child exits — preventing the OAuth token rotation race where a background
+  probe invalidates a token held by a long-running workload.
+- **`roost snapshot <profile> <out-path>`** — documented point-in-time credential
+  copy with a stderr warning. Makes the "copy once, use for duration" pattern
+  discoverable for external consumers (containers, sub-processes) that can't
+  participate in the lease system.
+
+### v0.4.0 — symmetric API, observability, integration surfaces
 
 - **Symmetric profile management** — `roost remove`, `roost rename`, plus
   the read-only `roost which` (returns what `pick` *would* choose without

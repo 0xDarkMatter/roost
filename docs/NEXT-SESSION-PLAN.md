@@ -1,433 +1,221 @@
-# v0.5.0 plan + handoff from 2026-04-25 session
+# v0.5.0 plan — credential rotation safety
 
-Self-note. Picking this up cold in a future session — everything you
-need is in this doc. Current state: v0.4.1 on main, commit `084b630`.
-
----
-
-## Session context (what just happened)
-
-### Commits landed this session
-
-1. `c928a53` — refactor: split `Resets (S/W)` into separate `Session in` / `Weekly in` columns (user feedback: combined cell was hard to scan)
-2. `11e305d` — feat: Plan column + dual session/weekly resets in status table (user asked for plan column; surfaces `claudeAiOauth.subscriptionType`)
-3. `084b630` — **fix(refresh): graceful MISSING_DEPENDENCY on stale install + doctor import check + update --apply** — THIS IS THE BIG ONE
-
-### The Axiom bug report (pigeon #47, resolved)
-
-Axiom reported `roost refresh --expired` crashing with `ModuleNotFoundError: No module named 'filelock'` on their v0.3.0 install. Root cause: editable install drift — v0.4.0 added `filelock` dep + import, but `uv tool install --editable` done against v0.3.0 doesn't re-sync the tool venv when `pyproject.toml` gets new deps. Source changes are picked up live; dep changes are NOT.
-
-Three-part fix shipped as v0.4.1:
-
-1. **Lazy-import `filelock` inside `refresh_profile`** — catch `ImportError`, return `RefreshResult(error_code="MISSING_DEPENDENCY", error_message=<reinstall command>)`. Every other subcommand keeps working (graceful per-subcommand degradation).
-2. **`roost doctor` runs a `subcommand_imports` check** — loads every `claude_lb.*` module, reports drift explicitly. Catches the failure *before* the user trips over it.
-3. **`roost update --apply`** — actually runs `git pull --ff-only` + `uv tool install --reinstall --editable <dir>` now. Was status-only before. `--no-pull` flag skips git for dep-only refreshes.
-
-Dogfooded the fix by self-upgrading with `roost update --apply --no-pull`. Axiom notified via pigeon reply.
-
-### Key session finding worth remembering
-
-**Editable install drift is a real recurring failure mode, not a one-off.** Any dep added after initial install → stale tool venv → cryptic runtime crash. The fix is structural (lazy import + doctor check + self-heal command), not just "this bug". Future feature additions should keep this pattern: lazy-import optional heavy deps, verify in doctor, self-heal via update.
-
-### Live fleet state (captured 2026-04-25)
-
-For context when eyeballing behaviour later:
-
-| Profile    | Plan | Session% | Weekly% | Sonnet% | Overage   | Reset window |
-|------------|------|----------|---------|---------|-----------|--------------|
-| account-b | max  | 97-99%   | 22-23%  | 3%      | 100% AUD  | ~22m (hot!)  |
-| account-c     | max  | 17%      | 8%      | 1%      | 99% USD   | ~1h 52m      |
-| account-a     | max  | 11%      | 6%      | 0%      | 11% AUD   | ~2m (freshest) |
-
-account-b is typically running the hottest; account-a has the most headroom. account-b has already burned through its monthly overage budget (100% AUD); account-c is about to (99% USD). Use this fleet as the testing/demo ground — variety of states without needing mocks.
-
-### Tier 2/3 items I recommended but deferred
-
-For the next "what could we add?" conversation:
-
-- **`roost watch`** — live-updating status table (TUI), Rich-based, ~30 lines
-- **`~/.config/claude-lb/usage-log.ndjson` + `roost history`** — append-on-probe, enables burn-rate projection and monthly reports
-- **`refresh --soon 30m`** — anticipatory refresh for tokens expiring within N
-- **`pick --max-cost <amount>`** — skip profiles near monthly overage cap (we have the data)
-- **`pick --format path|token`** — return creds dir or raw token instead of name
-- **Shell completion** — Typer supports free, we just disabled it (one line to re-enable)
-
-Skipped (feature creep / premature): MCP server, PyPI publish, profile groups/tags, telemetry.
+Self-note. Picking this up cold — everything needed is in this doc.
+Current state: v0.4.0 on `main`, commit `5d65d8f`.
 
 ---
 
-## North-star idiom (v0.5.0 target)
+## Session context
 
+### The problem (Axiom pigeon, 2026-05-02)
+
+Real production failure during Axiom direct trials. Sequence:
+
+1. `roost refresh --expired` rotates `mknv74`. Writes new access_token + new refresh_token atomically.
+2. Axiom copies `~/.claude-profiles/mknv74/.credentials.json` → WSL → Docker bind-mount.
+3. Inside the container, `@anthropic-ai/claude-code` runs a 15–60 min trial.
+4. At some point the container's SDK tries to refresh its token — but roost has since rotated
+   the refresh_token again (probe cadence ~11 min). The container holds an invalidated
+   refresh_token → `invalid_grant` → 401 on all subsequent `/v1/messages` calls.
+5. Trial fails in <140s with 0 useful tokens. Indistinguishable from model failure.
+
+**Direct evidence:** probing mknv74 with the freshly-rotated access token returns 429 (valid token)
+but the container sees 401 — proving the SDK's refresh path is broken, not the token itself.
+
+**Axiom workaround for now:** snapshot the credentials.json at trial start into a temp path,
+set `AXIOM_HOST_CLAUDE_CREDENTIALS` to the snapshot, never re-read roost's live file.
+
+### Root cause
+
+OAuth token rotation is one-shot: POST refresh_token → Anthropic invalidates it, returns
+new refresh_token + access_token. Any consumer holding the old refresh_token is now broken.
+Roost's atomic write guarantees the file is never half-written, but doesn't prevent a consumer
+from reading the file *between* two rotations and getting the old refresh_token.
+
+---
+
+## Implementation plan
+
+### Priority 1 (ship v0.5.0): `roost lease`
+
+Smallest viable fix that gives consumers protection for long-lived workloads.
+
+**Contract:**
 ```bash
-roost exec --count 4 --auto-refresh --strategy least-used \
-  -- axiom launch-parcel "$@"
-```
-
-Picks 4 healthy profiles ordered by headroom, inline-refreshes any with expired tokens, dispatches `axiom launch-parcel` once per profile with `$AXIOM_CLAUDE_PROFILE` set. Three features, ~30 lines of bash collapse into one.
-
----
-
-## Implementation order (why this order)
-
-1. **`pick --auto-refresh`** first — smallest, unblocks the others. `exec` will need auto-refresh behaviour baked in; easier to build once as a reusable helper than to duplicate.
-2. **`pick --count N`** second — enables multi-profile workflows. Touches the pick output contract (single line → newline-separated list when N>1), so CLI tests need updating.
-3. **`exec <cmd...>`** last — composes both. New subcommand, bigger surface area, more tests.
-
-Budget: 90m for auto-refresh + tests, 60m for count + tests, 120m for exec + tests. Plus 30m docs + commit messages. ~5h total if the session is uninterrupted.
-
----
-
-## Feature 1: `roost pick --auto-refresh`
-
-### Contract
-
-```bash
-roost pick --auto-refresh
-# stdout: single profile name, newline-terminated (unchanged)
+roost lease mknv74 --for 30m
+# stdout: lease-id (e.g. "lease-mknv74-1234567890")
 # exit 0 on success
-# exit 2 if auto-refresh fails AND no other healthy profile exists
-# exit 7 if auto-refresh loses a lock race AND no fallback available
+# exit 3 if profile not found
+# exit 1 if already leased (with stderr saying which lease holds it + TTL)
+
+roost release lease-mknv74-1234567890
+# exit 0 always (idempotent; no-op if lease already expired)
+
+roost lease list
+# table: profile, lease-id, expires-at, created-by (argv0 of leaseholder)
 ```
 
-### Behaviour
+**Behaviour:**
+- Lease is stored in `<config>/leases.json` (atomic write, same pattern as health.json).
+- While a lease is active on a profile, `roost refresh <name>` returns exit 7 (CONFLICT)
+  with a stderr message "profile <name> is leased until <expires_at> by <creator>".
+  The credentials are NOT touched.
+- `roost probe <name>` still runs (freshness, not state). Only refresh is blocked.
+- `roost pick --auto-refresh` respects the lease: if the chosen profile is leased and
+  auth_expired, falls through to the next candidate instead of refreshing.
+- Leases expire automatically. The check is done at read time (no daemon needed).
+- `roost doctor` reports any expired-but-not-released leases as INFO (housekeeping prompt).
 
-When the chosen profile is `auth_expired`, inline-refresh it before returning the name:
-
-1. Run `pick()` as normal against the current cache.
-2. If `outcome.chosen.health` is `AUTH_EXPIRED` AND the profile has `refresh_token_present`, call `refresh_profile` for that one profile.
-3. On refresh success: invalidate cache entry, re-probe just this one, re-run `pick`, return.
-4. On refresh failure (`LOCK_HELD`, `REFRESH_REJECTED`, etc.): emit a stderr warning, filter the expired profile out of the candidate pool, re-run `pick` against the remaining candidates.
-5. If no other candidates: propagate the original pick failure.
-
-### Implementation sketch
-
-In `src/claude_lb/cli.py::profiles_pick`, new flag:
-
-```python
-auto_refresh: Annotated[
-    bool,
-    typer.Option(
-        "--auto-refresh",
-        help=(
-            "If the chosen profile is auth_expired, refresh it inline "
-            "before returning. Falls through to next candidate if refresh fails."
-        ),
-    ),
-] = False,
-```
-
-After the initial `pick()` call:
-
-```python
-if auto_refresh and outcome.ok and outcome.chosen.health is Health.AUTH_EXPIRED:
-    outcome = _attempt_auto_refresh(outcome, cache, names, strategy)
-```
-
-New helper in `cli.py` (kept here rather than in `pick.py` because it depends on refresh + probe + cache; `pick.py` should stay pure-algorithm):
-
-```python
-def _attempt_auto_refresh(
-    outcome: PickOutcome,
-    cache: HealthCache,
-    names: list[str],
-    strategy: Strategy,
-) -> PickOutcome:
-    """Refresh the chosen AUTH_EXPIRED profile inline, re-probe, re-pick.
-    On refresh failure, filter the profile out and re-pick."""
-    chosen = outcome.chosen
-    profile = get_profile(chosen.name)
-    if profile is None or not profile.refresh_token_present:
-        return outcome  # can't help, let caller see auth_expired
-    results = refresh_many_sync([profile])
-    if not results or not results[0].refreshed:
-        # Refresh failed. Invalidate from cache so re-pick excludes it.
-        remove_profile(chosen.name)
-        return pick(
-            load_cache(),
-            [n for n in names if n != chosen.name],
-            strategy=strategy,
-        )
-    # Refresh succeeded. Re-probe just this profile to refresh its health
-    # entry (cache entry was invalidated by refresh already).
-    probe_many_sync([profile])
-    return pick(load_cache(), names, strategy=strategy)
-```
-
-### Tests to add
-
-- `test_auto_refresh_happy_path` — pre-populate cache with AUTH_EXPIRED, stub `refresh_many_sync` + `probe_many_sync`, assert pick returns the refreshed profile name.
-- `test_auto_refresh_falls_through_on_refresh_failure` — same setup but stub refresh to return REFRESH_REJECTED; assert pick falls through to another healthy candidate.
-- `test_auto_refresh_no_refresh_token_is_noop` — AUTH_EXPIRED + no `refresh_token_present` → return original outcome unchanged.
-- `test_auto_refresh_last_candidate_falls_through_to_exit_2` — only one profile, expired, refresh fails → exit 2 (AUTH_REQUIRED).
-
-### Gotchas
-
-- Recursive `pick()` could loop forever if not careful. Pass a shrunken `names` list rather than calling with the full list again.
-- Must preserve the caller's original `strategy`/`stickiness` when re-picking. Simplest: hoist into a local and thread through.
-- The `--warn-at` warning path runs AFTER auto-refresh — check the refreshed profile's usage against the threshold, not the original.
-
----
-
-## Feature 2: `roost pick --count N`
-
-### Contract
+**`roost exec` extension:**
+Add `--lease` flag (default: on) to auto-lease the picked profile for the child's lifetime.
+The lease TTL is set to `--timeout` (if given) or 30m (heuristic). Lease is released in a
+`finally` block so Ctrl+C also cleans up.
 
 ```bash
-roost pick --count 3
-# stdout:
-# account-a
-# account-c
-# account-b
-# One profile name per line, no trailing blank line.
-# Exit 0 if >= 1 candidate returned (even if fewer than N requested).
-# Exit 9 (UNAVAILABLE) if 0 candidates.
+roost exec --auto-refresh -- claude "long task"
+# Internally: pick → lease(picked, 30m) → child → release
 ```
 
-JSON variant:
+`--no-lease` to opt out for short-lived children.
 
-```bash
-roost pick --count 3 --json
-# { "data": [ { "name": ..., "health": ..., "rationale": ... }, ... ],
-#   "meta": { "count": 3, "requested": 3, "strategy": "least-used" } }
-```
+**Implementation sketch:**
 
-### Behaviour
-
-1. Run the filter ladder as normal.
-2. Sort by strategy (least-used, weighted, etc.).
-3. Return up to N candidates. If fewer than N pass the ladder, return what we have — caller decides whether partial fulfilment is OK.
-4. `--require-ok` combined with `--count` still filters to OK-only.
-5. Stickiness is IGNORED when count > 1 — sticky is a "keep returning the same profile" semantic that doesn't compose with multi-pick. Document this clearly in help.
-6. Each picked profile is appended to `picks.log`.
-7. `write_last_pick` is called for the FIRST profile only (the "primary" pick), so subsequent single-picks without `--count` honour stickiness against the primary.
-
-### Export behaviour
-
-`--export --count N` would be ambiguous (can't export N vars with the same name). Reject with `EXIT_VALIDATION`, pointing to `--json`. Alternative (multiple enumerated vars) is cute but error-prone; skip.
-
-### Implementation sketch
-
-Extend `PickOutcome`:
-
+New module `src/claude_lb/lease.py`:
 ```python
 @dataclass
-class PickOutcome:
-    chosen: ProfileHealth | None = None
-    chosen_many: list[ProfileHealth] = field(default_factory=list)  # NEW
-    strategy_used: Strategy | None = None
-    reason: PickFailureReason | None = None
-    earliest_recovery_at: datetime | None = None
-    rationale: str = ""
+class Lease:
+    lease_id: str
+    profile: str
+    expires_at: datetime
+    created_at: datetime
+    creator: str  # sys.argv[0]
+
+def acquire(profile: str, duration_s: int) -> Lease: ...
+def release(lease_id: str) -> bool: ...          # returns False if not found
+def get_active(profile: str) -> Lease | None: ... # None if no active lease
+def list_leases() -> list[Lease]: ...
+def purge_expired() -> int: ...                   # returns count purged
 ```
 
-Extend `pick.pick()`:
+Storage: `<config>/leases.json` — dict keyed by lease_id, atomic write.
 
-```python
-def pick(
-    cache: HealthCache,
-    discovered_names: list[str],
-    *,
-    count: int = 1,
-    ...
-) -> PickOutcome:
-    ...
-    # After sort:
-    if count == 1:
-        return PickOutcome(chosen=ordered[0], chosen_many=[ordered[0]], ...)
-    top = ordered[:count]
-    return PickOutcome(chosen=top[0], chosen_many=top, ...)
-```
+CLI additions in `cli.py`:
+- `roost lease <profile> [--for DURATION]` — duration defaults to "30m", parses "Nm"/"Nh"/"Ns".
+- `roost release <lease-id>` — idempotent.
+- `roost lease list [--json]`
 
-CLI layer emits `chosen_many` in order.
+`refresh.py` check: call `get_active(profile)` at the top of `refresh_profile`; if active,
+return `RefreshResult(error_code="LEASE_HELD", error_message=...)`.
 
-### Tests to add
-
-- `test_pick_count_returns_n_candidates` — cache with 5 profiles, `--count 3`, assert 3 names on stdout in expected order.
-- `test_pick_count_returns_fewer_when_candidates_limited` — 2 healthy, `--count 5` → returns 2, exit 0.
-- `test_pick_count_zero_candidates_exits_9` — all auth_dead, `--count 3` → stdout empty, exit 9.
-- `test_pick_count_disables_stickiness` — last-pick set to 'a' within window, `--count 2` with least-used should return top-2-by-least-used regardless of last-pick.
-- `test_pick_count_with_export_rejected` — `--count 2 --export` → EXIT_VALIDATION with message mentioning `--json`.
-- `test_pick_count_json_envelope` — `--count 2 --json` yields data array of length 2 with meta.count=2.
-- `test_pick_count_respects_strategy` — `--count 3 --strategy round-robin` rotates past last-pick.
-
-### Gotchas
-
-- `append_pick_log` should be called for each profile returned, not just the first. Otherwise we lose the audit trail for parallel dispatch.
-- Existing picks.log rotation policy still applies.
-- Backwards compat: existing `--json` output without `--count` is a single-object `{"data": {...}}`. With `--count` it becomes `{"data": [...]}`. This IS a shape change. Go with: single-object for `--count 1` (implicit or explicit), array for `--count > 1`. Cleaner for scripts that don't use `--count`. Test both shapes explicitly.
+**Tests to add:**
+- `test_lease_acquire_and_release` — acquire, confirm active, release, confirm gone.
+- `test_lease_blocks_refresh` — acquire lease, attempt refresh, assert LEASE_HELD result.
+- `test_lease_expired_is_transparent` — acquire with 1s TTL, sleep 2s, attempt refresh → succeeds.
+- `test_lease_auto_release_on_exec_exit` — stub child, confirm lease is released in finally.
+- `test_lease_pick_auto_refresh_skips_leased_expired` — leased profile is auth_expired,
+  auto-refresh picks the next candidate instead.
+- `test_lease_list_filters_expired` — list only returns active leases.
 
 ---
 
-## Feature 3: `roost exec <command...>`
+### Priority 2 (v0.5.0 or v0.5.1): `roost snapshot <profile> <out-path>`
 
-### Contract
+Smallest possible improvement for Axiom's manual workflow:
 
 ```bash
-roost exec claude --dangerously-skip-permissions "write function"
-# → picks a profile
-# → sets AXIOM_CLAUDE_PROFILE (or custom via --var-name)
-# → execs the command
-# → on exit, logs { profile, argv0, duration, exit_code } to picks.log
-# → roost's own exit code = child's exit code
+roost snapshot mknv74 /tmp/axiom-trial-creds-123.json
+# Copies the profile's credentials.json to out-path.
+# Prints a warning to stderr: "snapshot will not be updated by roost"
+# exit 0
+
+# JSON mode — also surfaces the profile's current health for sanity check
+roost snapshot mknv74 /tmp/... --json
+# { "data": { "path": "...", "profile": "mknv74", "health": "ok", ... }, "meta": {...} }
 ```
 
-Flags:
+This doesn't prevent the race; it just documents intent (this is a point-in-time copy)
+and makes it one command instead of a manual `cp`.
 
-- `--auto-refresh` (inherited from pick)
-- `--strategy` / `--stickiness` / `--require-ok` / `--warn-at` (all from pick)
-- `--var-name` (default AXIOM_CLAUDE_PROFILE)
-- `--retry-on-429` (default 1) — if the child exits with a signal mapping to rate-limit (non-zero + stderr match), re-pick and re-run
-- `--timeout <seconds>` (default: none) — kill the child after N seconds
-- `--dry-run` — print what would be executed, don't run
+**Note:** snapshot does NOT acquire a lease. If the caller wants rotation protection
+during the snapshot's lifetime, they need `roost lease` separately.
 
-Everything after `--` is the command + args (standard convention). Without `--`, unknown options belong to argv.
+---
 
-### Behaviour
+### Priority 3 (future): probe endpoint parity check
 
-1. Run pick logic (with auto-refresh if requested).
-2. If no healthy profile: propagate exit code from pick.
-3. Build env: `os.environ` + `{var_name: profile.name}`.
-4. `--dry-run`: `emit_text(f"{var_name}={profile.name} {command_repr}")` and exit 0.
-5. Otherwise: `subprocess.run(argv, env=env)`. On Windows, subprocess.run is cleaner than `os.execvpe`.
-6. Measure wall-clock duration. Capture child rc.
-7. Append to picks.log: `{ts}\t{profile}\tEXEC\trc={rc}\tdur={ms}`.
-8. If rc is non-zero AND matches a rate-limit signal AND retry budget left: re-pick (excluding just-used profile), re-run once.
-9. Return child's final rc as roost's exit code.
+`roost doctor --use-test` mode that POSTs a 1-token `/v1/messages` with the oauth-beta
+header — same auth path the consumer uses — and surfaces any probe-OK-but-use-fails gap.
 
-### Rate-limit detection heuristic (tricky)
+Deferred: costs a real API call. Opt-in only. Lower priority now that lease solves
+the immediate rotation problem.
 
-Options:
+---
 
-- Parse stderr for 429 / "rate limit" / "Please wait" patterns.
-- Check rc — claude CLI uses exit 1 for most errors, so rc alone isn't reliable.
-- **Re-probe the profile after the child exits**; if it shifted to RATE_LIMITED or SESSION_LIMIT, infer the child hit that.
+### Priority 4 (future): `.credentials.version` monotonic counter
 
-Ship with option 3 (re-probe, infer state change). Document that retry-on-429 is best-effort, not guaranteed.
+Sibling file to `.credentials.json`, updated atomically alongside it. Consumers that
+snapshot the file can detect rotation by re-reading the version. More robust than mtime.
 
-### Security considerations
-
-- NEVER log full argv if it contains tokens or secrets.
-- Default: log only `argv[0]` (low-risk, preserves what-command-ran).
-- `--verbose`: log full argv (escape hatch).
-- `--var-name` value lands in env; shell expansion avoided because Typer passes it as a string literal.
-
-### Implementation sketch
-
-New module `src/claude_lb/exec_cmd.py` (not `exec.py` — shadows builtin):
-
-```python
-async def run_exec(
-    command: list[str],
-    *,
-    strategy: Strategy,
-    stickiness_s: int | None,
-    auto_refresh: bool,
-    var_name: str,
-    retry_on_429: int,
-    timeout: float | None,
-    dry_run: bool,
-    warn_at: int | None,
-    verbose: bool,
-) -> int:
-    """Pick a profile, exec the command, handle retry, return child rc."""
-    ...
-```
-
-CLI wiring:
-
-```python
-@app.command("exec", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
-def exec_cmd(
-    ctx: typer.Context,
-    strategy: Annotated[str, typer.Option("--strategy")] = "sticky",
-    ...,
-) -> None:
-    command = ctx.args  # everything after `roost exec`
-    if not command:
-        stderr.print("[red]exec requires a command.[/red]")
-        raise typer.Exit(EXIT_VALIDATION)
-    rc = asyncio.run(run_exec(command, ...))
-    raise typer.Exit(rc)
-```
-
-### Tests to add
-
-- `test_exec_happy_path` — profile_factory, stub subprocess.run to return rc=0, assert roost exits 0 and `var_name` ended up in child env.
-- `test_exec_no_healthy_profile_exits_9` — no profiles, assert exit 9.
-- `test_exec_dry_run_prints_without_running` — `--dry-run`, assert no subprocess call, stdout contains var assignment.
-- `test_exec_propagates_child_exit_code` — stub child rc=42, assert roost exits 42.
-- `test_exec_retry_on_rate_limit` — first invocation re-probes profile as RATE_LIMITED, second picks different profile and succeeds. Assert picks.log has two entries with two different profiles.
-- `test_exec_timeout_kills_child` — stub child that sleeps > timeout, assert SIGTERM (or equivalent) and rc != 0.
-- `test_exec_logs_argv0_not_full_argv_by_default` — picks.log contains "claude" but NOT the secret-looking arg.
-
-### Gotchas
-
-- Windows doesn't support `os.execvpe` cleanly; stick with subprocess.run.
-- stdin/stdout/stderr must be inherited (not captured) so the child can be interactive. `subprocess.run` with `stdin=None, stdout=None, stderr=None` does this.
-- Ctrl+C during child execution should forward to the child, not be swallowed by roost. `subprocess.run` handles this on both platforms.
-- picks.log rotation happens inside `append_pick_log`; reuse it.
+Deferred until there's a second consumer type that needs it (Axiom's snapshot approach
+is sufficient for now).
 
 ---
 
 ## Cross-cutting work
 
 ### SPEC.md
-
-- §2 Command Architecture — add `exec` as a new top-level command (it's not a `profiles-*` subcommand; it's an action on a profile).
-- §4 Exit Codes — no new codes; EXIT_VALIDATION for `--count`+`--export`, existing codes cover the rest.
-- §9 Pick Algorithm — add "Multi-pick" subsection documenting `--count` behaviour (ladder → sort → top N, stickiness ignored, picks.log gets N entries).
+- §2 Command Architecture — add `lease`, `release`, `snapshot`.
+- §4 Exit Codes — `LEASE_HELD` maps to exit 7 (reuses CONFLICT semantics; rename to
+  `LOCK_CONFLICT` in docs to cover both file-lock and lease conflicts).
 
 ### README.md
-
-- New "Scripting" section showing the north-star idiom.
-- Update "Picking" section with `--auto-refresh` + `--count` examples.
-- New "Running commands" section for `exec`.
-
-### CHANGELOG.md
-
-Single v0.5.0 entry covering all three features.
+- New "Credential rotation safety" section explaining the rotation race and when to use lease.
+- Add `lease` / `release` / `snapshot` to the command reference table.
 
 ### AGENTS.md
+- New rule: while a profile is leased, `refresh` is blocked. The `pick --auto-refresh` path
+  filters leased-and-expired profiles to the next candidate rather than attempting a refresh.
+- Extend rule 14 (refresh race): lease is the user-facing escape hatch; document that leases
+  serialize rotation correctly but consumers must still use `snapshot` or `exec --lease`
+  to avoid the initial-read race.
 
-- Rule #14 update: for multi-pick + auto-refresh, the lock-race advice extends to concurrent auto-refreshes. Each profile's refresh still serializes via the per-profile file lock.
-- Add new rule: "`exec` forwards stdin/stdout/stderr to the child. Don't try to capture claude's output by redirecting roost's stdout — redirect the child directly."
+### CHANGELOG.md
+- Single v0.5.0 entry covering lease + release + snapshot + exec --lease.
 
-### Axiom integration note
-
-Ping Axiom (pigeon) when `--auto-refresh` ships — their Conductor OAuth preflight can shrink from:
-
+### Pigeon reply to Axiom
+Send a reply to message 109 when lease ships:
 ```
-roost refresh --expired 2>/dev/null
-profile=$(roost pick 2>/dev/null) || handle_failure $?
+roost 0.5.0 shipped with `roost lease / release / snapshot` + `exec --lease` (default on).
+Upgrade: uv tool install --reinstall --editable "X:/Forge/claude-lb"
+Lease a profile explicitly: LEASE_ID=$(roost lease mknv74 --for 30m --json | jq -r .data.lease_id)
+roost exec auto-leases for exec's child lifetime — your trial worktree can drop the manual snapshot.
 ```
-
-to:
-
-```
-profile=$(roost pick --auto-refresh 2>/dev/null) || handle_failure $?
-```
-
-When `exec` ships, their whole spawn-worker wrapper reduces further.
 
 ---
 
 ## Ordering for the actual session
 
-1. Ship `--auto-refresh` alone first. Smaller blast radius. Commit.
-2. Ship `--count` alone. Touches `pick.py` core but cleanly. Commit.
-3. Ship `exec`. Bump to 0.5.0 proper.
-4. Final commit + pmail to Axiom with the upgrade blurb.
+1. `src/claude_lb/lease.py` — storage + acquire/release/list/purge. Tests first.
+2. `cli.py` wiring for `lease`, `release`, `lease list`. CLI tests.
+3. Hook lease check into `refresh.py::refresh_profile`. Add LEASE_HELD tests.
+4. `pick --auto-refresh` respects leases — test skips leased+expired profile.
+5. `exec --lease` (default on) — auto-lease for child lifetime. Tests.
+6. `roost snapshot` — tiny new subcommand. Tests.
+7. Docs pass: SPEC, README, AGENTS, CHANGELOG.
+8. Bump to v0.5.0. Pigeon reply to Axiom.
 
 ---
 
 ## References in the existing codebase
 
-- `src/claude_lb/pick.py:pick` — algorithm core, extend with count parameter
-- `src/claude_lb/cli.py:profiles_pick` — flag plumbing
-- `src/claude_lb/refresh.py:refresh_profile` — called by auto-refresh
-- `src/claude_lb/probe.py:probe_many_sync` — re-probe after refresh
-- `src/claude_lb/pick.py:append_pick_log` — reuse for exec audit trail
+- `src/claude_lb/cache.py` — pattern to follow for atomic JSON storage
+- `src/claude_lb/refresh.py::refresh_profile` — where LEASE_HELD check goes
+- `src/claude_lb/pick.py::pick` — where auto-refresh falls-through logic lives
+- `src/claude_lb/exec_cmd.py` — extend with auto-lease
+- `src/claude_lb/paths.py` — add `leases_path()` following existing platform-aware pattern
+- `src/claude_lb/cli.py::profiles_pick` — `--auto-refresh` wiring to reference
 
 ---
 
-*Planned 2026-04-25 · Current state v0.4.1 · Target v0.5.0.*
+*Planned 2026-05-03 · Current state v0.4.0 · Target v0.5.0.*
+*Source: Axiom pigeon #109 (wizardly-antonelli, 2026-05-02).*

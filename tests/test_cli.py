@@ -82,7 +82,7 @@ def test_version() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert "claude-lb" in result.stdout
-    assert "0.4.0" in result.stdout
+    assert "0.5.0" in result.stdout
 
 
 def test_help_exits_zero() -> None:
@@ -823,7 +823,7 @@ def _stub_run_child_factory(*, rc_sequence: list[int], timed_out: bool = False,
 
     calls: list[dict] = []
 
-    def _stub(argv, *, env_var_name, profile_name, timeout):
+    def _stub(argv, *, env_var_name, profile_name, timeout, **_kw):
         calls.append({
             "argv": list(argv),
             "env_var_name": env_var_name,
@@ -2432,6 +2432,40 @@ def test_refresh_all_failures_with_lock_held_exits_conflict(
     assert result.exit_code == 7
 
 
+def test_refresh_all_failures_with_lease_held_exits_conflict(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LEASE_HELD (profile leased by exec) → exit 7, same as LOCK_HELD."""
+    profile_factory("account-a")
+    monkeypatch.setattr(
+        cli_mod,
+        "refresh_many_sync",
+        _stub_refresh_results(["account-a"], error_code="LEASE_HELD"),
+    )
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 7
+
+
+def test_refresh_partial_success_with_lease_held_exits_conflict(
+    profile_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mixed: one succeeded, one LEASE_HELD → still exit 7."""
+    from claude_lb.refresh import RefreshResult
+
+    profile_factory("account-a")
+    profile_factory("account-b")
+
+    def _mixed(profiles, *, timeout=10.0, jitter_s=0.0):
+        return [
+            RefreshResult(name=profiles[0].name, refreshed=True),
+            RefreshResult(name=profiles[1].name, refreshed=False, error_code="LEASE_HELD"),
+        ]
+
+    monkeypatch.setattr(cli_mod, "refresh_many_sync", _mixed)
+    result = runner.invoke(app, ["refresh", "--all"])
+    assert result.exit_code == 7
+
+
 def test_refresh_all_failures_refresh_rejected_exits_auth_required(
     profile_factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2619,7 +2653,7 @@ def test_exec_retry_on_429_dispatches_second_profile(
     # First child run rc=1; re-probe shows RATE_LIMITED; second run rc=0
     run_calls: list[str] = []
 
-    def _stub_run(argv, *, env_var_name, profile_name, timeout):
+    def _stub_run(argv, *, env_var_name, profile_name, timeout, **_kw):
         run_calls.append(profile_name)
         rc = 1 if len(run_calls) == 1 else 0
         return ExecResult(rc=rc, duration_ms=10)
@@ -2659,7 +2693,7 @@ def test_exec_no_retry_when_disabled(
 
     run_calls: list[str] = []
 
-    def _stub_run(argv, *, env_var_name, profile_name, timeout):
+    def _stub_run(argv, *, env_var_name, profile_name, timeout, **_kw):
         run_calls.append(profile_name)
         return ExecResult(rc=42, duration_ms=10)
 
@@ -2694,7 +2728,7 @@ def test_exec_timeout_doesnt_trigger_retry(
 
     run_calls: list[str] = []
 
-    def _stub_run(argv, *, env_var_name, profile_name, timeout):
+    def _stub_run(argv, *, env_var_name, profile_name, timeout, **_kw):
         run_calls.append(profile_name)
         return ExecResult(rc=RC_TIMEOUT, duration_ms=10, timed_out=True)
 
@@ -4772,4 +4806,124 @@ def test_top_with_bounded_iterations_renders_and_exits(
 def test_top_negative_interval_rejected_by_typer() -> None:
     result = runner.invoke(app, ["top", "--interval", "-1"])
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# snapshot — credential rotation safety
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_writes_file(profile_factory, _isolated_home: Path, tmp_path: Path) -> None:
+    """snapshot copies credentials.json to the destination."""
+    profile_factory("account-a")
+    dst = tmp_path / "snap" / "creds.json"
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["snapshot", "account-a", str(dst)])
+    assert result.exit_code == 0
+    assert dst.exists()
+    # Dest dir should have been created.
+    assert dst.parent.is_dir()
+    assert "point-in-time copy" in result.stderr
+
+
+def test_snapshot_unknown_profile_exits_3(profile_factory, _isolated_home: Path, tmp_path: Path) -> None:
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["snapshot", "no-such-profile", str(tmp_path / "out.json")])
+    assert result.exit_code == 3  # NOT_FOUND
+    assert "not found" in result.stderr.lower()
+
+
+def test_snapshot_json_output(profile_factory, _isolated_home: Path, tmp_path: Path) -> None:
+    profile_factory("account-a")
+    dst = tmp_path / "creds.json"
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["snapshot", "--json", "account-a", str(dst)])
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["data"]["profile"] == "account-a"
+    assert data["data"]["path"] == str(dst)
+    assert "source" in data["data"]
+
+
+# ---------------------------------------------------------------------------
+# exec --lease / --no-lease / --lease-for
+# ---------------------------------------------------------------------------
+
+
+def test_exec_passes_lease_profile_true_by_default(profile_factory) -> None:
+    """exec passes lease_profile=True to run_child by default."""
+    profile_factory("account-a")
+    captured: list[dict] = []
+
+    def _stub(argv, *, env_var_name, profile_name, timeout, lease_profile, lease_duration_s, **_kw):
+        captured.append({"lease_profile": lease_profile, "lease_duration_s": lease_duration_s})
+        from claude_lb.exec_cmd import ExecResult
+        return ExecResult(rc=0, duration_ms=10)
+
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync), \
+         patch.object(cli_mod, "run_child", _stub):
+        result = runner.invoke(app, ["exec", "echo", "hi"])
+    assert result.exit_code == 0
+    assert captured[0]["lease_profile"] is True
+    assert captured[0]["lease_duration_s"] == 30 * 60  # default
+
+
+def test_exec_no_lease_passes_false(profile_factory) -> None:
+    """--no-lease passes lease_profile=False to run_child."""
+    profile_factory("account-a")
+    captured: list[dict] = []
+
+    def _stub(argv, *, env_var_name, profile_name, timeout, lease_profile, lease_duration_s, **_kw):
+        captured.append({"lease_profile": lease_profile})
+        from claude_lb.exec_cmd import ExecResult
+        return ExecResult(rc=0, duration_ms=10)
+
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync), \
+         patch.object(cli_mod, "run_child", _stub):
+        result = runner.invoke(app, ["exec", "--no-lease", "echo", "hi"])
+    assert result.exit_code == 0
+    assert captured[0]["lease_profile"] is False
+
+
+def test_exec_lease_for_sets_duration(profile_factory) -> None:
+    """--lease-for 5m passes lease_duration_s=300."""
+    profile_factory("account-a")
+    captured: list[dict] = []
+
+    def _stub(argv, *, env_var_name, profile_name, timeout, lease_profile, lease_duration_s, **_kw):
+        captured.append({"lease_duration_s": lease_duration_s})
+        from claude_lb.exec_cmd import ExecResult
+        return ExecResult(rc=0, duration_ms=10)
+
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync), \
+         patch.object(cli_mod, "run_child", _stub):
+        result = runner.invoke(app, ["exec", "--lease-for", "5m", "echo", "hi"])
+    assert result.exit_code == 0
+    assert captured[0]["lease_duration_s"] == 300
+
+
+def test_exec_lease_for_invalid_exits_validation(profile_factory) -> None:
+    """--lease-for with bad value exits 4 (VALIDATION)."""
+    profile_factory("account-a")
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
+        result = runner.invoke(app, ["exec", "--lease-for", "5d", "echo", "hi"])
+    assert result.exit_code == 4  # VALIDATION
+    assert "lease-for" in result.stderr.lower()
+
+
+def test_exec_timeout_derives_lease_duration(profile_factory) -> None:
+    """--timeout 60 without --lease-for → lease_duration_s = int(60 * 1.2) = 72."""
+    profile_factory("account-a")
+    captured: list[dict] = []
+
+    def _stub(argv, *, env_var_name, profile_name, timeout, lease_profile, lease_duration_s, **_kw):
+        captured.append({"lease_duration_s": lease_duration_s})
+        from claude_lb.exec_cmd import ExecResult
+        return ExecResult(rc=0, duration_ms=10)
+
+    with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync), \
+         patch.object(cli_mod, "run_child", _stub):
+        result = runner.invoke(app, ["exec", "--timeout", "60", "echo", "hi"])
+    assert result.exit_code == 0
+    assert captured[0]["lease_duration_s"] == 72  # int(60 * 1.2)
 

@@ -122,6 +122,10 @@ Invariants an agent cannot intuit from `--help`:
 
 26. **`pick --fallback` is a CLI-layer concept, not a pick algorithm extension.** It activates AFTER `pick()` returns a structured failure. The fallback profile name must exist in discovery and not be in `--avoid`; non-existent fallbacks propagate the original failure (not a silent typo-rescue). Do not push `--fallback` into `pick.py` itself — keep the algorithm pure (filter ladder → strategy → top N) and let the CLI handle "what to do when there's nothing left" semantics. See `cli.profiles_pick`.
 
+27. **Leases prevent rotation of in-flight credentials.** `roost exec` auto-leases the picked profile for the child's lifetime (`--no-lease` to opt out; `--lease-for <duration>` to set the TTL explicitly; default 30m or `timeout * 1.2`). While leased, `refresh_profile()` returns `LEASE_HELD` (exit 7) without touching the credentials file. The lease store is `<config>/leases.json` — atomic writes, same pattern as `health.json`. Leases expire automatically at read time; no daemon, no cleanup process. Key invariants: (a) `roost pick` is zero-overhead — it never reads the lease store; (b) expired leases are transparent — `get_active()` returns None if past TTL; (c) only `refresh` checks leases, not `probe` — probing is freshness, not state. See `src/claude_lb/lease.py`, `src/claude_lb/exec_cmd.py:_maybe_lease`.
+
+28. **`roost snapshot <profile> <out-path>` is a documented point-in-time copy, not a live file.** It copies the credentials.json to the destination and prints a stderr warning that roost will never touch the snapshot. It does NOT acquire a lease. For full rotation protection during a long workload, use `roost exec` (which auto-leases). The snapshot command exists to make the "copy once, use for duration" pattern explicit and discoverable — without it, consumers would silently `cp` the file and have no documentation that the copy may become stale.
+
 **Prompt injection:** not applicable. `roost` returns only its own telemetry — profile names, utilization numbers, timestamps — never user-authored content from Anthropic's API.
 
 ## Code layout
@@ -135,7 +139,8 @@ Invariants an agent cannot intuit from `--help`:
 | `src/claude_lb/refresh.py` | OAuth refresh grant client; atomic credentials rewrite; `--jitter` support |
 | `src/claude_lb/cache.py` | Atomic read/write of `health.json`, TTL logic, `network_backoff_seconds` (exponential per-profile backoff for NETWORK_ERROR) |
 | `src/claude_lb/pick.py` | Strategies (incl. `lowest-overage`), stickiness, filter ladder (incl. `--avoid` and `--max-cost`), `PickOutcome.excluded_reasons` + `filter_scores` for `--explain`, pick log |
-| `src/claude_lb/exec_cmd.py` | `roost exec` subprocess orchestration (named `_cmd` to avoid shadowing the builtin) |
+| `src/claude_lb/lease.py` | Lease store: `acquire / release / get_active / list_leases / purge_expired`; `parse_duration` for duration strings |
+| `src/claude_lb/exec_cmd.py` | `roost exec` subprocess orchestration (named `_cmd` to avoid shadowing the builtin); `_maybe_lease` context manager auto-leases for child lifetime |
 | `src/claude_lb/output.py` | JSON envelope, stream separation, status table, `render_pick_explanation` |
 | `src/claude_lb/doctor.py` | Local-setup diagnostics |
 | `src/claude_lb/platform_status.py` | status.claude.com fetcher + 60s cache + format helpers (shared by `status` and `doctor`) |

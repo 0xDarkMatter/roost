@@ -79,6 +79,11 @@ def single_profile_fallback() -> Path | None:
     return None
 
 
+def leases_path() -> Path:
+    """Full path to leases.json (active lease registry)."""
+    return config_dir() / "leases.json"
+
+
 def ensure_config_dir() -> Path:
     """Create the config dir if missing; return it."""
     d = config_dir()

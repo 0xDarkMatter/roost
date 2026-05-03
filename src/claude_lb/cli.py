@@ -144,6 +144,7 @@ REFRESH_ERROR_TO_EXIT: dict[str, int] = {
     "UNEXPECTED_RESPONSE": EXIT_ERROR,
     "WRITE_FAILED": EXIT_ERROR,
     "LOCK_HELD": EXIT_CONFLICT,
+    "LEASE_HELD": EXIT_CONFLICT,
     # Stale editable install: pyproject declares the dep but tool venv
     # never got re-synced. Reusing EXIT_ERROR so scripts just see
     # "something went wrong"; the error_message/error_code tells the user
@@ -1198,15 +1199,15 @@ def _run_refresh(
         # beats anything else (operator may just need to retry), then
         # AUTH_REQUIRED for refresh/dead errors, then generic ERROR.
         failed_codes = [r.error_code for r in results if not r.refreshed]
-        if any(c == "LOCK_HELD" for c in failed_codes):
+        if any(c in ("LOCK_HELD", "LEASE_HELD") for c in failed_codes):
             raise typer.Exit(EXIT_CONFLICT)
         mapped = [REFRESH_ERROR_TO_EXIT.get(c or "", EXIT_ERROR) for c in failed_codes]
         raise typer.Exit(max(mapped) if mapped else EXIT_ERROR)
     if failed_count:
         # Some succeeded, some failed. Still exit non-zero but make LOCK_HELD
-        # observable so scripts can retry just the conflicted ones.
+        # / LEASE_HELD observable so scripts can retry just the conflicted ones.
         failed_codes = [r.error_code for r in results if not r.refreshed]
-        if any(c == "LOCK_HELD" for c in failed_codes):
+        if any(c in ("LOCK_HELD", "LEASE_HELD") for c in failed_codes):
             raise typer.Exit(EXIT_CONFLICT)
         raise typer.Exit(EXIT_ERROR)
 
@@ -1503,6 +1504,29 @@ def exec_cmd(
     ] = False,
     no_cache: Annotated[bool, typer.Option("--no-cache")] = False,
     max_age: Annotated[int | None, typer.Option("--max-age")] = None,
+    no_lease: Annotated[
+        bool,
+        typer.Option(
+            "--no-lease",
+            help=(
+                "Skip auto-leasing the picked profile. By default exec pins the "
+                "profile against rotation for the child's lifetime so that a "
+                "background probe cannot rotate the refresh_token under a "
+                "long-running child. Use --no-lease for short-lived children "
+                "where the overhead is unwanted."
+            ),
+        ),
+    ] = False,
+    lease_for: Annotated[
+        str,
+        typer.Option(
+            "--lease-for",
+            help=(
+                "Lease TTL when --no-lease is not set. Accepts '30m', '2h', '90s'. "
+                "Defaults to the --timeout value (if set) plus 20%%, else 30m."
+            ),
+        ),
+    ] = "",
 ) -> None:
     """Pick a profile, run a child command with AXIOM_CLAUDE_PROFILE set.
 
@@ -1517,6 +1541,8 @@ def exec_cmd(
     """
     import shlex
 
+    from .lease import parse_duration as _parse_lease_duration
+
     chosen_strategy = _validate_strategy(strategy)
     argv = list(ctx.args or [])
     if not argv:
@@ -1525,6 +1551,19 @@ def exec_cmd(
             "Example: claude-lb exec -- claude --help"
         )
         raise typer.Exit(EXIT_VALIDATION)
+
+    # Resolve lease duration: explicit --lease-for > timeout+20% > 30m default.
+    do_lease = not no_lease
+    if lease_for:
+        try:
+            lease_duration_s = _parse_lease_duration(lease_for)
+        except ValueError as exc:
+            stderr.print(f"[red]--lease-for: {exc}[/red]")
+            raise typer.Exit(EXIT_VALIDATION) from None
+    elif timeout is not None:
+        lease_duration_s = max(int(timeout * 1.2), 60)
+    else:
+        lease_duration_s = 30 * 60
 
     cache, names = _load_or_probe(refresh=no_cache, max_age=max_age)
     chosen, cache = _pick_one(
@@ -1552,6 +1591,8 @@ def exec_cmd(
         env_var_name=var_name,
         profile_name=chosen.name,
         timeout=timeout,
+        lease_profile=do_lease,
+        lease_duration_s=lease_duration_s,
     )
 
     full_argv_str = " ".join(shlex.quote(a) for a in argv) if log_full_argv else None
@@ -1613,6 +1654,8 @@ def exec_cmd(
                 env_var_name=var_name,
                 profile_name=second.name,
                 timeout=timeout,
+                lease_profile=do_lease,
+                lease_duration_s=lease_duration_s,
             )
             full_argv_str2 = (
                 " ".join(shlex.quote(a) for a in argv) if log_full_argv else None
@@ -2180,6 +2223,72 @@ def profiles_which(
         explain=explain,
         json_output=json_output,
     )
+
+
+# ---------------------------------------------------------------------------
+# snapshot — credential rotation safety
+# ---------------------------------------------------------------------------
+
+
+@app.command("snapshot")
+def snapshot_cmd(
+    profile: Annotated[
+        str,
+        typer.Argument(
+            help="Profile to snapshot.",
+            autocompletion=_complete_profile_names,
+        ),
+    ],
+    out_path: Annotated[
+        str,
+        typer.Argument(help="Destination path for the snapshot file."),
+    ],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Copy a profile's credentials.json to a stable out-path.
+
+    Unlike reading the live file directly, this makes the intent explicit:
+    the snapshot is a point-in-time copy that roost will never touch.
+    For full rotation protection during a long workload, combine with
+    `roost lease` (or use `roost exec` which auto-leases by default).
+
+    Example (Axiom trial pattern):
+        roost snapshot mknv74 /tmp/trial-creds.json
+        AXIOM_HOST_CLAUDE_CREDENTIALS=/tmp/trial-creds.json axiom solve ...
+    """
+    import shutil
+    from pathlib import Path
+
+    names_map = {p.name: p for p in discover_profiles()}
+    if profile not in names_map:
+        if json_output:
+            emit_error_json("NOT_FOUND", f"Profile {profile!r} not found")
+        else:
+            stderr.print(f"[red]profile not found:[/red] {profile!r}")
+        raise typer.Exit(EXIT_NOT_FOUND)
+
+    src = Path(names_map[profile].credentials_path)
+    dst = Path(out_path)
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    except OSError as exc:
+        if json_output:
+            emit_error_json("IO_ERROR", f"copy failed: {exc}")
+        else:
+            stderr.print(f"[red]snapshot failed:[/red] {exc}")
+        raise typer.Exit(1) from None
+
+    if json_output:
+        emit_json({
+            "data": {"profile": profile, "path": str(dst), "source": str(src)},
+            "meta": {"profile": profile},
+        })
+    else:
+        stderr.print(
+            f"[green]snapshot written:[/green] {dst}\n"
+            "[dim]Note: roost will not update this file — it is a point-in-time copy.[/dim]"
+        )
 
 
 # ---------------------------------------------------------------------------

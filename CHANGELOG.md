@@ -5,6 +5,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+## [0.5.0] - Unreleased
+
+### Added
+
+**Credential rotation safety**
+
+Fixes a real production failure where `roost refresh` (running at background
+probe cadence) rotated a profile's refresh_token while a long-lived consumer
+held a copy of the old credentials file. The consumer's SDK refresh attempt
+returned `invalid_grant` → 401 on all subsequent API calls — indistinguishable
+from model failure and wasting trial budget.
+
+- **`roost exec --lease` (default on)** — `exec` now auto-leases the picked
+  profile for the child's lifetime so that background probe pressure cannot
+  rotate the credential under a long-running child. The lease is released in a
+  `finally` block so Ctrl+C and exceptions both clean up correctly. Use
+  `--no-lease` for short-lived children where the overhead is unwanted. Use
+  `--lease-for <duration>` to override the TTL (defaults to `--timeout * 1.2`
+  when a timeout is set, else 30m). While leased, `roost refresh` returns
+  `LEASE_HELD` (exit 7) without touching the credentials file. Leases expire
+  automatically at read time — no daemon or cleanup process needed.
+
+- **`roost snapshot <profile> <out-path>`** — copy a profile's `credentials.json`
+  to a stable path with an explicit stderr warning that roost will never touch
+  the snapshot. Makes the "copy once, use for duration" pattern discoverable
+  without silently reading the live file. Does not acquire a lease; for full
+  rotation protection on arbitrary workloads use `roost exec` (which auto-leases).
+
+**Short-session impact: zero.** `roost pick` never reads the lease store.
+`roost exec --no-lease` opts out entirely. The lease overhead for a short-lived
+child is a few milliseconds of JSON I/O at exec start and exit.
+
 ## [0.4.0] - 2026-04-27
 
 ### Added

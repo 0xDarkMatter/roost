@@ -197,6 +197,24 @@ async def refresh_profile(
     endpoint at the top of the minute. Applied per-profile, not per call —
     parallel refreshes of N profiles each get their own random delay.
     """
+    # Refuse to rotate a leased profile — the consumer pinned it for a reason.
+    from .lease import get_active as _get_active_lease
+
+    active_lease = _get_active_lease(profile.name)
+    if active_lease is not None:
+        return RefreshResult(
+            name=profile.name,
+            refreshed=False,
+            previous_expires_at=profile.access_token_expires_at,
+            error_code="LEASE_HELD",
+            error_message=(
+                f"Profile {profile.name!r} is leased until "
+                f"{active_lease.expires_at.strftime('%H:%M:%S UTC')} "
+                f"by {active_lease.creator!r} (lease {active_lease.lease_id}). "
+                f"Run `roost release {active_lease.lease_id}` to unlock early."
+            ),
+        )
+
     # Lazy-import filelock here so that a stale install (pyproject declares
     # the dep but tool venv hasn't been re-synced) fails with a clean
     # RefreshResult instead of a ModuleNotFoundError traceback, and every
