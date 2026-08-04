@@ -13,6 +13,15 @@ Schemas:
 
     usage-log.ndjson line:
         one JSON object per line, see usage_log._record_for() for the schema.
+
+`summarise_metric` is metric-name-agnostic — it reads whatever key is passed
+via `metric=` off each record, so it already covers weekly_pct, session_pct,
+sonnet_pct, opus_pct, overage_pct, fable_pct, and spend_pct without a
+per-metric branch. A metric where every record is null (e.g. sonnet_pct/
+opus_pct on accounts migrated to the new `limits[]` shape) naturally produces
+zero grouped samples, so summarise_metric returns `[]` rather than raising or
+dividing by zero — see test_summarise_metric_all_null_metric_returns_no_data
+in test_stats.py.
 """
 
 from __future__ import annotations
