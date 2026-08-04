@@ -358,9 +358,10 @@ def test_inactive_scoped_limit_at_100_does_not_trigger_model_limit() -> None:
     result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
     assert result.health is Health.OK
     assert result.usage is not None
-    # model_pct() also requires is_active, so an inactive 100% entry is
-    # invisible to it too — not just to the health classifier.
-    assert result.usage.fable_pct is None
+    # The gate is classification-only. Reporting still reads the number: an
+    # inactive limit is "not the binding constraint", not "no data", so
+    # hiding it from the display would misreport real capacity.
+    assert result.usage.fable_pct == 100
 
 
 def test_weekly_exhausted_and_model_exhausted_prefers_weekly_limit() -> None:

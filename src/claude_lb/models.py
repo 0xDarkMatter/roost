@@ -136,7 +136,18 @@ class Usage(BaseModel):
     spend: Spend | None = None
 
     def model_pct(self, name: str) -> int | None:
-        """Active scoped-limit percent for `name` (case-insensitive).
+        """Scoped-limit percent for `name` (case-insensitive).
+
+        Deliberately does NOT filter on `is_active`. Upstream marks exactly
+        one limit active per profile — it means "this is the constraint
+        currently binding", not "this limit is enforced". Filtering on it here
+        would report `None` for an account whose Fable window is genuinely at
+        0% simply because its session window happens to be the nearer cap,
+        which reads as "no data" instead of "plenty left".
+
+        The classifier gates on `is_active` separately and deliberately (see
+        `taxonomy._classify_200`): only the binding constraint should be able
+        to push a profile out of the pick pool.
 
         Prefers `limits[]`; falls back to the legacy `sonnet_pct`/`opus_pct`
         windows for those two names so accounts still returning them don't
@@ -144,7 +155,7 @@ class Usage(BaseModel):
         """
         lname = name.lower()
         for limit in self.limits:
-            if limit.is_active and limit.model is not None and limit.model.lower() == lname:
+            if limit.model is not None and limit.model.lower() == lname:
                 return limit.percent
         if lname == "sonnet":
             return self.sonnet_pct

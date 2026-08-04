@@ -27,6 +27,7 @@ from .output import (
     stderr,
 )
 from .term import Term, emit_panel
+from .widget import render_widget
 from .pick import (
     PickFailureReason,
     Strategy,
@@ -556,6 +557,43 @@ def top_status(
         refresh=refresh,
         max_age=max_age,
         no_platform_status=no_platform_status,
+    )
+
+
+@app.command("widget")
+def status_widget(
+    no_cache: Annotated[
+        bool, typer.Option("--no-cache", help="Ignore cache; probe everything.")
+    ] = False,
+    max_age: Annotated[
+        int | None, typer.Option("--max-age", help="Override TTL, seconds.")
+    ] = None,
+    no_platform_status: Annotated[
+        bool, typer.Option("--no-platform-status", help="Skip the status.claude.com check.")
+    ] = False,
+    max_kb: Annotated[
+        int,
+        typer.Option("--max-kb", help="Byte budget for the emitted HTML."),
+    ] = 28,
+) -> None:
+    """Emit capacity cards as self-contained HTML for Claude Code's show_widget.
+
+    The whole document goes to stdout so it can be piped straight into the
+    tool. Nothing else may print there (rule 8) — the byte-budget warning and
+    any platform-status chatter stay on stderr.
+    """
+    cache, names = _load_or_probe(refresh=no_cache, max_age=max_age)
+    platform = None if no_platform_status else _load_platform_status(
+        force_refresh=no_cache,
+    )
+    meta_extra = _platform_status_to_meta(platform) if platform is not None else None
+    payload = build_status_payload(cache, names, platform_status_meta=meta_extra)
+    emit_text(
+        render_widget(
+            payload["data"],
+            payload["meta"],
+            max_bytes=max_kb * 1024,
+        )
     )
 
 

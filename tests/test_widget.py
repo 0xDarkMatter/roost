@@ -128,7 +128,14 @@ def test_fable_pct_absent_when_limits_key_missing_entirely():
     assert "Fable" in html
 
 
-def test_inactive_fable_limit_is_ignored():
+def test_inactive_fable_limit_is_still_displayed():
+    """`is_active: false` means "not the binding constraint", not "no data".
+
+    Upstream marks exactly one limit active per profile. Skipping the
+    inactive ones would render a profile whose Fable window is genuinely at
+    0% as "—", which reads as "unknown" when it actually means "plenty
+    left". Only the health classifier gates on `is_active`.
+    """
     usage = _usage(
         limits=[
             {
@@ -144,7 +151,7 @@ def test_inactive_fable_limit_is_ignored():
         ]
     )
     html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
-    assert "99%" not in html
+    assert "99%" in html
 
 
 def test_no_external_dependencies():

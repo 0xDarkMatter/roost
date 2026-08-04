@@ -264,8 +264,15 @@ def _active_fable_limit(usage: dict[str, Any] | None) -> dict[str, Any] | None:
     limits = usage.get("limits")
     if not isinstance(limits, list):
         return None
+    # Deliberately NOT filtered on `is_active`. Upstream marks exactly one
+    # limit active per profile, meaning "this is the constraint currently
+    # binding" — not "this limit is enforced". Filtering on it renders a
+    # profile whose Fable window sits at 0% as "—" (no data) purely because
+    # its session window is the nearer cap, which is the opposite of the
+    # truth. Only the classifier gates on `is_active`, and only to decide
+    # whether a profile leaves the pick pool.
     for entry in limits:
-        if not isinstance(entry, dict) or not entry.get("is_active"):
+        if not isinstance(entry, dict):
             continue
         model = entry.get("model")
         if isinstance(model, str) and model.strip().lower() == "fable":
