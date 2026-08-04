@@ -50,6 +50,56 @@ from typing import Any
 # fallbacks, which rendered every card dark on a light desktop.
 _INCIDENT_MAX_CHARS = 160
 
+# Anthropic's Claude mark, as an inline path. Same asset fleetflow's dashboard
+# uses for its provider marks — carried here rather than fetched because the
+# show_widget CSP blocks every outbound request, so a remote logo would render
+# as nothing. `currentColor` lets it inherit the surrounding text colour and
+# therefore track light/dark with everything else.
+_CLAUDE_MARK = (
+    '<svg class="rw-mark" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">'
+    '<path d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486'
+    "-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797"
+    "-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579"
+    "-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643"
+    "-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893"
+    " 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893"
+    "-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0"
+    "l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318"
+    ".091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107"
+    ".7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429"
+    "h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321"
+    "l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093"
+    ".1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075"
+    "-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621"
+    "l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107"
+    "-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768"
+    "-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496"
+    " 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959"
+    "l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468"
+    ".3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182"
+    "-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008"
+    "-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164"
+    '-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></svg>'
+)
+
+# Statuspage component/incident vocabulary -> colour. Ranked so "worst wins"
+# when several incidents share a day.
+_IMPACT_RANK = {"none": 0, "maintenance": 1, "minor": 2, "major": 3, "critical": 4}
+_IMPACT_COLORS = {
+    "none": "#1D9E75",
+    "maintenance": "#8a8a86",
+    "minor": "#E0A233",
+    "major": "#BA7517",
+    "critical": "#E24B4A",
+}
+_COMPONENT_COLORS = {
+    "operational": "#1D9E75",
+    "degraded_performance": "#E0A233",
+    "partial_outage": "#BA7517",
+    "major_outage": "#E24B4A",
+    "under_maintenance": "#8a8a86",
+}
+
 _STYLE = (
     "<style>"
     ".rw{color-scheme:light dark;"
@@ -106,15 +156,33 @@ _STYLE = (
     ".rw-status{font-size:11px;color:var(--rw-muted);margin-left:auto}"
     ".rw-pick{font-size:11px;color:var(--rw-muted)}"
     ".rw-pick b{color:var(--rw-text);font-weight:600}"
-    ".rw-rings{display:flex;flex-wrap:wrap;gap:14px;padding-top:2px}"
-    ".rw-ringbox{display:flex;flex-direction:column;align-items:center;gap:3px;"
+    ".rw-mark{width:15px;height:15px;flex:none;color:#D97757}"
+    ".rw-cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,auto);"
+    "gap:10px 20px;align-items:start}"
+    "@media (max-width:560px){.rw-cols{grid-template-columns:minmax(0,1fr)}}"
+    ".rw-col-r{display:flex;flex-direction:column;gap:3px;min-width:180px}"
+    ".rw-rings{display:flex;flex-wrap:wrap;gap:12px;padding-top:2px}"
+    ".rw-ringbox{display:flex;flex-direction:column;align-items:center;gap:2px;"
     "min-width:56px}"
-    ".rw-ring{width:44px;height:44px;display:block}"
-    ".rw-ringpct{font-size:10px;font-weight:500;"
-    "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace}"
-    ".rw-ringname{font-size:10px;color:var(--rw-muted);max-width:72px;"
+    ".rw-ring{width:46px;height:46px;display:block}"
+    ".rw-ringname{font-size:10px;color:var(--rw-muted);max-width:76px;"
     "overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+    ".rw-legrow{display:flex;gap:6px}"
+    ".rw-leg{font-size:9px;font-weight:500;"
+    "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace}"
     ".rw-ringwin{font-size:9px;color:var(--rw-muted)}"
+    # Component rows + incident grid (right column).
+    ".rw-comp{display:flex;align-items:center;gap:6px;font-size:10px;"
+    "color:var(--rw-muted);line-height:1.5}"
+    ".rw-cdot{width:6px;height:6px;border-radius:1.5px;flex:none}"
+    ".rw-cname{color:var(--rw-text);white-space:nowrap;overflow:hidden;"
+    "text-overflow:ellipsis}"
+    ".rw-cstate{margin-left:auto;white-space:nowrap}"
+    ".rw-gridlabel{font-size:9px;color:var(--rw-muted);margin-top:6px}"
+    ".rw-daygrid{display:grid;grid-template-columns:repeat(20,1fr);gap:2px;"
+    "margin-top:3px;max-width:200px}"
+    ".rw-day{display:block;width:100%;aspect-ratio:1;border-radius:1.5px;"
+    "min-height:6px}"
     "</style>"
 )
 
@@ -218,72 +286,108 @@ def _render(
     return f'{_STYLE}<div class="rw">{head}{grid}</div>'
 
 
-def _binding_window(profile: dict[str, Any]) -> tuple[str, float | None]:
-    """The window closest to exhausting, i.e. what actually gates this profile.
 
-    Returns (label, percent). A fleet-level ring wants one number per profile,
-    and the honest one is the *worst* window — a profile at weekly 5% but
-    Fable 90% has 10% of headroom, not 95%. Naming the window alongside the
-    number keeps that legible rather than mysterious.
-    """
-    usage = profile.get("usage")
-    usage = usage if isinstance(usage, dict) else None
-    if usage is None:
-        return ("—", None)
-    fable_limit = _active_fable_limit(usage)
-    windows = (
-        ("Session", _as_number(usage.get("session_pct"))),
-        ("Weekly", _as_number(usage.get("weekly_pct"))),
-        ("Fable", _as_number(fable_limit.get("percent")) if fable_limit else None),
+_RING_OUTER_R = 15.9155  # circumference 100 -> dasharray maps 1:1 to percent
+_RING_INNER_R = 10.5
+
+
+def _arc(radius: float, pct: float, colour: str, width: float) -> str:
+    """One stroked arc. Dash length is scaled to the radius's circumference."""
+    circumference = 2 * 3.141592653589793 * radius
+    dash = circumference * max(0.0, min(100.0, pct)) / 100.0
+    return (
+        f'<circle cx="18" cy="18" r="{radius:g}" fill="none" stroke="{colour}" '
+        f'stroke-width="{width:g}" stroke-linecap="round" '
+        f'stroke-dasharray="{dash:.3f} {circumference - dash:.3f}" '
+        'transform="rotate(-90 18 18)"/>'
     )
-    known = [(label, pct) for label, pct in windows if pct is not None]
-    if not known:
-        return ("—", None)
-    return max(known, key=lambda w: w[1])
 
 
 def _ring(profile: dict[str, Any]) -> str:
-    """One donut gauge: binding-window percent for a single profile.
+    """Concentric gauges for one profile: outer = Weekly, inner = Fable.
 
-    r=15.9155 makes the circumference exactly 100, so stroke-dasharray maps
-    1:1 to percent with no arithmetic. Pure SVG — no canvas, no library, and
-    nothing that needs a network fetch the show_widget CSP would block.
+    Two rings rather than one because the two windows exhaust independently
+    and the gap between them is the whole point — a profile at Weekly 76%
+    with Fable at 90% is gated by Fable, and a single ring showing either
+    number alone hides that.
+
+    Pure SVG. No canvas, no library, nothing needing a network fetch the
+    show_widget CSP would block.
     """
     name = str(profile.get("name") or "unknown")
-    label, pct = _binding_window(profile)
     health = str(profile.get("health") or "unknown")
-    if pct is None:
-        colour = _SEVERITY_GREY
-        dash = 0.0
-        text = "—"
-    else:
-        colour = _severity_color(pct)
-        dash = max(0.0, min(100.0, pct))
-        text = f"{int(pct) if float(pct).is_integer() else round(pct, 1)}%"
-    # An unhealthy profile reads as its state, not as a percentage — a
-    # dead profile at 5% usage is not 95% available.
+    usage = profile.get("usage")
+    usage = usage if isinstance(usage, dict) else None
+    weekly = _as_number(usage.get("weekly_pct")) if usage else None
+    fable_limit = _active_fable_limit(usage)
+    fable = _as_number(fable_limit.get("percent")) if fable_limit else None
+
+    arcs = [
+        '<circle cx="18" cy="18" r="15.9155" fill="none" '
+        'stroke="var(--rw-track)" stroke-width="3"/>',
+        '<circle cx="18" cy="18" r="10.5" fill="none" '
+        'stroke="var(--rw-track)" stroke-width="2.4"/>',
+    ]
+    # An unhealthy profile reads as its state, not a percentage — a dead
+    # profile at 5% usage is not 95% available.
     if health not in ("ok", "model_limit"):
         colour = _HEALTH_COLORS.get(health, _SEVERITY_GREY)
-        text = "!"
-        dash = 100.0
+        arcs.append(_arc(_RING_OUTER_R, 100.0, colour, 3))
+        centre = "!"
+        centre_colour = colour
+        # The screen-reader label must say the same thing the ring does. An
+        # aria-label quoting "weekly 5%" for a dead profile would tell a
+        # non-sighted user it has 95% of headroom, which is exactly the
+        # misreading the visual treatment exists to prevent.
+        aria = f"{name}: {health.replace('_', ' ')}"
+    else:
+        if weekly is not None:
+            arcs.append(_arc(_RING_OUTER_R, weekly, _severity_color(weekly), 3))
+        if fable is not None:
+            arcs.append(_arc(_RING_INNER_R, fable, _severity_color(fable), 2.4))
+        binding = max([p for p in (weekly, fable) if p is not None], default=None)
+        centre = "—" if binding is None else f"{_fmt_pct(binding)}"
+        centre_colour = _SEVERITY_GREY if binding is None else _severity_color(binding)
+        aria = f"{name}: weekly {_fmt_pct(weekly)}, Fable {_fmt_pct(fable)}"
+
+    if health not in ("ok", "model_limit"):
+        # Same reason the centre shows "!" and the aria-label names the state:
+        # a percentage next to a dead profile reads as available headroom.
+        colour = _HEALTH_COLORS.get(health, _SEVERITY_GREY)
+        legend = (
+            f'<span class="rw-leg" style="color:{colour}">'
+            f'{_esc(health.replace("_", " "))}</span>'
+        )
+    else:
+        legend = (
+            f'<span class="rw-leg" style="color:{_pct_colour(weekly)}">'
+            f"W {_fmt_pct(weekly)}</span>"
+            f'<span class="rw-leg" style="color:{_pct_colour(fable)}">'
+            f"F {_fmt_pct(fable)}</span>"
+        )
     return (
         '<div class="rw-ringbox">'
-        '<svg class="rw-ring" viewBox="0 0 36 36" role="img" '
-        f'aria-label="{_esc(name)}: {_esc(label)} {_esc(text)}">'
-        '<circle cx="18" cy="18" r="15.9155" fill="none" '
-        'stroke="var(--rw-track)" stroke-width="3.2"/>'
-        f'<circle cx="18" cy="18" r="15.9155" fill="none" stroke="{colour}" '
-        f'stroke-width="3.2" stroke-linecap="round" '
-        f'stroke-dasharray="{dash:g} {100 - dash:g}" '
-        'transform="rotate(-90 18 18)"/>'
-        f'<text x="18" y="21" text-anchor="middle" font-size="10" '
-        f'fill="{colour}" font-family="ui-monospace,Consolas,monospace">'
-        f"{_esc(text)}</text>"
+        f'<svg class="rw-ring" viewBox="0 0 36 36" role="img" '
+        f'aria-label="{_esc(aria)}">'
+        f"{''.join(arcs)}"
+        f'<text x="18" y="20.6" text-anchor="middle" font-size="8.5" '
+        f'fill="{centre_colour}" font-family="ui-monospace,Consolas,monospace">'
+        f"{_esc(centre)}</text>"
         "</svg>"
         f'<span class="rw-ringname" title="{_esc(name)}">{_esc(name)}</span>'
-        f'<span class="rw-ringwin">{_esc(label)}</span>'
+        f'<span class="rw-legrow">{legend}</span>'
         "</div>"
     )
+
+
+def _fmt_pct(pct: float | None) -> str:
+    if pct is None:
+        return "—"
+    return f"{int(pct) if float(pct).is_integer() else round(pct, 1)}%"
+
+
+def _pct_colour(pct: float | None) -> str:
+    return _SEVERITY_GREY if pct is None else _severity_color(pct)
 
 
 def _render_dashboard(
@@ -317,18 +421,103 @@ def _render_dashboard(
 
     rings = "".join(_ring(p) for p in profiles)
     ring_row = f'<div class="rw-rings">{rings}</div>' if rings else ""
+    right = _render_platform_panel(meta)
+
+    body = (
+        f'<div class="rw-cols"><div class="rw-col-l">{ring_row}</div>'
+        f'<div class="rw-col-r">{right}</div></div>'
+        if right
+        else ring_row
+    )
 
     return (
         '<div class="rw-head">'
         '<div class="rw-head-row">'
-        '<span class="rw-title">roost</span>'
+        f'{_CLAUDE_MARK}<span class="rw-title">roost</span>'
         f'<span class="rw-counts">{total} profile{"" if total == 1 else "s"} · '
         f"{ok} ok</span>"
         f"{status}"
         "</div>"
-        f"{pick_row}{ring_row}"
+        f"{pick_row}{body}"
         f"{_incident_line(meta)}"
         "</div>"
+    )
+
+
+def _render_platform_panel(meta: dict[str, Any]) -> str:
+    """Right-hand column: Anthropic component states + incident-day grid.
+
+    Both inputs are optional — an older cache, a `--no-platform-status` run, or
+    a Statuspage that never answered all yield an absent section rather than an
+    empty box. Best-effort enrichment, per AGENTS.md rule 20.
+    """
+    platform = meta.get("platform_status")
+    if not isinstance(platform, dict):
+        return ""
+
+    blocks: list[str] = []
+
+    components = platform.get("components")
+    if isinstance(components, list) and components:
+        rows = []
+        for component in components[:5]:
+            if not isinstance(component, dict):
+                continue
+            name = _clip(component.get("name") or "?", 28)
+            state = str(component.get("status") or "unknown")
+            colour = _COMPONENT_COLORS.get(state, _SEVERITY_GREY)
+            rows.append(
+                '<div class="rw-comp">'
+                f'<span class="rw-cdot" style="background:{colour}"></span>'
+                f'<span class="rw-cname">{_esc(name)}</span>'
+                f'<span class="rw-cstate" style="color:{colour}">'
+                f'{_esc(state.replace("_", " "))}</span>'
+                "</div>"
+            )
+        if rows:
+            blocks.append("".join(rows))
+
+    grid = _incident_grid(platform)
+    if grid:
+        blocks.append(grid)
+
+    if not blocks:
+        return ""
+    return "".join(blocks)
+
+
+def _incident_grid(platform: dict[str, Any]) -> str:
+    """One square per day, coloured by that day's worst reported incident.
+
+    Deliberately labelled "incidents", never "uptime". Statuspage's public API
+    exposes incident records, not uptime measurements — a day with no incident
+    is "nothing was reported", which is a weaker claim than "100% up". The
+    window is whatever the data actually covers (the endpoint returns a bounded
+    number of recent incidents), so it is read from the payload rather than
+    assumed.
+    """
+    days = platform.get("incident_days")
+    if not isinstance(days, list) or not days:
+        return ""
+    cells = []
+    for day in days[-60:]:
+        if not isinstance(day, dict):
+            continue
+        impact = str(day.get("impact") or "none")
+        colour = _IMPACT_COLORS.get(impact, _SEVERITY_GREY)
+        date = _esc(str(day.get("date") or ""))
+        label = "no incidents" if impact == "none" else impact
+        cells.append(
+            f'<i class="rw-day" style="background:{colour}" '
+            f'title="{date}: {_esc(label)}"></i>'
+        )
+    if not cells:
+        return ""
+    span = platform.get("history_days")
+    span_text = f"last {span} days" if isinstance(span, int) and span > 0 else "recent"
+    return (
+        f'<div class="rw-gridlabel">Incidents · {_esc(span_text)}</div>'
+        f'<div class="rw-daygrid">{"".join(cells)}</div>'
     )
 
 

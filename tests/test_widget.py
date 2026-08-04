@@ -191,12 +191,12 @@ def test_oversized_fleet_drops_profiles_and_warns():
         )
         for i in range(80)
     ]
-    # Budget must clear the fixed chrome (style block + dashboard header,
-    # ~3.5 KB) or nothing can fit and the drop path is not what is being
-    # tested — see test_budget_below_fixed_chrome_warns for that case.
+    # Budget must clear the fixed chrome (style block, Claude mark, and
+    # dashboard header — ~7 KB) or nothing can fit and the drop path is not
+    # what is being tested — see test_budget_below_fixed_chrome_warns.
     with pytest.warns(Warning, match="dropped"):
-        html = render_widget(profiles, {"count": 80, "ok": 80}, max_bytes=8_000)
-    assert len(html.encode("utf-8")) <= 8_000
+        html = render_widget(profiles, {"count": 80, "ok": 80}, max_bytes=12_000)
+    assert len(html.encode("utf-8")) <= 12_000
     # The most-recently-probed profile (agent-with-...-000) must survive the drop.
     assert "agent-with-a-fairly-long-profile-name-000" in html
 
@@ -356,8 +356,12 @@ def test_dashboard_ring_uses_the_binding_window_not_the_first():
     )
     html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
     head = html.split('<div class="rw-head">')[1].split('<div class="rw-grid">')[0]
+    # Outer ring is Weekly, inner is Fable, and the legend names both so the
+    # gap between them (5% vs 90%) is legible rather than implied.
+    assert "W 5%" in head
+    assert "F 90%" in head
+    # The centre figure is the binding one, not the first one read.
     assert "90%" in head
-    assert ">Fable<" in head
 
 
 def test_dashboard_ring_shows_state_not_percent_for_unhealthy():
@@ -368,6 +372,9 @@ def test_dashboard_ring_shows_state_not_percent_for_unhealthy():
     )
     head = html.split('<div class="rw-head">')[1].split('<div class="rw-grid">')[0]
     assert "5%" not in head
+    # The aria-label must say the same thing the ring does — announcing
+    # "weekly 5%" would tell a screen-reader user it has 95% of headroom.
+    assert "auth dead" in head
 
 
 def test_dashboard_ring_handles_null_usage():
