@@ -55,8 +55,8 @@ _INCIDENT_MAX_CHARS = 160
 # show_widget CSP blocks every outbound request, so a remote logo would render
 # as nothing. `currentColor` lets it inherit the surrounding text colour and
 # therefore track light/dark with everything else.
-_CLAUDE_MARK = (
-    '<svg class="rw-mark" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">'
+_CLAUDE_PATH = (
+    '<g id="i-claude" fill="currentColor" stroke="none">'
     '<path d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486'
     "-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797"
     "-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579"
@@ -79,8 +79,21 @@ _CLAUDE_MARK = (
     ".3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182"
     "-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008"
     "-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164"
-    '-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></svg>'
+    '-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></g>'
 )
+
+
+def _claude_mark(cls: str) -> str:
+    """The Claude mark at a given size class, via the sprite.
+
+    Referenced rather than inlined because the path is ~1.8 KB and it now
+    appears twice — once in the roost header, once on the Claude Status
+    panel. Two copies would cost more than a whole profile card.
+    """
+    return (
+        f'<svg class="{cls}" viewBox="0 0 24 24" aria-hidden="true">'
+        '<use href="#i-claude"/></svg>'
+    )
 
 # Statuspage component/incident vocabulary -> colour. Ranked so "worst wins"
 # when several incidents share a day.
@@ -137,7 +150,8 @@ _GRID_PX = _GRID_ROWS * _PERIOD_PX - _GAP_PX
 # card, which matters at four cards x five stats.
 _ICON_SPRITE = (
     '<svg width="0" height="0" style="position:absolute" aria-hidden="true">'
-    '<defs><g id="i-target" fill="none" stroke="currentColor" stroke-width="2">'
+    "<defs>" + _CLAUDE_PATH
+    + '<g id="i-target" fill="none" stroke="currentColor" stroke-width="2">'
     '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5"/></g>'
     '<g id="i-play" fill="none" stroke="currentColor" stroke-width="2" '
     'stroke-linejoin="round"><path d="M7 5l12 7-12 7z"/></g>'
@@ -245,7 +259,19 @@ _STYLE = (
     # at once. Pure CSS: :has() detects "some row is hovered" to drop the
     # default, and a per-index sibling rule reveals the matching strip.
     # Eight rules covers more components than Anthropic has ever listed.
-    ".rw-strips{display:grid;margin-top:4px;min-height:26px}"
+    # Service list and calendar side by side rather than stacked — the cell
+    # is wide and was wasting it vertically. The rows and .rw-strips must
+    # stay SIBLINGS for the hover rules below (CSS selects siblings, not
+    # cousins), so the two columns are made with grid placement rather than
+    # by wrapping the rows in their own container.
+    ".rw-svcs{display:grid;grid-template-columns:auto auto;gap:0 14px;"
+    "align-items:start}"
+    ".rw-svc{grid-column:1}"
+    ".rw-strips{grid-column:2;grid-row:1/99;display:grid;min-height:26px}"
+    ".rw-brand{display:flex;align-items:center;gap:5px;margin-bottom:6px}"
+    ".rw-bmark{width:13px;height:13px;flex:none;color:#D97757}"
+    ".rw-bname{font-size:11px;font-weight:600;letter-spacing:.01em}"
+    ".rw-bstate{font-size:10px;color:var(--rw-muted);margin-left:auto}"
     ".rw-s{grid-area:1/1;visibility:hidden}"
     ".rw-s:first-child{visibility:visible}"
     ".rw-svcs:has(.rw-svc:hover) .rw-s{visibility:hidden}"
@@ -583,8 +609,6 @@ def _render_dashboard(
     if not isinstance(ok, int):
         ok = sum(1 for p in profiles if p.get("health") == "ok")
 
-    status_text = _platform_summary(meta)
-    status = f'<span class="rw-status">{_esc(status_text)}</span>' if status_text else ""
 
     pick_row = ""
     if recommended and recommended.get("name"):
@@ -613,10 +637,9 @@ def _render_dashboard(
     return (
         '<div class="rw-head">'
         '<div class="rw-head-row">'
-        f'{_CLAUDE_MARK}<span class="rw-title">roost</span>'
+        f'{_claude_mark("rw-mark")}<span class="rw-title">roost</span>'
         f'<span class="rw-counts">{total} profile{"" if total == 1 else "s"} · '
         f"{ok} ok</span>"
-        f"{status}"
         # Only when the bar view actually exists — see _render.
         + (
             '<label class="rw-toggle" for="rw-mode" title="Bar or grid gauges">'
@@ -643,7 +666,16 @@ def _render_platform_panel(meta: dict[str, Any], detail: str = "full") -> str:
     if not isinstance(platform, dict):
         return ""
 
-    blocks: list[str] = []
+    # Branded as "Claude Status", the name of the page this data comes from —
+    # not "Anthropic". The status page is Claude-branded and so is every
+    # component on it.
+    state = _platform_summary(meta)
+    blocks: list[str] = [
+        f'<div class="rw-brand">{_claude_mark("rw-bmark")}'
+        '<span class="rw-bname">Claude Status</span>'
+        + (f'<span class="rw-bstate">{_esc(state)}</span>' if state else "")
+        + "</div>"
+    ]
 
     components = platform.get("components")
     if isinstance(components, list) and components:
@@ -792,11 +824,11 @@ def _platform_summary(meta: dict[str, Any]) -> str:
         # Bounded for the same reason _incident_line is: a long Statuspage
         # description is the only unbounded field in the payload, and no
         # amount of dropping profiles can claw those bytes back.
-        return f"Anthropic: {_clip(description)}"
+        return _clip(description)
     indicator = platform_status.get("indicator")
     if not indicator:
         return ""
-    return f"Anthropic: {str(indicator).replace('_', ' ')}"
+    return str(indicator).replace("_", " ")
 
 
 

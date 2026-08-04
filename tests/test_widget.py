@@ -391,7 +391,11 @@ def test_dashboard_shows_platform_status():
         "platform_status": {"indicator": "none", "description": "All Systems Operational"},
     }
     html = render_widget([_profile()], meta)
-    assert "Anthropic: All Systems Operational" in html
+    # Branded "Claude Status" — the name of the page the data comes from.
+    # Every component on it is Claude-branded; "Anthropic" is the company.
+    assert "Claude Status" in html
+    assert "All Systems Operational" in html
+    assert "Anthropic" not in html
 
 
 def test_dashboard_rings_are_pure_svg_no_external_refs():
