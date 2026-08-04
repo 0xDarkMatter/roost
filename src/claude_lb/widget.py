@@ -187,6 +187,10 @@ _STYLE = (
     "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace}"
     ".rw-ringwin{font-size:9px;color:var(--rw-muted)}"
     # Component rows + incident grid (right column).
+    ".rw-comprow{display:flex;flex-direction:column;gap:2px;margin-bottom:5px}"
+    ".rw-cstrip{display:flex;gap:1px;height:9px;padding-left:12px}"
+    ".rw-cstrip i{flex:1;min-width:1px;border-radius:1px;display:block;"
+    "opacity:.85}"
     ".rw-comp{display:flex;align-items:center;gap:6px;font-size:10px;"
     "color:var(--rw-muted);line-height:1.5}"
     ".rw-cdot{width:6px;height:6px;border-radius:1.5px;flex:none}"
@@ -194,10 +198,6 @@ _STYLE = (
     "text-overflow:ellipsis}"
     ".rw-cstate{margin-left:auto;white-space:nowrap}"
     ".rw-gridlabel{font-size:9px;color:var(--rw-muted);margin-top:6px}"
-    ".rw-daygrid{display:grid;grid-template-columns:repeat(20,1fr);gap:2px;"
-    "margin-top:3px;max-width:200px}"
-    ".rw-day{display:block;width:100%;aspect-ratio:1;border-radius:1.5px;"
-    "min-height:6px}"
     ".rw-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;"
     "font-size:10px;color:var(--rw-muted);border-top:1px solid var(--rw-border);"
     "padding-top:6px;margin-top:1px}"
@@ -523,7 +523,7 @@ def _render_platform_panel(meta: dict[str, Any]) -> str:
 
     components = platform.get("components")
     if isinstance(components, list) and components:
-        rows = []
+        rows = [_incident_window_label(platform)]
         for component in components[:5]:
             if not isinstance(component, dict):
                 continue
@@ -541,55 +541,91 @@ def _render_platform_panel(meta: dict[str, Any]) -> str:
                 else f'<span class="rw-cstate" style="color:{colour}">'
                 f'{_esc(state.replace("_", " "))}</span>'
             )
+            raw_name = str(component.get("name") or "")
             rows.append(
+                '<div class="rw-comprow">'
                 f'<div class="rw-comp" title="{_esc(name)}: '
                 f'{_esc(state.replace("_", " "))}">'
                 f'<span class="rw-cdot" style="background:{colour}"></span>'
                 f'<span class="rw-cname">{_esc(name)}</span>'
                 f"{label}</div>"
+                f"{_component_strip(platform, raw_name)}"
+                "</div>"
             )
         if rows:
             blocks.append("".join(rows))
 
-    grid = _incident_grid(platform)
-    if grid:
-        blocks.append(grid)
+    # No fleet-wide grid: with a strip under every component it would repeat
+    # the same days in aggregate, and one noisy service would colour every
+    # cell for all of them — the roll-up hides exactly what the strips show.
 
     if not blocks:
         return ""
     return "".join(blocks)
 
 
-def _incident_grid(platform: dict[str, Any]) -> str:
-    """One square per day, coloured by that day's worst reported incident.
+def _component_strip(platform: dict[str, Any], component: str) -> str:
+    """A per-day bar strip for one component, under its status row.
 
-    Deliberately labelled "incidents", never "uptime". Statuspage's public API
-    exposes incident records, not uptime measurements — a day with no incident
-    is "nothing was reported", which is a weaker claim than "100% up". The
-    window is whatever the data actually covers (the endpoint returns a bounded
-    number of recent incidents), so it is read from the payload rather than
-    assumed.
+    This is the shape status.claude.com itself uses: every service carries
+    its own history inline rather than sharing one roll-up. It answers "is
+    Claude Code specifically having a bad week?" — which a fleet-wide grid
+    cannot, because one noisy component colours every day for all of them.
+
+    Rendered always rather than on hover: the information is the point, and
+    a hover-only reveal hides it from touch, from print, and from anyone
+    who does not think to try.
     """
-    days = platform.get("incident_days")
+    series = platform.get("component_days")
+    if not isinstance(series, dict):
+        return ""
+    days = series.get(component)
     if not isinstance(days, list) or not days:
         return ""
     cells = []
-    for day in days[-60:]:
+    for day in days[-_STRIP_DAYS:]:
         if not isinstance(day, dict):
             continue
         impact = str(day.get("impact") or "none")
         cls = _IMPACT_CLASSES.get(impact, "c-n")
-        date = _esc(str(day.get("date") or ""))
-        label = "no incidents" if impact == "none" else impact
-        cells.append(f'<i class="rw-day {cls}" title="{date}: {_esc(label)}"></i>')
+        if impact == "none":
+            # No tooltip on clean days. At ~35 bytes each across five
+            # components that was 3 KB of "no incidents" — a caption for the
+            # absence of news, paid for out of the byte budget that decides
+            # whether the page renders inline at all. A green cell already
+            # says it.
+            cells.append(f'<i class="{cls}"></i>')
+            continue
+        date = str(day.get("date") or "")[5:]  # MM-DD; the year is implied
+        count = day.get("count")
+        suffix = f" ×{count}" if isinstance(count, int) and count > 1 else ""
+        cells.append(f'<i class="{cls}" title="{_esc(date)} {_esc(impact)}{suffix}"></i>')
     if not cells:
         return ""
+    return f'<div class="rw-cstrip">{"".join(cells)}</div>'
+
+
+_STRIP_DAYS = 45
+
+
+def _incident_window_label(platform: dict[str, Any]) -> str:
+    """Names what the per-component strips actually cover.
+
+    Deliberately says "Incidents", never "uptime". Statuspage's public API
+    exposes incident records, not uptime measurements — a day with nothing
+    reported is a weaker claim than "100% up", and the percentage on their
+    own status page is computed from data this API does not expose.
+
+    The window is read from the payload, never assumed: the endpoint returns
+    a bounded number of recent incidents, so the real span is whatever that
+    reaches back to (~29 days at the time of writing, not the 90 the status
+    page shows). Hardcoding a window would caption a short series with a long
+    claim.
+    """
     span = platform.get("history_days")
-    span_text = f"last {span} days" if isinstance(span, int) and span > 0 else "recent"
-    return (
-        f'<div class="rw-gridlabel">Incidents · {_esc(span_text)}</div>'
-        f'<div class="rw-daygrid">{"".join(cells)}</div>'
-    )
+    if not isinstance(span, int) or span <= 0:
+        return '<div class="rw-gridlabel">Incidents · recent</div>'
+    return f'<div class="rw-gridlabel">Incidents · last {span} days</div>'
 
 
 def _platform_summary(meta: dict[str, Any]) -> str:

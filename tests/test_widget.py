@@ -524,3 +524,87 @@ def test_component_names_drop_parenthetical_hostnames():
     html = render_widget([_profile()], meta)
     assert ">Claude Console<" in html
     assert "platform.cl" not in html.split("title=")[0]
+
+
+def test_component_strips_render_per_service():
+    """Each service carries its own history, as status.claude.com does.
+
+    A fleet-wide roll-up cannot answer "is Claude Code specifically having a
+    bad week?" — one noisy service colours every day for all of them.
+    """
+    meta = {
+        "count": 1,
+        "ok": 1,
+        "platform_status": {
+            "indicator": "none",
+            "components": [
+                {"name": "Claude Code", "status": "operational"},
+                {"name": "Claude API", "status": "operational"},
+            ],
+            "history_days": 3,
+            "incident_days": [
+                {"date": "2026-08-01", "impact": "none", "count": 0},
+                {"date": "2026-08-02", "impact": "major", "count": 1},
+                {"date": "2026-08-03", "impact": "none", "count": 0},
+            ],
+            "component_days": {
+                "Claude Code": [
+                    {"date": "2026-08-01", "impact": "none", "count": 0},
+                    {"date": "2026-08-02", "impact": "major", "count": 1},
+                    {"date": "2026-08-03", "impact": "none", "count": 0},
+                ],
+                "Claude API": [
+                    {"date": "2026-08-01", "impact": "none", "count": 0},
+                    {"date": "2026-08-02", "impact": "none", "count": 0},
+                    {"date": "2026-08-03", "impact": "none", "count": 0},
+                ],
+            },
+        },
+    }
+    html = render_widget([_profile()], meta)
+    strips = re.findall(r'rw-cstrip">(.*?)</div>', html, re.S)
+    assert len(strips) == 2, "one strip per component"
+    assert 'class="c-o"' in strips[0], "Claude Code shows its major-impact day"
+    assert 'class="c-o"' not in strips[1], "Claude API stays clean that day"
+
+
+def test_component_strip_labels_the_real_window_not_a_fixed_one():
+    """The endpoint returns a bounded number of incidents, so the window is
+    whatever it reaches back to — captioning a 3-day series "last 90 days"
+    would be a claim the data cannot support."""
+    meta = {
+        "count": 1,
+        "ok": 1,
+        "platform_status": {
+            "indicator": "none",
+            "components": [{"name": "Claude Code", "status": "operational"}],
+            "history_days": 3,
+            "component_days": {"Claude Code": [{"date": "2026-08-01", "impact": "none"}]},
+        },
+    }
+    html = render_widget([_profile()], meta)
+    assert "last 3 days" in html
+    assert "90" not in html.split("rw-gridlabel")[1][:60]
+
+
+def test_clean_days_carry_no_tooltip():
+    """A caption for the absence of news, times 145 cells, is 3 KB of budget."""
+    meta = {
+        "count": 1,
+        "ok": 1,
+        "platform_status": {
+            "indicator": "none",
+            "components": [{"name": "Claude Code", "status": "operational"}],
+            "history_days": 2,
+            "component_days": {
+                "Claude Code": [
+                    {"date": "2026-08-01", "impact": "none", "count": 0},
+                    {"date": "2026-08-02", "impact": "minor", "count": 2},
+                ]
+            },
+        },
+    }
+    html = render_widget([_profile()], meta)
+    strip = re.findall(r'rw-cstrip">(.*?)</div>', html, re.S)[0]
+    assert strip.count("title=") == 1, "only the incident day is captioned"
+    assert "08-02 minor ×2" in strip
