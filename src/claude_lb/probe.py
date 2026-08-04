@@ -29,6 +29,51 @@ ANTHROPIC_VERSION = "2023-06-01"
 ANTHROPIC_BETA = "oauth-2025-04-20"
 DEFAULT_TIMEOUT_S = 10.0
 
+# Anthropic changed the /api/oauth/usage shape once already (seven_day_opus /
+# seven_day_sonnet silently went null, model-scoped capacity moved to a new
+# limits[] array) and roost kept quiet about it for weeks. This set is a
+# TRIPWIRE, not a schema: unknown keys are informational only, never fatal —
+# roost can't fail closed on an upstream field change it doesn't control (see
+# AGENTS.md rule 20). Adding a key here is how a human acknowledges having
+# looked at it, not a validation gate to keep in sync with every response field.
+KNOWN_USAGE_KEYS: frozenset[str] = frozenset({
+    "five_hour", "seven_day", "seven_day_oauth_apps", "seven_day_opus",
+    "seven_day_sonnet", "seven_day_cowork", "seven_day_omelette", "tangelo",
+    "iguana_necktie", "omelette_promotional", "nimbus_quill", "cinder_cove",
+    "amber_ladder", "extra_usage", "limits", "spend", "member_dashboard_available",
+})
+
+# Strict subset of KNOWN_USAGE_KEYS that roost's classifier/pick logic
+# actually reads. A key can be known-and-deliberately-ignored vs
+# missing/null-and-drifted — that distinction is what makes null_modelled
+# below meaningful instead of just echoing "everything not modelled".
+MODELLED_USAGE_KEYS: frozenset[str] = frozenset({
+    "five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet",
+    "extra_usage", "limits", "spend",
+})
+
+
+def detect_field_drift(body: dict[str, Any] | None) -> dict[str, list[str]]:
+    """Pure comparison of a usage response's top-level keys against what
+    roost knows about. Never raises and never mutates `body` or influences
+    classification/caching/health state — this is a tripwire for `roost
+    doctor` to surface, per AGENTS.md rule 20 (best-effort enrichment must
+    never be load-bearing). A non-dict or None body yields all-empty lists.
+    """
+    if not isinstance(body, dict) or not body:
+        # An empty dict is treated the same as "no body" — nothing to diff
+        # against, so it is not itself drift-worthy (e.g. a 204/empty probe
+        # response shouldn't be reported as "every key went missing").
+        return {"unknown": [], "missing": [], "null_modelled": []}
+    keys = set(body.keys())
+    return {
+        "unknown": sorted(keys - KNOWN_USAGE_KEYS),
+        "missing": sorted(MODELLED_USAGE_KEYS - keys),
+        "null_modelled": sorted(
+            k for k in MODELLED_USAGE_KEYS if k in body and body[k] is None
+        ),
+    }
+
 
 def _now() -> datetime:
     return datetime.now(UTC)

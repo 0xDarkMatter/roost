@@ -10,7 +10,16 @@ import pytest
 import respx
 
 from claude_lb.models import Health, Profile
-from claude_lb.probe import ANTHROPIC_BETA, ANTHROPIC_VERSION, API_URL, probe_many, probe_profile
+from claude_lb.probe import (
+    ANTHROPIC_BETA,
+    ANTHROPIC_VERSION,
+    API_URL,
+    KNOWN_USAGE_KEYS,
+    MODELLED_USAGE_KEYS,
+    detect_field_drift,
+    probe_many,
+    probe_profile,
+)
 
 USAGE_FIXTURES = Path(__file__).parent / "fixtures" / "oauth-usage"
 
@@ -435,3 +444,64 @@ async def test_probe_many_failures_independent_per_profile(
     by_name = {r.name: r for r in results}
     assert by_name["a"].consecutive_failures == 1
     assert by_name["b"].consecutive_failures == 5
+
+
+# ---------------------------------------------------------------------------
+# detect_field_drift — tripwire for upstream /api/oauth/usage schema changes
+# ---------------------------------------------------------------------------
+
+
+def _limits_normal_body() -> dict:
+    return json.loads((USAGE_FIXTURES / "limits-fable-normal.json").read_text())
+
+
+def test_detect_field_drift_exactly_known_keys_no_drift() -> None:
+    body = {k: (0 if k in MODELLED_USAGE_KEYS else None) for k in KNOWN_USAGE_KEYS}
+    assert detect_field_drift(body) == {"unknown": [], "missing": [], "null_modelled": []}
+
+
+def test_detect_field_drift_all_known_keys_present_no_unknown_or_missing() -> None:
+    body = {k: None for k in KNOWN_USAGE_KEYS}
+    drift = detect_field_drift(body)
+    assert drift["unknown"] == []
+    assert drift["missing"] == []
+    assert drift["null_modelled"] == sorted(MODELLED_USAGE_KEYS)
+
+
+def test_detect_field_drift_reports_unknown_key() -> None:
+    body = _limits_normal_body()
+    body["quokka_sunset"] = {}
+    drift = detect_field_drift(body)
+    assert drift["unknown"] == ["quokka_sunset"]
+
+
+def test_detect_field_drift_reports_missing_modelled_key() -> None:
+    body = _limits_normal_body()
+    del body["limits"]
+    drift = detect_field_drift(body)
+    assert "limits" in drift["missing"]
+
+
+def test_detect_field_drift_reports_null_modelled_key() -> None:
+    """Real fixture capture: seven_day_sonnet is null while limits[] carries
+    the actual per-model data — this is the exact incident that motivated
+    the tripwire."""
+    body = _limits_normal_body()
+    drift = detect_field_drift(body)
+    assert "seven_day_sonnet" in drift["null_modelled"]
+    assert "seven_day_opus" in drift["null_modelled"]
+    assert drift["unknown"] == []
+    assert drift["missing"] == []
+
+
+@pytest.mark.parametrize("body", [None, [], "string", {}])
+def test_detect_field_drift_handles_non_dict_bodies(body: object) -> None:
+    drift = detect_field_drift(body)  # type: ignore[arg-type]
+    assert drift == {"unknown": [], "missing": [], "null_modelled": []}
+
+
+def test_detect_field_drift_does_not_mutate_body() -> None:
+    body = _limits_normal_body()
+    before = json.loads(json.dumps(body))
+    detect_field_drift(body)
+    assert body == before

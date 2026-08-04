@@ -478,3 +478,69 @@ def test_status_page_included_in_run_doctor_when_network_enabled(
     offline_names = [c.name for c in report_offline.checks]
     assert "claude_status_page" not in offline_names
     assert "anthropic_reachable" not in offline_names
+
+
+# ---------------------------------------------------------------------------
+# usage_field_drift check — tripwire for upstream /api/oauth/usage drift
+# ---------------------------------------------------------------------------
+
+
+def _clean_body() -> dict:
+    from claude_lb.probe import KNOWN_USAGE_KEYS, MODELLED_USAGE_KEYS
+
+    return {k: (0 if k in MODELLED_USAGE_KEYS else None) for k in KNOWN_USAGE_KEYS}
+
+
+def test_usage_field_drift_skipped_with_no_profiles() -> None:
+    result = doctor_mod._check_usage_field_drift(timeout_s=1.0)
+    assert result.passed is True
+    assert "skipped" in result.detail.lower()
+
+
+def test_usage_field_drift_ok_on_clean_body(
+    profile_factory, respx_mock: respx.MockRouter
+) -> None:
+    from claude_lb.probe import API_URL
+
+    profile_factory("account-a")
+    respx_mock.get(API_URL).respond(200, json=_clean_body())
+    result = doctor_mod._check_usage_field_drift(timeout_s=1.0)
+    assert result.passed is True
+    assert result.extra.get("warning") is None
+    assert "no field drift" in result.detail.lower()
+
+
+def test_usage_field_drift_warns_on_drifted_body(
+    profile_factory, respx_mock: respx.MockRouter
+) -> None:
+    from claude_lb.probe import API_URL
+
+    profile_factory("account-a")
+    body = _clean_body()
+    body["quokka_sunset"] = {}
+    body["seven_day_sonnet"] = None
+    respx_mock.get(API_URL).respond(200, json=body)
+    result = doctor_mod._check_usage_field_drift(timeout_s=1.0)
+    assert result.passed is True  # WARN, not failure
+    assert result.extra["warning"] is True
+    assert "quokka_sunset" in result.detail
+    assert "seven_day_sonnet" in result.detail
+    assert "limits[]" in result.detail
+
+
+def test_usage_field_drift_skipped_on_non_200(
+    profile_factory, respx_mock: respx.MockRouter
+) -> None:
+    from claude_lb.probe import API_URL
+
+    profile_factory("account-a")
+    respx_mock.get(API_URL).respond(403, json={"error": {"message": "nope"}})
+    result = doctor_mod._check_usage_field_drift(timeout_s=1.0)
+    assert result.passed is True
+    assert "skipped" in result.detail.lower()
+
+
+def test_usage_field_drift_included_only_with_network(profile_factory) -> None:
+    profile_factory("account-a")
+    report = doctor_mod.run_doctor(skip_network=True)
+    assert "usage_field_drift" not in [c.name for c in report.checks]

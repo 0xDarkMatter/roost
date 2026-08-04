@@ -28,6 +28,7 @@ from .cache import load_cache
 from .discovery import discover_profiles
 from .paths import cache_path, config_dir
 from .platform_status import STATUS_PAGE_URL, fetch_platform_status
+from .probe import detect_field_drift, probe_raw_many_sync
 
 
 @dataclass
@@ -365,6 +366,67 @@ def _check_claude_status_page(timeout_s: float = 3.0) -> CheckResult:
     )
 
 
+def _check_usage_field_drift(timeout_s: float = 3.0) -> CheckResult:
+    """Probe one profile and diff the raw response against what roost knows
+    about (see `probe.KNOWN_USAGE_KEYS` / `probe.MODELLED_USAGE_KEYS`).
+
+    Always WARN-level (passed=True) — an Anthropic-side schema change is not
+    a local misconfiguration and must never fail the doctor run (AGENTS.md
+    rule 20). This check is the one that would have caught the
+    seven_day_opus/seven_day_sonnet-going-null incident that motivated it.
+    """
+    profiles = discover_profiles()
+    if not profiles:
+        return CheckResult(
+            name="usage_field_drift",
+            passed=True,
+            detail="(skipped — no profiles)",
+        )
+    profile = profiles[0]
+    try:
+        results = probe_raw_many_sync([profile], timeout=timeout_s)
+    except Exception as exc:  # pragma: no cover -- defensive, probe_raw_many_sync already catches httpx errors internally
+        return CheckResult(
+            name="usage_field_drift",
+            passed=True,
+            detail=f"Couldn't probe {profile.name}: {type(exc).__name__}: {exc}",
+            extra={"warning": True},
+        )
+    _name, status_code, body, _headers = results[0]
+    if status_code != 200 or body is None:
+        return CheckResult(
+            name="usage_field_drift",
+            passed=True,
+            detail=f"(skipped — probe of {profile.name} returned status {status_code})",
+        )
+
+    drift = detect_field_drift(body)
+    if not drift["unknown"] and not drift["missing"] and not drift["null_modelled"]:
+        return CheckResult(
+            name="usage_field_drift",
+            passed=True,
+            detail=f"no field drift detected (checked against {profile.name})",
+            extra=drift,
+        )
+
+    parts: list[str] = []
+    if drift["unknown"]:
+        parts.append(f"unknown top-level keys: {', '.join(drift['unknown'])}")
+    if drift["missing"]:
+        parts.append(f"missing modelled keys: {', '.join(drift['missing'])}")
+    if drift["null_modelled"]:
+        parts.append(
+            f"modelled keys present but null: {', '.join(drift['null_modelled'])} "
+            f"(per-model capacity may have moved to limits[])"
+        )
+    return CheckResult(
+        name="usage_field_drift",
+        passed=True,  # WARN, not failure — informational
+        detail=f"[{profile.name}] " + "; ".join(parts),
+        extra={"warning": True, **drift},
+    )
+
+
 def run_doctor(*, skip_network: bool = False) -> DoctorReport:
     """Run all diagnostic checks and return a structured report."""
     checks: list[CheckResult] = [
@@ -378,6 +440,7 @@ def run_doctor(*, skip_network: bool = False) -> DoctorReport:
     if not skip_network:
         checks.append(_check_anthropic_reachable())
         checks.append(_check_claude_status_page())
+        checks.append(_check_usage_field_drift())
     return DoctorReport(version=__version__, checks=checks)
 
 
