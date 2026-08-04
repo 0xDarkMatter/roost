@@ -690,3 +690,231 @@ def test_format_status_line_truncates_many_degraded_components() -> None:
     assert "Comp2" in line
     # 4th and 5th truncated with " (+N more)"
     assert "+2 more" in line
+
+
+# ---------------------------------------------------------------------------
+# Per-component incident-day series — _reduce_component_days +
+# fetch_incident_and_component_days
+# ---------------------------------------------------------------------------
+
+
+def _incidents_payload_with_components(incidents: list[dict]) -> dict:
+    return {"page": {"name": "Claude"}, "incidents": incidents}
+
+
+def test_reduce_component_days_marks_named_component_only() -> None:
+    payload = _incidents_payload_with_components([
+        {
+            "name": "Blip",
+            "impact": "minor",
+            "created_at": "2026-07-07T10:00:00Z",
+            "resolved_at": "2026-07-07T11:00:00Z",
+            "components": [{"name": "Claude Code"}],
+        }
+    ])
+    incident_days, _ = ps._reduce_incident_days(payload)
+    component_days = ps._reduce_component_days(
+        payload, {"Claude Code", "Claude API"}, incident_days
+    )
+    assert component_days["Claude Code"] == [
+        {"date": "2026-07-07", "impact": "minor", "count": 1}
+    ]
+    assert component_days["Claude API"] == [
+        {"date": "2026-07-07", "impact": "none", "count": 0}
+    ]
+
+
+def test_component_days_same_dates_order_and_length_as_incident_days() -> None:
+    payload = _incidents_payload_with_components([
+        {
+            "name": "First",
+            "impact": "minor",
+            "created_at": "2026-07-01T00:00:00Z",
+            "resolved_at": "2026-07-01T01:00:00Z",
+            "components": [{"name": "Claude Code"}],
+        },
+        {
+            "name": "Second",
+            "impact": "minor",
+            "created_at": "2026-07-04T00:00:00Z",
+            "resolved_at": "2026-07-04T01:00:00Z",
+            "components": [{"name": "Claude Code"}],
+        },
+    ])
+    incident_days, _ = ps._reduce_incident_days(payload)
+    component_days = ps._reduce_component_days(payload, {"Claude Code"}, incident_days)
+    assert [d["date"] for d in component_days["Claude Code"]] == [
+        d["date"] for d in incident_days
+    ]
+    assert len(component_days["Claude Code"]) == len(incident_days)
+
+
+def test_component_with_zero_incidents_gets_full_length_all_none_series() -> None:
+    payload = _incidents_payload_with_components([
+        {
+            "name": "Blip",
+            "impact": "minor",
+            "created_at": "2026-07-07T10:00:00Z",
+            "resolved_at": "2026-07-07T11:00:00Z",
+            "components": [{"name": "Claude Code"}],
+        }
+    ])
+    incident_days, _ = ps._reduce_incident_days(payload)
+    component_days = ps._reduce_component_days(payload, {"Claude Code", "Untouched"}, incident_days)
+    assert len(component_days["Untouched"]) == len(incident_days)
+    assert all(d["impact"] == "none" and d["count"] == 0 for d in component_days["Untouched"])
+
+
+def test_component_days_multi_day_incident_marks_every_spanned_day() -> None:
+    payload = _incidents_payload_with_components([
+        {
+            "name": "Long outage",
+            "impact": "major",
+            "created_at": "2026-07-07T22:00:00Z",
+            "resolved_at": "2026-07-09T02:00:00Z",
+            "components": [{"name": "Claude Code"}],
+        }
+    ])
+    incident_days, _ = ps._reduce_incident_days(payload)
+    component_days = ps._reduce_component_days(payload, {"Claude Code"}, incident_days)
+    dates = [d["date"] for d in component_days["Claude Code"]]
+    assert dates == ["2026-07-07", "2026-07-08", "2026-07-09"]
+    assert all(d["impact"] == "major" for d in component_days["Claude Code"])
+
+
+def test_component_days_two_incidents_same_day_worst_impact_wins() -> None:
+    payload = _incidents_payload_with_components([
+        {
+            "name": "Minor blip",
+            "impact": "minor",
+            "created_at": "2026-07-07T01:00:00Z",
+            "resolved_at": "2026-07-07T02:00:00Z",
+            "components": [{"name": "Claude Code"}],
+        },
+        {
+            "name": "Major outage",
+            "impact": "major",
+            "created_at": "2026-07-07T10:00:00Z",
+            "resolved_at": "2026-07-07T12:00:00Z",
+            "components": [{"name": "Claude Code"}],
+        },
+    ])
+    incident_days, _ = ps._reduce_incident_days(payload)
+    component_days = ps._reduce_component_days(payload, {"Claude Code"}, incident_days)
+    assert len(component_days["Claude Code"]) == 1
+    assert component_days["Claude Code"][0]["impact"] == "major"
+    assert component_days["Claude Code"][0]["count"] == 2
+
+
+def test_component_days_unknown_component_creates_no_key() -> None:
+    payload = _incidents_payload_with_components([
+        {
+            "name": "Blip",
+            "impact": "minor",
+            "created_at": "2026-07-07T10:00:00Z",
+            "resolved_at": "2026-07-07T11:00:00Z",
+            "components": [{"name": "Renamed Component"}],
+        }
+    ])
+    incident_days, _ = ps._reduce_incident_days(payload)
+    component_days = ps._reduce_component_days(payload, {"Claude Code"}, incident_days)
+    assert "Renamed Component" not in component_days
+    assert component_days["Claude Code"][0]["impact"] == "none"
+
+
+def test_reduce_component_days_no_incidents_returns_empty_dict() -> None:
+    assert ps._reduce_component_days({"incidents": []}, {"Claude Code"}, []) == {}
+
+
+def test_fetch_incident_and_component_days_success(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get(ps.INCIDENTS_PAGE_URL).respond(200, json=_incidents_payload_with_components([
+        {
+            "name": "Blip",
+            "impact": "minor",
+            "created_at": "2026-07-07T10:00:00Z",
+            "resolved_at": "2026-07-07T11:00:00Z",
+            "components": [{"name": "Claude Code"}],
+        }
+    ]))
+    days, history_days, component_days = ps.fetch_incident_and_component_days(
+        {"Claude Code"}, timeout_s=1.0
+    )
+    assert history_days == 1
+    assert days[0]["date"] == "2026-07-07"
+    assert component_days["Claude Code"][0]["impact"] == "minor"
+
+
+def test_fetch_incident_and_component_days_failure_returns_empty(
+    respx_mock: respx.MockRouter,
+) -> None:
+    respx_mock.get(ps.INCIDENTS_PAGE_URL).respond(500)
+    days, history_days, component_days = ps.fetch_incident_and_component_days(
+        {"Claude Code"}, timeout_s=1.0
+    )
+    assert days == []
+    assert history_days == 0
+    assert component_days == {}
+
+
+def test_load_or_fetch_populates_component_days_on_cache_miss(
+    respx_mock: respx.MockRouter, _isolate: Path
+) -> None:
+    respx_mock.get(ps.STATUS_PAGE_URL).respond(200, json=_summary(components=[
+        {"name": "Claude Code", "status": "operational"},
+    ]))
+    respx_mock.get(ps.INCIDENTS_PAGE_URL).respond(200, json=_incidents_payload_with_components([
+        {
+            "name": "Blip",
+            "impact": "minor",
+            "created_at": "2026-07-07T10:00:00Z",
+            "resolved_at": "2026-07-07T11:00:00Z",
+            "components": [{"name": "Claude Code"}],
+        }
+    ]))
+    result = ps.load_or_fetch(timeout_s=1.0)
+    assert result is not None
+    assert result.component_days["Claude Code"][0]["impact"] == "minor"
+    cache_file = _isolate / "platform-status.json"
+    payload = json.loads(cache_file.read_text())
+    assert payload["component_days"]["Claude Code"][0]["date"] == "2026-07-07"
+
+
+def test_load_or_fetch_incidents_failure_leaves_component_days_empty(
+    respx_mock: respx.MockRouter, _isolate: Path
+) -> None:
+    respx_mock.get(ps.STATUS_PAGE_URL).respond(200, json=_summary(components=[
+        {"name": "Claude Code", "status": "operational"},
+    ]))
+    respx_mock.get(ps.INCIDENTS_PAGE_URL).respond(500)
+    result = ps.load_or_fetch(timeout_s=1.0)
+    assert result is not None
+    assert result.component_days == {}
+
+
+def test_read_cache_handles_shape_without_component_days(_isolate: Path) -> None:
+    """A cache file written before component_days existed has no such key —
+    loading it must yield an empty dict, never a KeyError."""
+    cache_file = _isolate / "platform-status.json"
+    cache_file.write_text(json.dumps({
+        "schema_version": ps._SCHEMA_VERSION,
+        "fetched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "indicator": "none",
+        "description": "All Systems Operational",
+        "active_incidents": [],
+        "degraded_components": [],
+        "components": [{"name": "Claude Code", "status": "operational"}],
+        "incident_days": [{"date": "2026-07-07", "impact": "minor", "count": 1}],
+        "history_days": 1,
+    }))
+    result = ps._read_cache()
+    assert result is not None
+    assert result.component_days == {}
+
+
+def test_to_json_meta_includes_component_days() -> None:
+    status = ps._parse_summary(_summary(components=[{"name": "Claude Code", "status": "operational"}]))
+    status.incident_days = [{"date": "2026-07-07", "impact": "minor", "count": 1}]
+    status.history_days = 1
+    status.component_days = {"Claude Code": [{"date": "2026-07-07", "impact": "minor", "count": 1}]}
+    meta = ps.to_json_meta(status)
+    assert meta["component_days"]["Claude Code"][0]["date"] == "2026-07-07"
