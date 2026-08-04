@@ -9,7 +9,7 @@ A one-shot stateless CLI that answers "which of my Claude Code OAuth
 profiles is healthy right now?" It reads local OAuth credentials from
 `~/.claude-profiles/<name>/.credentials.json`, probes
 `GET /api/oauth/usage` (with `anthropic-beta: oauth-2025-04-20`),
-classifies the response into eight health states, caches results, and
+classifies the response into nine health states, caches results, and
 picks the best profile for downstream scripts. It can also exchange
 stored refresh tokens for fresh access tokens via
 `roost refresh <name>`.
@@ -29,7 +29,8 @@ without per-window % numbers.
 | `roost rename <old> <new> [--force]` | Move profile dir; drops old cache entry; new name re-classifies on next probe |
 | `roost list` | Enumerate discovered profiles |
 | `roost probe [<name>]` | Live probe all profiles or one |
-| `roost status` | Cached health table + stdout summary |
+| `roost status [--cards]` | Cached health table (or one capacity-card panel per profile with `--cards`) + stdout summary |
+| `roost widget` | Self-contained HTML capacity cards on stdout, for Claude Code's `show_widget` tool; `--max-kb` sets the byte budget (default 28) |
 | `roost show <name>` | One profile's full health detail |
 | `roost pick [--strategy S]` | Return the best profile name (exit 0) |
 | `roost which [--strategy S]` | Read-only counterpart to `pick`: same decision logic, no side effects on `picks.log` / `last-pick.json` |
@@ -126,6 +127,14 @@ Invariants an agent cannot intuit from `--help`:
 
 28. **`roost snapshot <profile> <out-path>` is a documented point-in-time copy of credentials.json, not a live file.** It copies the credentials.json to the destination and prints a stderr warning that roost will never touch the snapshot. It does NOT acquire a lease. **Do not use snapshots as the credentials source for long-running headless claude workloads.** Claude auto-refreshes when the access_token expires and writes the new chain back to the file it read from — for a snapshot, that means the new refresh_token lives in the snapshot, the old one in the live profile is server-side-consumed, and `roost refresh <name>` will subsequently fail with `invalid_grant`. Snapshots are only safe for sub-access-token-lifetime workloads (currently ~8h) that never trigger a refresh. The recommended pattern for headless claude dispatch is `CLAUDE_CONFIG_DIR=~/.claude-profiles/<name>/` directly — let claude own the refresh chain. See `docs/findings.md` §6.
 
+29. **`ScopedLimit.is_active` means "this is the constraint currently binding," not "this limit is enforced."** Upstream marks exactly one entry in a profile's `limits[]` array active — it's a statement about which window is nearest to biting today, not about which windows have real data. The **classifier** (`taxonomy._classify_200`) gates `MODEL_LIMIT` on `is_active` deliberately: only the binding constraint should be able to push a profile out of the pick pool. **Reporting must NOT apply the same filter** — `Usage.model_pct()` and `widget._active_fable_limit()` both read `limits[]` without checking `is_active`, on purpose. This distinction was a real bug caught before ship: an earlier build filtered the display on `is_active`, which made a profile whose Fable window was genuinely at 0% render as "no data" purely because its session window happened to be the nearer cap that day — the opposite of the truth. If you add a new consumer of `limits[]`, decide explicitly which side of this split it belongs on before writing the filter. See `models.py::Usage.model_pct` and `widget.py::_active_fable_limit`.
+
+30. **`MODEL_LIMIT` loses to `WEEKLY_LIMIT`/`SESSION_LIMIT` when more than one condition is true for a profile.** `taxonomy._classify_200` checks `seven_day.utilization` then `five_hour.utilization` before it ever inspects `limits[]`. This is deliberate precedence, not incidental code order: the broader, longer-lasting condition is the more useful signal to both report and gate selection on. Don't reorder these checks without understanding why — see `docs/findings.md` §7.
+
+31. **`probe.KNOWN_USAGE_KEYS` / `MODELLED_USAGE_KEYS` are a tripwire, not a schema.** `probe.detect_field_drift()` compares a live response's top-level keys against these two frozensets and returns `unknown` / `missing` / `null_modelled` lists — but it never raises, never mutates classification or caching, and never fails `roost doctor` (the `usage_field_drift` check is always WARN-level, consistent with rule 20). Anthropic has already changed this response shape once without notice — `seven_day_opus`/`seven_day_sonnet` silently went null, model-scoped capacity moved into `limits[]` — and roost stayed quiet about it for a while; this check exists to catch the next one. Adding a key to `KNOWN_USAGE_KEYS` is how a maintainer records having looked at a new field and decided it's safe to ignore for now — it is not a validation gate that must track every field in the response. See `probe.py::detect_field_drift` and `doctor.py::_check_usage_field_drift`.
+
+32. **`roost widget` output must stay self-contained and under its byte budget.** The page is rendered inline by Claude Code's `show_widget` tool behind a strict CSP: no CDN script or stylesheet, no webfont, no `fetch`/XHR, no `<script src>`/`<link>`, no outbound request of any kind — `widget.py` ships one inline `<style>` block and plain markup, deliberately no `<script>` tag at all. `render_widget()` enforces a hard byte budget (`max_bytes`, exposed as `--max-kb` on the CLI, default 28 KiB) by dropping the least-recently-probed profiles until the page fits, warning via `warnings.warn` (stderr) when it has to. Never introduce a `<script>` tag, an external asset reference, `Arial` anywhere in the font stack, or a native `alert`/`confirm`/`prompt` call into this renderer — the CSP silently breaks the first three, and the last is a standing ban on this machine with no carve-out for a fragment this small. See the `widget.py` module docstring.
+
 **Prompt injection:** not applicable. `roost` returns only its own telemetry — profile names, utilization numbers, timestamps — never user-authored content from Anthropic's API.
 
 ## Code layout
@@ -155,7 +164,7 @@ Invariants an agent cannot intuit from `--help`:
 
 ## Testing
 
-- `tests/fixtures/oauth-usage/` — captured + synthetic `/api/oauth/usage` bodies (ok, session-exhausted, weekly-exhausted, both-exhausted, 403-scope-missing). Classifier must correctly label each.
+- `tests/fixtures/oauth-usage/` — captured + synthetic `/api/oauth/usage` bodies (ok, session-exhausted, weekly-exhausted, both-exhausted, 403-scope-missing, and `limits-fable-{normal,critical,exhausted}` for the `limits[]`/`spend` shape). Classifier must correctly label each.
 - `tests/fixtures/401-auth-error.json` — auth-dead fixture.
 - `tests/test_refresh.py` — uses `respx` to mock `/v1/oauth/token`, asserts atomic credentials rewrite and preserves non-oauth fields on success; verifies failed refreshes never clobber credentials. Includes `--jitter` propagation tests.
 - `tests/test_usage_log.py` — opt-in toggle, append/append_many, iter_records (with profile + since filters), truncate.

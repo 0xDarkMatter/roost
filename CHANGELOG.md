@@ -5,6 +5,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+### Added
+
+- **Model-scoped capacity (`limits[]`/`spend`) parsing and the `model_limit`
+  health state.** Anthropic moved per-model usage (currently the Fable model)
+  out of the `seven_day_sonnet`/`seven_day_opus` windows — now `null` on every
+  profile — into a top-level `limits[]` array, with a sibling `spend` block
+  carrying monthly overage in minor units. `roost` now parses both
+  (`ScopedLimit`, `Spend` in `models.py`) and classifies a profile as
+  `model_limit` when an *active* scoped limit is exhausted (`percent >= 100`)
+  even though the aggregate weekly/session windows are still under 100 — a gap
+  the previous classifier couldn't see. Ninth `Health` state; `MODEL_LIMIT`
+  sits in the filter ladder between `WEEKLY_LIMIT` and `AUTH_EXPIRED`, and
+  loses precedence to `WEEKLY_LIMIT`/`SESSION_LIMIT` when more than one
+  condition fires for the same profile. See `docs/findings.md` §7.
+- **Fable column** in `roost status`'s table (shown only when at least one
+  profile has model-scoped data) and a dedicated Fable gauge on
+  `status --cards`, `roost widget`, and `roost trace`.
+- **`roost widget`** — renders capacity cards as a single self-contained HTML
+  fragment on stdout, sized for Claude Code's `show_widget` tool (strict CSP:
+  no CDN, no webfont, no outbound requests, no `<script>` tag at all). Hard
+  byte budget via `--max-kb` (default 28); drops the least-recently-probed
+  profiles to fit, warning on stderr if it had to.
+- **`roost status --cards`** — renders one capacity-card panel per profile
+  (Session / Weekly / Fable / Overage bars) to stderr instead of the table.
+- **`usage_field_drift` doctor check** — probes one profile and diffs the raw
+  response's top-level keys against what `roost` knows about
+  (`probe.KNOWN_USAGE_KEYS` / `MODELLED_USAGE_KEYS`); always WARN-level, never
+  fails the doctor run. This is the check that would have caught the
+  `seven_day_opus`/`seven_day_sonnet`-going-null shift before it went
+  unnoticed for a while.
+- **`roost report --metric`** gains `fable_pct` and `spend_pct`.
+
+### Fixed
+
+- **`is_active` was being applied to reporting, not just classification.** An
+  earlier build of the Fable display filtered `limits[]` on `is_active` when
+  rendering `fable_pct` / the widget gauge, which reported "no data" for a
+  profile whose Fable window was genuinely at 0% simply because its session
+  window happened to be the nearer cap that day. The classifier still gates
+  `MODEL_LIMIT` on `is_active` (correctly — only the binding constraint
+  should disqualify a profile from `pick`); reporting
+  (`Usage.model_pct()`, `widget._active_fable_limit()`) does not.
+- **stdout/stderr forced to UTF-8.** Windows defaults both streams to the
+  console codepage (cp1252/cp437), which cannot encode the box-drawing
+  separators and dashes the widget and table renderers emit — piping
+  `roost widget` to a file, or running under a non-UTF console, produced
+  mojibake. `output.emit_text` / `term.ensure_utf8` now force UTF-8 on the
+  way out.
+
 ### Documentation
 
 - **OAuth auto-refresh finding (2026-05-11).** Empirical verification that
