@@ -225,20 +225,24 @@ _STYLE = (
     "padding-top:6px;margin-top:1px}"
     ".rw-stats b{display:block;color:var(--rw-text);font-weight:500;"
     "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace;font-size:11px}"
-    # Square-grid gauges. The 5x10 block of squares is drawn with THREE
-    # stacked gradients on a single element, not 50 <i> tags: two repeating
-    # gradients paint the card-coloured gaps that separate the squares, and
-    # one linear gradient underneath fills bottom-up to --p. Three cards'
-    # worth of real elements would have been 600 tags and roughly 8 KB —
-    # enough on its own to push the page past the budget that decides
-    # whether it renders inline. The gaps must be listed BEFORE the fill so
-    # they paint over it.
-    ".rw-squares{display:none;gap:16px;justify-content:space-around;"
-    "padding:2px 0 1px}"
-    ".rw-sqcol{display:flex;flex-direction:column;align-items:center;gap:5px}"
-    ".rw-sqgrid{width:43px;height:88px;background-image:"
-    "repeating-linear-gradient(to right,transparent 0 7px,var(--rw-card) 7px 9px),"
-    "repeating-linear-gradient(to bottom,transparent 0 7px,var(--rw-card) 7px 9px),"
+    # Square-grid gauges. The 10x10 block is drawn with THREE stacked
+    # gradients on a single element, not 100 <i> tags: two repeating
+    # gradients paint the card-coloured gaps that separate the cells, and one
+    # linear gradient underneath fills bottom-up to --p. Real elements would
+    # be 1,200 tags across four cards — enough on its own to push the page
+    # well past the budget that decides whether it renders inline. The gaps
+    # must be listed BEFORE the fill so they paint over it.
+    ".rw-squares{display:none;gap:10px;padding:2px 0 1px}"
+    ".rw-sqcol{flex:1;min-width:0;display:flex;flex-direction:column;"
+    "align-items:center;gap:5px}"
+    # Fluid width so the three blocks fill the card, with aspect-ratio:1
+    # keeping the cells square at whatever that width turns out to be — a
+    # fixed pixel size would go landscape the moment the card grew. Gaps are
+    # expressed in PERCENT for the same reason: 10 columns and 10 rows of
+    # 8.5%-cell / 1.5%-gap, so the geometry survives any container width.
+    ".rw-sqgrid{width:100%;aspect-ratio:1;background-image:"
+    "repeating-linear-gradient(to right,transparent 0 8.5%,var(--rw-card) 8.5% 10%),"
+    "repeating-linear-gradient(to bottom,transparent 0 8.5%,var(--rw-card) 8.5% 10%),"
     "linear-gradient(to top,var(--f) var(--p),var(--rw-track) var(--p))}"
     ".rw-sqlabel{font-size:10px;color:var(--rw-muted)}"
     ".rw-sqval{font-size:11px;font-weight:500;"
@@ -758,10 +762,13 @@ def _render_card(
     )
 
 
-# 5 columns x 10 rows = 50 squares per window. The fill quantises to whole
-# rows, so the granularity is 10% even though 50 squares are drawn — the
+# 10 columns x 10 rows = 100 cells per window. The fill quantises to whole
+# ROWS, so the granularity is 10% even though 100 cells are drawn — the
 # density is for legibility at a glance, and the exact figure is printed
-# beneath, which is what keeps the rounding honest.
+# beneath, which is what keeps the rounding honest. Raising this to
+# per-cell resolution would mean filling part of a row left-to-right, which
+# a linear gradient cannot express; it would need 100 real elements per
+# window and about 8 KB per card.
 _GRID_ROWS = 10
 
 
