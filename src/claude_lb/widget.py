@@ -118,6 +118,13 @@ _STYLE = (
     "--rw-card:#fff;--rw-border:#e4e2dd;--rw-text:#1a1a17;--rw-muted:#8a887f;"
     "--rw-track:#efeee9;--rw-warn:#c8871b;--rw-idle:#d3d1c7}"
     ".rw *{box-sizing:border-box}"
+    # Colour classes rather than inline styles on every cell. A square grid
+    # plus a day grid is several hundred elements; `class="c-g"` is a third
+    # the bytes of an inline background declaration, and the byte budget is
+    # what decides whether the page renders inline or spools to a file.
+    ".rw .c-g{background:#1D9E75}.rw .c-y{background:#E0A233}"
+    ".rw .c-o{background:#BA7517}.rw .c-r{background:#E24B4A}"
+    ".rw .c-n{background:#8a8a86}"
     ".rw-mono{font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace}"
     ".rw-summary{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;"
     "margin:0 0 10px;font-size:11px;color:var(--rw-muted);letter-spacing:.02em}"
@@ -191,17 +198,41 @@ _STYLE = (
     "margin-top:3px;max-width:200px}"
     ".rw-day{display:block;width:100%;aspect-ratio:1;border-radius:1.5px;"
     "min-height:6px}"
-    # Per-card stat chips + trend strip, in the ff-monitor idiom: a compact
-    # metric row and a bar strip rather than prose.
     ".rw-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;"
     "font-size:10px;color:var(--rw-muted);border-top:1px solid var(--rw-border);"
     "padding-top:6px;margin-top:1px}"
     ".rw-stats b{display:block;color:var(--rw-text);font-weight:500;"
     "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace;font-size:11px}"
-    ".rw-spark{display:flex;align-items:flex-end;gap:1px;height:16px;"
-    "margin-top:5px}"
-    ".rw-spark i{flex:1;min-width:1px;border-radius:1px;display:block;"
-    "background:var(--rw-idle)}"
+    # Square-grid gauges: one vertical stack per window, filling bottom-up.
+    ".rw-squares{display:none;gap:14px;justify-content:space-around;"
+    "padding:2px 0 1px}"
+    ".rw-sqcol{display:flex;flex-direction:column;align-items:center;gap:4px}"
+    ".rw-sqstack{display:flex;flex-direction:column-reverse;gap:2px}"
+    ".rw-sqstack i{width:16px;height:7px;border-radius:1.5px;display:block;"
+    "background:var(--rw-track)}"
+    ".rw-sqlabel{font-size:10px;color:var(--rw-muted)}"
+    ".rw-sqval{font-size:11px;font-weight:500;"
+    "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace}"
+    # CSS-ONLY view toggle. A hidden checkbox drives it via a sibling
+    # selector, so the page keeps its no-<script> guarantee structurally
+    # rather than by convention — see the module docstring. Do not "improve"
+    # this into a JS click handler.
+    ".rw-modechk{position:absolute;opacity:0;pointer-events:none}"
+    ".rw-toggle{margin-left:auto;display:inline-flex;border:1px solid "
+    "var(--rw-border);border-radius:5px;overflow:hidden;cursor:pointer;"
+    "font-size:10px;user-select:none}"
+    ".rw-toggle span{padding:2px 8px;color:var(--rw-muted);"
+    "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace}"
+    ".rw-toggle span+span{border-left:1px solid var(--rw-border)}"
+    ".rw-toggle .rw-t-bar{background:var(--rw-border);color:var(--rw-text)}"
+    ".rw-modechk:checked~.rw-grid .rw-bars{display:none}"
+    ".rw-modechk:checked~.rw-grid .rw-squares{display:flex}"
+    ".rw-modechk:checked~.rw-head .rw-toggle .rw-t-bar{background:transparent;"
+    "color:var(--rw-muted)}"
+    ".rw-modechk:checked~.rw-head .rw-toggle .rw-t-grid{"
+    "background:var(--rw-border);color:var(--rw-text)}"
+    ".rw-modechk:focus-visible~.rw-head .rw-toggle{outline:2px solid "
+    "var(--rw-warn);outline-offset:1px}"
     "</style>"
 )
 
@@ -304,9 +335,16 @@ def _render(
     else:
         grid = '<div class="rw-empty">No profiles discovered — run <code>roost probe</code> first.</div>'
     head = _render_dashboard(profiles, meta, recommended)
+    # The checkbox must precede both the header (which holds its label) and
+    # the grid (which it restyles), because CSS can only select FORWARD
+    # siblings. Moving it breaks the toggle silently.
+    toggle = (
+        '<input type="checkbox" id="rw-mode" class="rw-modechk" '
+        'aria-label="Switch between bar and grid gauges">'
+    )
     # Everything lives inside .rw so the palette custom properties stay scoped
     # to this fragment instead of leaking onto the host page.
-    return f'{_STYLE}<div class="rw">{head}{grid}</div>'
+    return f'{_STYLE}<div class="rw">{toggle}{head}{grid}</div>'
 
 
 
@@ -460,6 +498,9 @@ def _render_dashboard(
         f'<span class="rw-counts">{total} profile{"" if total == 1 else "s"} · '
         f"{ok} ok</span>"
         f"{status}"
+        '<label class="rw-toggle" for="rw-mode" title="Bar or grid gauges">'
+        '<span class="rw-t-bar">Bars</span><span class="rw-t-grid">Grid</span>'
+        "</label>"
         "</div>"
         f"{pick_row}{body}"
         f"{_incident_line(meta)}"
@@ -486,16 +527,26 @@ def _render_platform_panel(meta: dict[str, Any]) -> str:
         for component in components[:5]:
             if not isinstance(component, dict):
                 continue
-            name = _clip(component.get("name") or "?", 28)
+            name = _clip(_short_component(component.get("name") or "?"), 26)
             state = str(component.get("status") or "unknown")
             colour = _COMPONENT_COLORS.get(state, _SEVERITY_GREY)
+            # Only an ABNORMAL state earns words. Repeating "operational"
+            # down a column of healthy services is noise that buries the one
+            # row that would matter. The dot still carries the state, and the
+            # title attribute keeps it available to a screen reader and on
+            # hover for every row.
+            label = (
+                ""
+                if state == "operational"
+                else f'<span class="rw-cstate" style="color:{colour}">'
+                f'{_esc(state.replace("_", " "))}</span>'
+            )
             rows.append(
-                '<div class="rw-comp">'
+                f'<div class="rw-comp" title="{_esc(name)}: '
+                f'{_esc(state.replace("_", " "))}">'
                 f'<span class="rw-cdot" style="background:{colour}"></span>'
                 f'<span class="rw-cname">{_esc(name)}</span>'
-                f'<span class="rw-cstate" style="color:{colour}">'
-                f'{_esc(state.replace("_", " "))}</span>'
-                "</div>"
+                f"{label}</div>"
             )
         if rows:
             blocks.append("".join(rows))
@@ -527,13 +578,10 @@ def _incident_grid(platform: dict[str, Any]) -> str:
         if not isinstance(day, dict):
             continue
         impact = str(day.get("impact") or "none")
-        colour = _IMPACT_COLORS.get(impact, _SEVERITY_GREY)
+        cls = _IMPACT_CLASSES.get(impact, "c-n")
         date = _esc(str(day.get("date") or ""))
         label = "no incidents" if impact == "none" else impact
-        cells.append(
-            f'<i class="rw-day" style="background:{colour}" '
-            f'title="{date}: {_esc(label)}"></i>'
-        )
+        cells.append(f'<i class="rw-day {cls}" title="{date}: {_esc(label)}"></i>')
     if not cells:
         return ""
     span = platform.get("history_days")
@@ -573,6 +621,18 @@ def _incident_line(meta: dict[str, Any]) -> str:
     return f'<span class="rw-incident">status.claude.com: {_esc(_clip(label))}</span>'
 
 
+def _short_component(name: object) -> str:
+    """Drop Statuspage's parenthetical hostnames.
+
+    "Claude Console (platform.claude.com)" is the service name plus its
+    address; in a 190px column the address is what gets truncated into
+    "(platform.cl…", which is noise wearing the shape of information.
+    """
+    text = str(name)
+    head, _, _rest = text.partition(" (")
+    return head or text
+
+
 def _clip(text: object, limit: int = _INCIDENT_MAX_CHARS) -> str:
     """Bound a free-text field from the payload.
 
@@ -604,20 +664,63 @@ def _render_card(
     overage_pct = _overage_pct(usage)
 
     fable_reset = _parse_dt(fable_limit.get("resets_at")) if fable_limit else None
-    gauges = [
-        _gauge_row("Session", session_pct, _parse_dt(profile.get("session_reset_at")), now),
-        _gauge_row("Weekly", weekly_pct, _parse_dt(profile.get("weekly_reset_at")), now),
-        _gauge_row("Fable", fable_pct, fable_reset, now),
+    windows = [
+        ("Session", session_pct, _parse_dt(profile.get("session_reset_at"))),
+        ("Weekly", weekly_pct, _parse_dt(profile.get("weekly_reset_at"))),
+        ("Fable", fable_pct, fable_reset),
     ]
     if overage_pct is not None:
-        gauges.append(_gauge_row("Overage", overage_pct, None, now))
+        windows.append(("Overage", overage_pct, None))
+
+    bars = "".join(_gauge_row(label, pct, reset, now) for label, pct, reset in windows)
+    squares = "".join(_gauge_column(label, pct) for label, pct, _ in windows)
 
     return (
         '<div class="rw-card">'
         f"{_render_header(name, health, plan)}"
-        f'<div class="rw-gauges">{"".join(gauges)}</div>'
+        f'<div class="rw-gauges rw-bars">{bars}</div>'
+        f'<div class="rw-squares">{squares}</div>'
         f"{_render_stats(stats)}"
         f"{_render_footer(profile, now, session_pct, weekly_pct, fable_pct, fable_limit)}"
+        "</div>"
+    )
+
+
+_SQUARES_PER_COLUMN = 10
+
+
+def _gauge_column(label: str, pct: float | None) -> str:
+    """One vertical stack of squares for a single window.
+
+    Each square is 10% of the window. The exact figure is printed beneath, so
+    the stack is a shape to scan rather than the source of truth — which is
+    what lets it round without misleading.
+
+    A non-zero percent always lights at least one square. 2% genuinely rounds
+    to nothing at this granularity, and an empty column beside a "2%" label
+    reads as broken rather than as nearly-empty. Overstating the very bottom
+    of the range by a few points is the lesser error, and only there.
+    """
+    if pct is None:
+        filled = 0
+        colour = _SEVERITY_GREY
+        cls = "c-n"
+    else:
+        clamped = max(0.0, min(100.0, pct))
+        filled = round(clamped / (100 / _SQUARES_PER_COLUMN))
+        if clamped > 0:
+            filled = max(1, filled)
+        colour = _severity_color(clamped)
+        cls = _severity_class(clamped)
+    cells = "".join(
+        f'<i class="{cls}"></i>' if i < filled else "<i></i>"
+        for i in range(_SQUARES_PER_COLUMN)
+    )
+    return (
+        '<div class="rw-sqcol">'
+        f'<div class="rw-sqstack">{cells}</div>'
+        f'<span class="rw-sqlabel">{_esc(label)}</span>'
+        f'<b class="rw-sqval" style="color:{colour}">{_fmt_pct(pct)}</b>'
         "</div>"
     )
 
@@ -648,32 +751,9 @@ def _render_stats(stats: dict[str, Any] | None) -> str:
     eta = stats.get("eta")
     if isinstance(eta, str) and eta:
         cells.append(f"<span>Full in<b>{_esc(eta)}</b></span>")
-    row = f'<div class="rw-stats">{"".join(cells)}</div>' if cells else ""
-    return f"{row}{_render_spark(stats.get('trend'))}"
+    return f'<div class="rw-stats">{"".join(cells)}</div>' if cells else ""
 
 
-def _render_spark(trend: Any) -> str:
-    """Bar strip of a profile's weekly-usage history, ff-monitor style.
-
-    Heights are scaled against 100% rather than the series' own max, so two
-    cards are directly comparable — a self-scaled strip would make a profile
-    idling at 3% look identical to one at 90%.
-    """
-    if not isinstance(trend, list) or len(trend) < 2:
-        return ""
-    bars = []
-    for value in trend[-28:]:
-        try:
-            pct = max(0.0, min(100.0, float(value)))
-        except (TypeError, ValueError):
-            continue
-        height = max(6.0, pct)
-        bars.append(
-            f'<i style="height:{height:.0f}%;background:{_severity_color(pct)}"></i>'
-        )
-    if not bars:
-        return ""
-    return f'<div class="rw-spark">{"".join(bars)}</div>'
 
 
 def _render_header(name: str, health: str, plan: object) -> str:
@@ -746,6 +826,24 @@ def _severity_color(pct: float) -> str:
     if pct >= 60:
         return _SEVERITY_AMBER
     return _SEVERITY_GREEN
+
+
+def _severity_class(pct: float) -> str:
+    """Class-name twin of `_severity_color`, for high-element-count grids."""
+    if pct >= 85:
+        return "c-r"
+    if pct >= 60:
+        return "c-o"
+    return "c-g"
+
+
+_IMPACT_CLASSES = {
+    "none": "c-g",
+    "maintenance": "c-n",
+    "minor": "c-y",
+    "major": "c-o",
+    "critical": "c-r",
+}
 
 
 def _active_fable_limit(usage: dict[str, Any] | None) -> dict[str, Any] | None:

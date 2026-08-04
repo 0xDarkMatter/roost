@@ -425,3 +425,102 @@ def test_long_incident_description_is_bounded():
         warnings.simplefilter("error")
         html = render_widget([_profile()], meta)
     assert len(html.encode("utf-8")) < 28_672
+
+
+# ---------------------------------------------------------------------------
+# Square-grid gauges + view toggle
+# ---------------------------------------------------------------------------
+
+
+def test_square_gauges_render_three_columns_of_ten():
+    usage = _usage(session_pct=2, weekly_pct=76)
+    html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
+    card = html.split('<div class="rw-card">')[1]
+    stacks = re.findall(r'rw-sqstack">(.*?)</div>', card, re.S)
+    assert len(stacks) == 3, "one stack per window: Session, Weekly, Fable"
+    for stack in stacks:
+        assert stack.count("<i") == 10
+
+
+def test_square_gauge_lights_at_least_one_square_when_nonzero():
+    """2% rounds to nothing at 10%-per-square granularity.
+
+    An empty column beside a "2%" label reads as broken rather than as
+    nearly-empty, so a non-zero percent always lights one. The exact figure
+    is printed beneath, which is what makes the rounding safe.
+    """
+    usage = _usage(session_pct=2, weekly_pct=0)
+    html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
+    card = html.split('<div class="rw-card">')[1]
+    stacks = re.findall(r'rw-sqstack">(.*?)</div>', card, re.S)
+    assert stacks[0].count('<i class=') == 1, "2% lights exactly one square"
+    assert stacks[1].count('<i class=') == 0, "0% lights none"
+
+
+def test_square_gauge_fill_tracks_percentage():
+    usage = _usage(session_pct=50, weekly_pct=100)
+    html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
+    card = html.split('<div class="rw-card">')[1]
+    stacks = re.findall(r'rw-sqstack">(.*?)</div>', card, re.S)
+    assert stacks[0].count('<i class=') == 5
+    assert stacks[1].count('<i class=') == 10
+
+
+def test_view_toggle_is_css_only_no_script():
+    """The toggle must not reintroduce JavaScript.
+
+    The page's no-<script> guarantee is what makes "cannot reach for
+    alert/confirm/prompt" structurally true rather than a convention. A
+    hidden checkbox plus a sibling selector buys interactivity without it.
+    """
+    html = render_widget([_profile()], {"count": 1, "ok": 1})
+    assert "<script" not in html.lower()
+    assert 'class="rw-modechk"' in html
+    assert 'for="rw-mode"' in html
+    # The checkbox must precede what it restyles — CSS only selects forward.
+    assert html.index("rw-modechk") < html.index('<div class="rw-head">')
+    assert html.index("rw-modechk") < html.index('<div class="rw-grid">')
+
+
+def test_both_gauge_views_are_present_for_the_toggle():
+    html = render_widget([_profile(usage=_usage())], {"count": 1, "ok": 1})
+    assert "rw-bars" in html
+    assert "rw-squares" in html
+
+
+def test_component_rows_omit_operational_text():
+    """Repeating "operational" down a healthy column buries the one row
+    that would matter. The dot carries the state; only an abnormal one
+    earns words."""
+    meta = {
+        "count": 1,
+        "ok": 1,
+        "platform_status": {
+            "indicator": "none",
+            "components": [
+                {"name": "Claude Code", "status": "operational"},
+                {"name": "Claude API (api.anthropic.com)", "status": "degraded_performance"},
+            ],
+        },
+    }
+    html = render_widget([_profile()], meta)
+    head = html.split('<div class="rw-head">')[1].split('<div class="rw-grid">')[0]
+    visible = re.sub(r'title="[^"]*"', "", head)
+    assert "operational" not in visible, "healthy rows say nothing; the dot carries it"
+    assert "degraded performance" in visible, "an abnormal state still earns words"
+    # The state stays available to assistive tech and on hover.
+    assert 'title="Claude Code: operational"' in head
+
+
+def test_component_names_drop_parenthetical_hostnames():
+    meta = {
+        "count": 1,
+        "ok": 1,
+        "platform_status": {
+            "indicator": "none",
+            "components": [{"name": "Claude Console (platform.claude.com)", "status": "operational"}],
+        },
+    }
+    html = render_widget([_profile()], meta)
+    assert ">Claude Console<" in html
+    assert "platform.cl" not in html.split("title=")[0]
