@@ -1,5 +1,28 @@
 # v0.5.0 plan — credential rotation safety
 
+> **SUPERSEDED 2026-05-11 by `docs/findings.md` §6.**
+>
+> This doc was the design plan for v0.5.0's `--lease` + `roost snapshot`
+> machinery, motivated by the 2026-05-02 Axiom production failure. v0.5.0
+> shipped and the machinery works as specified below.
+>
+> However, empirical testing on 2026-05-11 revealed that `claude`
+> auto-refreshes its OAuth chain and writes the new chain back to the file
+> it read from. This makes the snapshot pattern this doc proposes
+> structurally unsafe for any workload that runs long enough to trigger a
+> refresh — the snapshot's new refresh_token diverges from the live
+> source profile's, server-side-invalidating the source.
+>
+> **The recommended trial-dispatch pattern is now
+> `CLAUDE_CONFIG_DIR=~/.claude-profiles/$(roost pick)` directly against
+> the live profile dir — no snapshot, no lease.** See README "Trial
+> dispatch (recommended pattern)" and `docs/findings.md` §6 for the
+> architectural reason.
+>
+> The plan below is preserved as a historical record of the v0.5.0
+> design. The `--lease` and `roost snapshot` surface still ships and
+> works as described — just not the primary recommendation.
+
 Self-note. Picking this up cold — everything needed is in this doc.
 Current state: v0.4.0 on `main`, commit `5d65d8f`.
 

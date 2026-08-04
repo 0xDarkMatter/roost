@@ -17,7 +17,7 @@ from claude_lb.exec_cmd import RC_NOT_FOUND, RC_TIMEOUT, ExecResult, run_child
 def test_run_child_propagates_rc_zero() -> None:
     result = run_child(
         [sys.executable, "-c", "import sys; sys.exit(0)"],
-        env_var_name="AXIOM_CLAUDE_PROFILE",
+        env_var_name="ROOST_PROFILE",
         profile_name="account-a",
         timeout=10.0,
     )
@@ -31,7 +31,7 @@ def test_run_child_propagates_rc_zero() -> None:
 def test_run_child_propagates_nonzero_rc() -> None:
     result = run_child(
         [sys.executable, "-c", "import sys; sys.exit(42)"],
-        env_var_name="AXIOM_CLAUDE_PROFILE",
+        env_var_name="ROOST_PROFILE",
         profile_name="account-a",
         timeout=10.0,
     )
@@ -60,7 +60,7 @@ def test_run_child_records_duration() -> None:
     """A child that sleeps ~100ms should report duration_ms >= 90 (slack for jitter)."""
     result = run_child(
         [sys.executable, "-c", "import time; time.sleep(0.1)"],
-        env_var_name="AXIOM_CLAUDE_PROFILE",
+        env_var_name="ROOST_PROFILE",
         profile_name="account-a",
         timeout=10.0,
     )
@@ -72,8 +72,8 @@ def test_run_child_not_found_returns_rc_127() -> None:
     """Unknown executable → FileNotFoundError → rc=127 (shell convention),
     not_found=True. Use a name no platform will resolve."""
     result = run_child(
-        ["claude-lb-this-binary-does-not-exist-xyz123"],
-        env_var_name="AXIOM_CLAUDE_PROFILE",
+        ["roost-this-binary-does-not-exist-xyz123"],
+        env_var_name="ROOST_PROFILE",
         profile_name="account-a",
         timeout=10.0,
     )
@@ -88,7 +88,7 @@ def test_run_child_timeout_returns_rc_124() -> None:
     start = time.monotonic()
     result = run_child(
         [sys.executable, "-c", "import time; time.sleep(5)"],
-        env_var_name="AXIOM_CLAUDE_PROFILE",
+        env_var_name="ROOST_PROFILE",
         profile_name="account-a",
         timeout=0.3,
     )

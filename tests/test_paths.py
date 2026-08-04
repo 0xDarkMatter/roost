@@ -16,6 +16,75 @@ def test_config_dir_returns_path() -> None:
     assert isinstance(p, Path)
 
 
+# ---------------------------------------------------------------------------
+# legacy config migration (claude-lb -> roost rename)
+# ---------------------------------------------------------------------------
+
+
+def test_migrate_moves_legacy_dir_when_new_absent(tmp_path: Path) -> None:
+    legacy = tmp_path / "claude-lb"
+    legacy.mkdir()
+    (legacy / "health.json").write_text("{}")
+    (legacy / "picks.log").write_text("audit\n")
+    new = tmp_path / "roost"
+
+    moved = paths_mod._migrate_legacy_config(legacy, new)
+
+    assert moved is True
+    assert not legacy.exists()
+    assert (new / "health.json").read_text() == "{}"
+    assert (new / "picks.log").read_text() == "audit\n"
+
+
+def test_migrate_noop_when_new_already_exists(tmp_path: Path) -> None:
+    """A populated new dir means we already migrated / fresh-installed under the
+    new name — never clobber it with the stale legacy copy."""
+    legacy = tmp_path / "claude-lb"
+    legacy.mkdir()
+    (legacy / "health.json").write_text("OLD")
+    new = tmp_path / "roost"
+    new.mkdir()
+    (new / "health.json").write_text("NEW")
+
+    moved = paths_mod._migrate_legacy_config(legacy, new)
+
+    assert moved is False
+    assert (new / "health.json").read_text() == "NEW"
+    assert legacy.exists()  # left untouched
+
+
+def test_migrate_noop_when_legacy_absent(tmp_path: Path) -> None:
+    moved = paths_mod._migrate_legacy_config(tmp_path / "claude-lb", tmp_path / "roost")
+    assert moved is False
+
+
+def test_migrate_noop_when_paths_equal(tmp_path: Path) -> None:
+    same = tmp_path / "cfg"
+    same.mkdir()
+    assert paths_mod._migrate_legacy_config(same, same) is False
+
+
+def test_config_dir_triggers_migration_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """config_dir() migrates the legacy tree on first call and is a no-op after."""
+    legacy = tmp_path / "claude-lb"
+    legacy.mkdir()
+    (legacy / "leases.json").write_text("{}")
+    new = tmp_path / "roost"
+
+    def _fake_user_config_dir(app_name: str, **_kw) -> str:
+        return str(tmp_path / app_name)
+
+    monkeypatch.setattr(paths_mod, "user_config_dir", _fake_user_config_dir)
+    monkeypatch.setattr(paths_mod, "_migration_attempted", False)
+
+    result = paths_mod.config_dir()
+    assert result == new
+    assert (new / "leases.json").read_text() == "{}"
+    assert not legacy.exists()
+
+
 def test_cache_path_is_health_json_under_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(paths_mod, "config_dir", lambda: Path("/cfg"))
     assert paths_mod.cache_path() == Path("/cfg/health.json")

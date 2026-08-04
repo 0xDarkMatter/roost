@@ -17,7 +17,7 @@ from claude_lb import platform_status as ps
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect config_dir to a tmp path so the cache writes don't pollute
-    the user's real ~/.config/claude-lb. Also mirrors the override into the
+    the user's real ~/.config/roost. Also mirrors the override into the
     platform_status module since it imports config_dir at module-load time."""
     config = tmp_path / "config"
     config.mkdir()

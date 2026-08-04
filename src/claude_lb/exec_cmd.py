@@ -2,15 +2,15 @@
 
 Collapses the spawn-worker wrapper from:
 
-    profile=$(claude-lb pick --auto-refresh 2>/dev/null) || exit $?
-    AXIOM_CLAUDE_PROFILE=$profile claude --args...
+    profile=$(roost pick --auto-refresh 2>/dev/null) || exit $?
+    ROOST_PROFILE=$profile claude --args...
 
 into a single call:
 
-    claude-lb exec --auto-refresh -- claude --args...
+    roost exec --auto-refresh -- claude --args...
 
-claude-lb's own exit code equals the child's exit code, so scripts can
-treat `claude-lb exec` as a transparent wrapper.
+roost's own exit code equals the child's exit code, so scripts can
+treat `roost exec` as a transparent wrapper.
 
 Named `exec_cmd.py` (not `exec.py`) because `exec` shadows the Python
 builtin in some static-analysis setups.

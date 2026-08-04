@@ -651,7 +651,7 @@ def test_humanize_until_handles_naive_target_and_naive_now() -> None:
 def test_status_table_renders_auth_expired_remediation_in_session_column(
     capsys,
 ) -> None:
-    """auth_expired profiles should display `claude-lb refresh <name>` in
+    """auth_expired profiles should display `roost refresh <name>` in
     the session column (the remediation is what operators need to see)."""
     from datetime import UTC, datetime
 
@@ -668,7 +668,7 @@ def test_status_table_renders_auth_expired_remediation_in_session_column(
     captured = capsys.readouterr()
     rendered = captured.out + captured.err
     flat = " ".join(rendered.split())
-    assert "claude-lb refresh expired-acct" in flat
+    assert "roost refresh expired-acct" in flat
 
 
 def test_status_table_renders_auth_dead_remediation_in_session_column(

@@ -1,4 +1,4 @@
-"""`claude-lb update [--check]` — self-update check (Forma §23).
+"""`roost update [--check]` — self-update check (Forma §23).
 
 v0.1 scope: assume the package was installed via
 `uv tool install --editable <path>`. We don't fetch from PyPI or a release
@@ -40,7 +40,7 @@ class UpdateStatus:
 
 @dataclass
 class UpdateApplyResult:
-    """Outcome of `claude-lb update --apply`."""
+    """Outcome of `roost update --apply`."""
 
     current_version: str
     install_dir: str | None
@@ -64,7 +64,7 @@ def _package_install_dir() -> Path | None:
 
 
 def _would_self_lock() -> bool:
-    """True iff we're on Windows AND running as the uv-tool-installed claude-lb.
+    """True iff we're on Windows AND running as the uv-tool-installed roost.
 
     Windows refuses to overwrite memory-mapped `.pyd`/`.dll` files that the
     current process has loaded. `uv tool install --reinstall` rewrites every
@@ -87,7 +87,7 @@ def _would_self_lock() -> bool:
     return (
         "uv" in parts_lower
         and "tools" in parts_lower
-        and "claude-lb" in parts_lower
+        and "roost" in parts_lower
     )
 
 
@@ -268,10 +268,10 @@ def apply_update(*, pull: bool = True) -> UpdateApplyResult:
             pulled=pulled,
             reinstalled=False,
             error=(
-                "Windows self-upgrade limitation: claude-lb can't reinstall "
+                "Windows self-upgrade limitation: roost can't reinstall "
                 "itself while running (the current process has its own .pyd "
                 "files mapped, so uv tool install can't overwrite them). "
-                "Run the following from any shell that is NOT claude-lb "
+                "Run the following from any shell that is NOT roost "
                 "(bash, cmd, or PowerShell all work):\n"
                 f"    uv tool install --reinstall --editable \"{install_dir}\""
             ),

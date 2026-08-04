@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .models import HealthCache, ProfileHealth
+from .term import Term, emit_panel
 
 stderr = Console(stderr=True)
 
@@ -166,7 +167,7 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
     has_opus = any(e.usage and e.usage.opus_pct is not None for e in entries)
     has_extra = any(e.usage and e.usage.extra is not None for e in entries)
 
-    table = Table(title="claude-lb profiles", show_lines=False)
+    table = Table(title="roost profiles", show_lines=False)
     table.add_column("Profile", style="bold")
     if has_plan:
         table.add_column("Plan")
@@ -206,7 +207,7 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
             session_in = f"{e.retry_after_s}s"
             weekly_in = "—"
         elif e.health.value == "auth_expired":
-            session_in = f"claude-lb refresh {e.name}"
+            session_in = f"roost refresh {e.name}"
             weekly_in = "—"
         elif e.health.value == "auth_dead":
             session_in = "claude login"
@@ -330,49 +331,62 @@ def render_pick_explanation(
     excluded_reasons: dict[str, str],
     filter_scores: dict[str, float],
 ) -> None:
-    """Render a pick decision tree to stderr.
+    """Render the pick decision as a grouped-tree panel to stderr.
 
-    Layout (Rich tables, no color noise):
-
-        Pick decision (strategy=least-used)
-        ┌─────────────┬──────────────┬───────────────┐
-        │ Profile     │ Status       │ Score / why   │
-        ├─────────────┼──────────────┼───────────────┤
-        │ account-a   │ excluded     │ health=...    │
-        │ account-b   │ candidate    │ score=12.0    │
-        │ account-c   │ ◀ chosen     │ score=8.0     │
-        └─────────────┴──────────────┴───────────────┘
-          Rationale: least-used: lowest weekly usage among healthy
-
-    The whole table is one render call (no incremental redraw) so it stays
-    readable when stderr is redirected to a file.
+    Profiles are bucketed into CHOSEN / CANDIDATES / EXCLUDED / NOT CONSIDERED
+    sections (TERMINAL-DESIGN.md §5.1); the rationale rides a dim summary line
+    above the footer. Empty buckets are omitted. The whole panel is one write
+    so it stays readable when stderr is redirected to a file.
     """
-    table = Table(
-        title=f"Pick decision (strategy={strategy})",
-        show_lines=False,
-        expand=False,
-        title_justify="left",
+    t = Term()
+
+    candidates = [
+        n for n in discovered_names
+        if n != chosen and n not in excluded_reasons and n in filter_scores
+    ]
+    excluded = [n for n in discovered_names if n in excluded_reasons]
+    not_considered = [
+        n for n in discovered_names
+        if n != chosen and n not in excluded_reasons and n not in filter_scores
+    ]
+
+    lines: list[str] = [
+        t.panel_open("roost", "roost · pick", indicator=strategy),
+        t.vert(),
+    ]
+
+    def _section(label: str, names: list[str], color: str | None, detail_for) -> None:
+        if not names:
+            return
+        lines.append(t.section(label, len(names), color=color))
+        for i, name in enumerate(names):
+            lines.append(
+                t.leaf(name, detail=detail_for(name), last=(i == len(names) - 1))
+            )
+        lines.append(t.vert())
+
+    if chosen is not None:
+        score = filter_scores.get(chosen)
+        detail = f"score={score:.2f}" if score is not None else "—"
+        lines.append(t.section("CHOSEN", 1, color="green"))
+        lines.append(t.leaf(chosen, detail=detail, last=True))
+        lines.append(t.vert())
+
+    _section(
+        "CANDIDATES", candidates, None,
+        lambda n: f"score={filter_scores[n]:.2f}",
     )
-    table.add_column("Profile", no_wrap=True)
-    table.add_column("Status", no_wrap=True)
-    table.add_column("Score / why", overflow="fold")
+    _section("EXCLUDED", excluded, "red", lambda n: excluded_reasons[n])
+    _section("NOT CONSIDERED", not_considered, "dim", lambda _n: "—")
 
-    for name in discovered_names:
-        if name == chosen:
-            status = "[bold green]◀ chosen[/bold green]"
-            score = filter_scores.get(name)
-            detail = f"score={score:.2f}" if score is not None else "—"
-        elif name in excluded_reasons:
-            status = "[red]excluded[/red]"
-            detail = excluded_reasons[name]
-        elif name in filter_scores:
-            status = "candidate"
-            detail = f"score={filter_scores[name]:.2f}"
-        else:
-            status = "[dim]not considered[/dim]"
-            detail = "—"
-        table.add_row(name, status, detail)
-
-    stderr.print(table)
     if rationale:
-        stderr.print(f"  Rationale: {rationale}")
+        lines.append(t.summary_line(rationale))
+        lines.append(t.vert())
+
+    footer_health = (
+        t.health("healthy", chosen) if chosen is not None
+        else t.health("critical", "no pick")
+    )
+    lines.append(t.panel_close(left_text="pick decision", right_text=footer_health))
+
+    emit_panel(lines)

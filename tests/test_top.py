@@ -74,7 +74,7 @@ def test_build_snapshot_table_renders_profile_rows() -> None:
     out = buf.getvalue()
     assert "a" in out
     assert "b" in out
-    assert "claude-lb" in out  # title
+    assert "roost" in out  # title
 
 
 def test_build_snapshot_table_empty_entries_renders_header_only() -> None:

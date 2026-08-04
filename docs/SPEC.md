@@ -70,7 +70,7 @@ Single resource: `profiles`. For convenience, top-level aliases collapse the res
 | `roost profiles pick [--strategy <s>]` | `roost pick` | Return the best healthy profile name |
 | `roost profiles invalidate <name>` | `roost invalidate <name>` | Drop cache for a profile; forces re-probe |
 | `roost profiles refresh [<name>\|--all\|--expired]` | `roost refresh ...` | Refresh OAuth tokens (§10) |
-| `roost exec <cmd...>` | — | Pick a profile, run a child command with `AXIOM_CLAUDE_PROFILE` set; propagate child rc |
+| `roost exec <cmd...>` | — | Pick a profile, run a child command with `ROOST_PROFILE` set; propagate child rc |
 | `roost doctor` | — | Diagnose local setup (§11) |
 | `roost update [--apply]` | — | Check or apply an in-place upgrade |
 | `roost --version` | — | Print semver, exit 0 |
@@ -161,7 +161,7 @@ account-a
 ### `profiles pick --export`
 
 ```
-AXIOM_CLAUDE_PROFILE=account-a
+ROOST_PROFILE=account-a
 ```
 
 Shell-sourceable via `eval $(roost pick --export)`. No quoting — profile names are guaranteed `[a-zA-Z0-9_-]+` (same constraint as directory names under `~/.claude-profiles/`).
@@ -214,7 +214,7 @@ Standard Forma (§5) mapping:
 ```bash
 profile=$(roost pick 2>/dev/null)
 case $? in
-  0) export AXIOM_CLAUDE_PROFILE="$profile" ;;
+  0) export ROOST_PROFILE="$profile" ;;
   5) echo "no ok profiles; sleeping 60s then retrying with rate-limited allowed" >&2; sleep 60 ;;
   6) echo "all profiles throttled; backing off" >&2; sleep 300 ;;
   9) echo "all profiles exhausted or dead; operator intervention required" >&2; exit 1 ;;
@@ -352,8 +352,8 @@ One probe per profile per invocation unless `--all` is used with `invalidate`. C
 
 | Platform | Path |
 |---|---|
-| Linux / macOS | `~/.config/claude-lb/health.json` |
-| Windows | `%APPDATA%\claude-lb\health.json` |
+| Linux / macOS | `~/.config/roost/health.json` |
+| Windows | `%APPDATA%\roost\health.json` |
 
 XDG override respected: `$XDG_CONFIG_HOME/roost/health.json`.
 
@@ -419,7 +419,7 @@ Cache writes use **atomic write-rename** (`tempfile` in same dir + `os.replace`)
 |---|---|
 | `sticky` | **Default.** Prefer the most-recently-picked profile *if still healthy and within stickiness window*. Else fall back to `least-used`. Maximises prompt-cache locality across back-to-back parcels. |
 | `least-used` | Prefer `ok` profiles, sorted by `usage.weekly_pct` ascending, then by `probed_at` descending (most recently verified) |
-| `round-robin` | Prefer `ok` profiles, sorted by last-picked timestamp from `~/.config/claude-lb/picks.log` ascending. Good when load-spreading beats cache locality. |
+| `round-robin` | Prefer `ok` profiles, sorted by last-picked timestamp from `~/.config/roost/picks.log` ascending. Good when load-spreading beats cache locality. |
 | `weighted` | Like `least-used` but multiplies by `1 / (session_pct + 1)` so a profile with low session usage beats one with low weekly usage |
 | `first-healthy` | Iterate in discovery order; return first `ok`. Deterministic testing. |
 
@@ -438,7 +438,7 @@ roost pick --strategy round-robin # Load-spread explicitly (ignores stickiness)
 **Algorithm:**
 
 ```
-1. Read last-picked entry from ~/.config/claude-lb/picks.log
+1. Read last-picked entry from ~/.config/roost/picks.log
 2. If last_pick.profile exists in discovered list
    AND last_pick.profile is currently `ok`
    AND (now - last_pick.timestamp) < stickiness_seconds:
@@ -496,7 +496,7 @@ silently (they need `claude login`, not `refresh`). Collapses the
 
 ### Pick log (audit trail)
 
-Every successful pick appends to `~/.config/claude-lb/picks.log`:
+Every successful pick appends to `~/.config/roost/picks.log`:
 
 ```
 2026-04-24T09:45:12Z	account-a	least-used	score=0.91
@@ -595,19 +595,19 @@ On success, `.credentials.json` is atomically rewritten (tempfile + `os.replace`
 
 ```bash
 $ roost pick --export
-AXIOM_CLAUDE_PROFILE=account-a
+ROOST_PROFILE=account-a
 ```
 
 Output format:
 
 - `<VAR>=<value>` on stdout, nothing else
-- Variable name: `AXIOM_CLAUDE_PROFILE` by default (matches Axiom's var); override with `--var-name <NAME>`
+- Variable name: `ROOST_PROFILE` by default; override with `--var-name <NAME>` (e.g. `--var-name AXIOM_CLAUDE_PROFILE` for Axiom's convention)
 
 Usage:
 
 ```bash
 eval $(roost pick --export)
-# $AXIOM_CLAUDE_PROFILE is now set in current shell
+# $ROOST_PROFILE is now set in current shell
 ```
 
 ### Shell completion (optional)
@@ -639,7 +639,7 @@ roost/
 │   ├── discovery.py              # ~/.claude-profiles/ walk + credentials.json parse
 │   ├── probe.py                  # async httpx probe + classification
 │   ├── taxonomy.py               # Health enum + classifier (the §6 logic)
-│   ├── cache.py                  # Read/write ~/.config/claude-lb/health.json
+│   ├── cache.py                  # Read/write ~/.config/roost/health.json
 │   ├── pick.py                   # Strategies + filter ladder
 │   ├── output.py                 # stdout/stderr separation, JSON envelope
 │   └── patterns.py               # Externalised keyword lists for 429 classification
@@ -730,7 +730,7 @@ roost status
 - [ ] All §6 seven states classified correctly from real Anthropic response fixtures
 - [ ] `--json` works on every command
 - [ ] Semantic exit codes (§4)
-- [ ] Cache at `~/.config/claude-lb/health.json` with atomic writes
+- [ ] Cache at `~/.config/roost/health.json` with atomic writes
 - [ ] Cross-platform paths (Linux/macOS/Windows)
 - [ ] 90%+ test coverage on `taxonomy.py`, `discovery.py`, `pick.py`
 
@@ -741,7 +741,7 @@ roost status
 - [ ] `invalidate <name>` drops cache entry; mtime bump on credentials.json auto-invalidates
 - [ ] `probe --parallel` concurrent probes via `asyncio.gather`
 - [ ] `--max-age <seconds>` overrides default TTLs
-- [ ] Pick log at `~/.config/claude-lb/picks.log` with 10MB rotation
+- [ ] Pick log at `~/.config/roost/picks.log` with 10MB rotation
 - [ ] `--verbose` dumps full probe payloads to stderr for debugging
 - [ ] README includes runnable examples for every command
 - [ ] CI (GitHub Actions): lint + type-check + test on 3.11 / 3.12 / 3.13 across Linux / macOS / Windows

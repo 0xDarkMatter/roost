@@ -1,4 +1,4 @@
-"""`claude-lb doctor` — diagnose the local setup (Forma §9 introspection).
+"""`roost doctor` — diagnose the local setup (Forma §9 introspection).
 
 Runs a series of checks and reports pass/fail for each. Useful for answering
 "why isn't pick returning what I expect?" without having to trace through
@@ -229,7 +229,7 @@ def _check_cache_readable() -> CheckResult:
             passed=False,
             detail=(
                 f"Cache JSON is malformed at line {exc.lineno} col {exc.colno}: "
-                f"{exc.msg}. Delete {target} or run `claude-lb invalidate "
+                f"{exc.msg}. Delete {target} or run `roost invalidate "
                 f"<name>` for any profile to reset."
             ),
         )
@@ -293,7 +293,7 @@ def _check_anthropic_reachable(timeout_s: float = 3.0) -> CheckResult:
 def _check_claude_status_page(timeout_s: float = 3.0) -> CheckResult:
     """Fetch status.claude.com summary; surface platform incidents as a warning.
 
-    This is informational — claude-lb can't *fix* an Anthropic-side incident,
+    This is informational — roost can't *fix* an Anthropic-side incident,
     but operators consulting `doctor` because pick is misbehaving deserve to
     know whether the platform is degraded vs whether their setup is wrong.
 

@@ -34,7 +34,7 @@ def _build_snapshot_table(entries: list[ProfileHealth]) -> Table:
     # asking it to render — but simpler: rebuild the table here, mirroring
     # the existing layout. Keep it terse since the column logic itself is
     # tested against render_status_table elsewhere.
-    table = Table(title="claude-lb (live)", title_justify="left", show_lines=False)
+    table = Table(title="roost (live)", title_justify="left", show_lines=False)
     table.add_column("Profile", no_wrap=True)
     table.add_column("Health", no_wrap=True)
     table.add_column("Session %", justify="right")

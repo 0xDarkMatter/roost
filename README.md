@@ -13,12 +13,70 @@
 
 ![roost](docs/assets/hackathon.gif)
 
+## Trial dispatch (recommended pattern)
+
+For headless `claude` workloads (Axiom trials, scripted runs, parallel
+batches), the simplest and safest pattern is to let claude own its own
+credentials file and use roost purely as a picker:
+
+```bash
+PROFILE=$(roost pick --strategy round-robin)
+CLAUDE_CONFIG_DIR=~/.claude-profiles/$PROFILE claude -p ...
+```
+
+Claude auto-refreshes its OAuth chain when the access_token expires and
+writes the new chain back to the same file. By pointing claude directly
+at the live profile dir, the refresh chain stays in sync with what roost
+sees — no orphan-source bug, no coordination needed.
+
+For batches: pre-refresh once, then fan out:
+
+```bash
+for p in $(roost list); do roost refresh $p; done
+for i in $(seq 1 8); do
+  P=$(roost pick --strategy round-robin)
+  CLAUDE_CONFIG_DIR=~/.claude-profiles/$P axiom solve --task $i &
+done
+wait
+```
+
+For long-running agents (multi-day), dedicate one profile and exclude it
+from the rotation pool:
+
+```bash
+# Agent owns roamhq permanently:
+CLAUDE_CONFIG_DIR=~/.claude-profiles/roamhq claude -p ... &
+
+# Trial fleet routes around it:
+roost pick --avoid roamhq
+```
+
+**Do not** snapshot `credentials.json` and hand the copy to a workload
+that may run long enough to trigger a refresh. Claude refreshes inside
+the snapshot, the OAuth server consumes the snapshot's refresh_token,
+and the live source profile is orphaned — its refresh_token is now
+server-side-invalid and `roost refresh <name>` will return
+`invalid_grant`. See `docs/findings.md` §6 for the empirical verification
+and the architectural reason.
+
 ## Recent updates
 
 [**Releases on GitHub**](https://github.com/0xDarkMatter/roost/releases) ·
 [Full CHANGELOG](CHANGELOG.md)
 
 ### v0.5.0 — credential rotation safety
+
+> **Note (added 2026-05-11):** the `--lease` and `roost snapshot`
+> surface ship and work as described below, but empirical testing
+> revealed claude itself auto-refreshes credentials.json and writes the
+> new chain back to the read-from file. This makes the snapshot pattern
+> unsafe for any workload that triggers a refresh (typically ≥8h
+> wall-time). The current recommendation for trial dispatch is the
+> "Trial dispatch (recommended pattern)" section above — direct
+> `CLAUDE_CONFIG_DIR` against the live profile dir, no snapshot. The
+> v0.5.0 features remain available for sub-8h cases or workloads that
+> can't read `~/.claude-profiles/<name>/` directly. See
+> `docs/findings.md` §6.
 
 - **`roost exec --lease` (default on)** — pins the picked profile against
   `roost refresh` for the child's lifetime. A background probe can no longer
@@ -72,7 +130,7 @@
 
 ### v0.2.0 — exec, multi-pick, operational tooling
 
-- **`roost exec <cmd...>`** — pick a profile, set `AXIOM_CLAUDE_PROFILE`,
+- **`roost exec <cmd...>`** — pick a profile, set `ROOST_PROFILE`,
   exec the command, propagate child rc. With `--auto-refresh` and
   `--retry-on-429`.
 - **`roost pick --auto-refresh`** — inline-refresh expired tokens before
@@ -103,7 +161,7 @@
                              ▼
                   ┌──────────────────────┐
                   │  sticky              │
-                  │  least-used          │──► AXIOM_CLAUDE_PROFILE=‹name›
+                  │  least-used          │──► ROOST_PROFILE=‹name›
                   │  round-robin         │              → claude ...
                   │  weighted            │
                   └──────────────────────┘
@@ -123,7 +181,7 @@ scripting call, reading utilization numbers straight from Anthropic's
 OAuth usage endpoint.
 
 ```bash
-AXIOM_CLAUDE_PROFILE=$(roost pick) my-script ...
+ROOST_PROFILE=$(roost pick) my-script ...
 ```
 
 It works with any Claude Code OAuth account (Max / Pro / Team). On Max
@@ -216,7 +274,7 @@ roost probe                          # Live-probe all profiles
 roost status                         # Cached health table
 roost pick                           # → personal  (one profile name, exit 0)
 roost refresh --expired              # Refresh any profile whose token expired
-eval "$(roost pick --export)"        # AXIOM_CLAUDE_PROFILE=personal in shell
+eval "$(roost pick --export)"        # ROOST_PROFILE=personal in shell
 roost status --json | jq '.meta'     # Machine-readable summary
 ```
 
@@ -381,10 +439,10 @@ roost exec --strategy least-used --timeout 300 --retry-on-429 1 -- claude ...
 
 # Dry-run: show what would execute without talking to the API
 roost exec --dry-run -- claude --help
-# → AXIOM_CLAUDE_PROFILE=account-a claude --help
+# → ROOST_PROFILE=account-a claude --help
 ```
 
-`roost exec` picks a profile, sets `AXIOM_CLAUDE_PROFILE=<name>` in the
+`roost exec` picks a profile, sets `ROOST_PROFILE=<name>` in the
 child's env, and execs the command. The child's exit code becomes roost's
 exit code, so scripts can treat `exec` as a transparent wrapper. stdin/stdout/
 stderr are inherited (interactive children work unchanged). Every run is
@@ -397,7 +455,7 @@ Key flags:
   rate-limited/session-exhausted, retry once with a different profile (best-effort)
 - `--timeout S` — kill after S seconds (exit 124)
 - `--dry-run` — print the env + command, don't execute
-- `--var-name NAME` — override `AXIOM_CLAUDE_PROFILE`
+- `--var-name NAME` — override `ROOST_PROFILE`
 - `--log-full-argv` — log the full child argv instead of just argv[0] (may leak secrets)
 - `--lease` (default on) / `--no-lease` — acquire an expiring lock on the picked
   profile before spawning the child. While held, `roost refresh` returns `LEASE_HELD`
@@ -435,7 +493,7 @@ prominent warning that the copy is not kept fresh.
 # If `exec` doesn't fit, drop to pick + eval yourself:
 profile=$(roost pick --auto-refresh 2>/dev/null)
 case $? in
-  0) export AXIOM_CLAUDE_PROFILE="$profile" ;;
+  0) export ROOST_PROFILE="$profile" ;;
   2) echo "All profiles dead or expired: run claude login --profile <name>" ;;
   5) echo "No profile is currently ok — retry or relax --require-ok" ;;
   6) echo "All profiles throttled — back off" ;;
@@ -634,7 +692,7 @@ Stickiness window: `--stickiness <s>` or `CLAUDE_LB_STICKINESS=<s>`. Set to `0` 
 | `CLAUDE_LB_PROFILES_DIR` | `~/.claude-profiles` | Absolute path to the profiles tree. Useful for testing or multi-tenant setups. |
 | `CLAUDE_LB_USAGE_LOG` | unset | Set to `1`/`true`/`yes`/`on` to enable per-probe NDJSON logging without writing the marker file. Equivalent to `roost config usage-log on` for the current process. |
 | `CLAUDE_CONFIG_DIR` | unset | Single-profile fallback: if set to a dir containing a direct `.credentials.json`, loaded as profile `default`. |
-| `XDG_CONFIG_HOME` | unset | Linux/macOS: overrides `~/.config/claude-lb/`. Windows uses `%APPDATA%\claude-lb\`. |
+| `XDG_CONFIG_HOME` | unset | Linux/macOS: overrides `~/.config/roost/`. Windows uses `%APPDATA%\roost\`. |
 
 ## Diagnostics
 
@@ -666,8 +724,8 @@ POSIX platforms (macOS, Linux) are unaffected — inode-swap semantics let
 
 | Purpose | Path |
 |---------|------|
-| Cache (Linux/macOS) | `~/.config/claude-lb/health.json` |
-| Cache (Windows) | `%APPDATA%\claude-lb\health.json` |
+| Cache (Linux/macOS) | `~/.config/roost/health.json` |
+| Cache (Windows) | `%APPDATA%\roost\health.json` |
 | Pick log | `<config>/picks.log` (tab-separated, 10 MB rotation) |
 | Last-pick state | `<config>/last-pick.json` |
 | Platform-status cache | `<config>/platform-status.json` (60s TTL, used by `status`) |

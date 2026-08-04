@@ -2,7 +2,7 @@
 
 Disabled by default for privacy/disk-footprint conservatism. Enable via:
 
-  - `claude-lb config usage-log on` (writes a marker file at
+  - `roost config usage-log on` (writes a marker file at
     `<config>/usage-log.enabled`), or
   - `CLAUDE_LB_USAGE_LOG=1` environment variable
 
@@ -58,7 +58,7 @@ def enable_marker() -> Path:
     target = usage_log_marker_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     if not target.exists():
-        target.write_text("# claude-lb: per-probe usage logging enabled\n")
+        target.write_text("# roost: per-probe usage logging enabled\n")
     return target
 
 

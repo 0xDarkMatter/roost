@@ -46,7 +46,7 @@ account-b is typically running the hottest; account-a has the most headroom. acc
 For the next "what could we add?" conversation:
 
 - **`roost watch`** — live-updating status table (TUI), Rich-based, ~30 lines
-- **`~/.config/claude-lb/usage-log.ndjson` + `roost history`** — append-on-probe, enables burn-rate projection and monthly reports
+- **`~/.config/roost/usage-log.ndjson` + `roost history`** — append-on-probe, enables burn-rate projection and monthly reports
 - **`refresh --soon 30m`** — anticipatory refresh for tokens expiring within N
 - **`pick --max-cost <amount>`** — skip profiles near monthly overage cap (we have the data)
 - **`pick --format path|token`** — return creds dir or raw token instead of name

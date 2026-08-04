@@ -271,7 +271,7 @@ def test_local_auth_expired_with_refresh_token_suggests_refresh() -> None:
     assert result is not None
     assert result.health is Health.AUTH_EXPIRED
     assert result.error is not None
-    assert "claude-lb refresh" in result.error.message
+    assert "roost refresh" in result.error.message
     assert "claude login" not in result.error.message
     # No network was hit — latency is 0.
     assert result.probe_latency_ms == 0

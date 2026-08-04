@@ -1,4 +1,4 @@
-"""Pydantic models shared across claude-lb modules."""
+"""Pydantic models shared across roost modules."""
 
 from __future__ import annotations
 
@@ -105,7 +105,7 @@ class ProfileHealth(BaseModel):
 
 
 class HealthCache(BaseModel):
-    """On-disk cache shape for ~/.config/claude-lb/health.json."""
+    """On-disk cache shape for ~/.config/roost/health.json."""
 
     schema_version: int = 1
     updated_at: datetime

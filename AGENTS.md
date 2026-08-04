@@ -34,7 +34,7 @@ without per-window % numbers.
 | `roost pick [--strategy S]` | Return the best profile name (exit 0) |
 | `roost which [--strategy S]` | Read-only counterpart to `pick`: same decision logic, no side effects on `picks.log` / `last-pick.json` |
 | `roost refresh <name> \| --all \| --expired \| --soon DURATION [--jitter S]` | OAuth refresh, rewrites `.credentials.json`. `--jitter` adds per-profile random delay for cron-spread |
-| `roost exec <cmd...>` | Pick a profile, run a child command with `AXIOM_CLAUDE_PROFILE` set |
+| `roost exec <cmd...>` | Pick a profile, run a child command with `ROOST_PROFILE` set |
 | `roost history` | Show recent picks + exec runs from `picks.log` |
 | `roost stats [--since] [--profile]` | Aggregate over `picks.log` — totals, p50/p95 durations, failure rate |
 | `roost report --metric M [--sparkline] [--project]` | Aggregate over opt-in `usage-log.ndjson` time-series; per-profile min/max/avg + projection |
@@ -64,7 +64,7 @@ Every command accepts `--json` and returns a `{data, meta}` envelope.
 # Pre-flight for spawning a `claude` subprocess
 roost refresh --expired 2>/dev/null
 profile=$(roost pick 2>/dev/null) && \
-  AXIOM_CLAUDE_PROFILE=$profile claude ...
+  ROOST_PROFILE=$profile claude ...
 
 # Machine-readable status for dashboards
 roost status --json | jq '.meta'
@@ -122,9 +122,9 @@ Invariants an agent cannot intuit from `--help`:
 
 26. **`pick --fallback` is a CLI-layer concept, not a pick algorithm extension.** It activates AFTER `pick()` returns a structured failure. The fallback profile name must exist in discovery and not be in `--avoid`; non-existent fallbacks propagate the original failure (not a silent typo-rescue). Do not push `--fallback` into `pick.py` itself — keep the algorithm pure (filter ladder → strategy → top N) and let the CLI handle "what to do when there's nothing left" semantics. See `cli.profiles_pick`.
 
-27. **Leases prevent rotation of in-flight credentials.** `roost exec` auto-leases the picked profile for the child's lifetime (`--no-lease` to opt out; `--lease-for <duration>` to set the TTL explicitly; default 30m or `timeout * 1.2`). While leased, `refresh_profile()` returns `LEASE_HELD` (exit 7) without touching the credentials file. The lease store is `<config>/leases.json` — atomic writes, same pattern as `health.json`. Leases expire automatically at read time; no daemon, no cleanup process. Key invariants: (a) `roost pick` is zero-overhead — it never reads the lease store; (b) expired leases are transparent — `get_active()` returns None if past TTL; (c) only `refresh` checks leases, not `probe` — probing is freshness, not state. See `src/claude_lb/lease.py`, `src/claude_lb/exec_cmd.py:_maybe_lease`.
+27. **Leases prevent rotation of in-flight credentials *by roost*; they do NOT prevent claude's own auto-refresh.** `roost exec` auto-leases the picked profile for the child's lifetime (`--no-lease` to opt out; `--lease-for <duration>` to set the TTL explicitly; default 30m or `timeout * 1.2`). While leased, `refresh_profile()` returns `LEASE_HELD` (exit 7) without touching the credentials file. The lease store is `<config>/leases.json` — atomic writes, same pattern as `health.json`. Leases expire automatically at read time; no daemon, no cleanup process. Key invariants: (a) `roost pick` is zero-overhead — it never reads the lease store; (b) expired leases are transparent — `get_active()` returns None if past TTL; (c) only `refresh` checks leases, not `probe` — probing is freshness, not state. See `src/claude_lb/lease.py`, `src/claude_lb/exec_cmd.py:_maybe_lease`. **Note (2026-05-11):** under empirical testing, the credential-rotation threat that leases address is no longer the dominant trial failure mode — claude's own OAuth auto-refresh is. Leases stay supported for short-running children but are not the recommended trial-dispatch primitive. See `docs/findings.md` §6 for the architectural reason; the recommended pattern is `CLAUDE_CONFIG_DIR=~/.claude-profiles/$(roost pick)` directly against the live profile dir.
 
-28. **`roost snapshot <profile> <out-path>` is a documented point-in-time copy, not a live file.** It copies the credentials.json to the destination and prints a stderr warning that roost will never touch the snapshot. It does NOT acquire a lease. For full rotation protection during a long workload, use `roost exec` (which auto-leases). The snapshot command exists to make the "copy once, use for duration" pattern explicit and discoverable — without it, consumers would silently `cp` the file and have no documentation that the copy may become stale.
+28. **`roost snapshot <profile> <out-path>` is a documented point-in-time copy of credentials.json, not a live file.** It copies the credentials.json to the destination and prints a stderr warning that roost will never touch the snapshot. It does NOT acquire a lease. **Do not use snapshots as the credentials source for long-running headless claude workloads.** Claude auto-refreshes when the access_token expires and writes the new chain back to the file it read from — for a snapshot, that means the new refresh_token lives in the snapshot, the old one in the live profile is server-side-consumed, and `roost refresh <name>` will subsequently fail with `invalid_grant`. Snapshots are only safe for sub-access-token-lifetime workloads (currently ~8h) that never trigger a refresh. The recommended pattern for headless claude dispatch is `CLAUDE_CONFIG_DIR=~/.claude-profiles/<name>/` directly — let claude own the refresh chain. See `docs/findings.md` §6.
 
 **Prompt injection:** not applicable. `roost` returns only its own telemetry — profile names, utilization numbers, timestamps — never user-authored content from Anthropic's API.
 
@@ -141,7 +141,8 @@ Invariants an agent cannot intuit from `--help`:
 | `src/claude_lb/pick.py` | Strategies (incl. `lowest-overage`), stickiness, filter ladder (incl. `--avoid` and `--max-cost`), `PickOutcome.excluded_reasons` + `filter_scores` for `--explain`, pick log |
 | `src/claude_lb/lease.py` | Lease store: `acquire / release / get_active / list_leases / purge_expired`; `parse_duration` for duration strings |
 | `src/claude_lb/exec_cmd.py` | `roost exec` subprocess orchestration (named `_cmd` to avoid shadowing the builtin); `_maybe_lease` context manager auto-leases for child lifetime |
-| `src/claude_lb/output.py` | JSON envelope, stream separation, status table, `render_pick_explanation` |
+| `src/claude_lb/output.py` | JSON envelope, stream separation, status table, `render_pick_explanation` (panel grammar via `term`) |
+| `src/claude_lb/term.py` | Terminal-panel renderer — Python port of claude-mods `TERMINAL-DESIGN.md` (glyph/brand registries, ASCII + `NO_COLOR` fallbacks, `panel_open/close`, `section`, `leaf`, `check_row`, `alert_panel`, `health`). Consumers: `doctor`, `pick --explain` |
 | `src/claude_lb/doctor.py` | Local-setup diagnostics |
 | `src/claude_lb/platform_status.py` | status.claude.com fetcher + 60s cache + format helpers (shared by `status` and `doctor`) |
 | `src/claude_lb/updater.py` | Version + upstream check |

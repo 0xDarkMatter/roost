@@ -40,7 +40,7 @@ def _headers(token: str) -> dict[str, str]:
         "anthropic-version": ANTHROPIC_VERSION,
         "anthropic-beta": ANTHROPIC_BETA,
         "accept": "application/json",
-        "user-agent": f"claude-lb/{__version__}",
+        "user-agent": f"roost/{__version__}",
     }
 
 
@@ -139,7 +139,7 @@ def _local_auth_expired(profile: Profile) -> ProfileHealth | None:
             type="token_expired",
             message=(
                 f"OAuth access token expired {delta_s}s ago. "
-                f"Run: claude-lb refresh {profile.name}"
+                f"Run: roost refresh {profile.name}"
                 if profile.refresh_token_present
                 else f"OAuth access token expired {delta_s}s ago and no refresh "
                 f"token is stored. Run: claude login --profile {profile.name}"
@@ -261,7 +261,7 @@ async def probe_raw_many(
 ) -> list[tuple[str, int | None, dict[str, Any] | None, dict[str, str]]]:
     """Diagnostic: return raw (name, status_code, body, headers) tuples.
 
-    Bypasses classification + caching. Intended for `claude-lb probe --raw`
+    Bypasses classification + caching. Intended for `roost probe --raw`
     to help capture unknown response shapes during development, or to inspect
     what Anthropic is currently returning when a user reports weird behaviour.
     """

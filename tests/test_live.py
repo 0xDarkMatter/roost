@@ -48,7 +48,7 @@ def fleet() -> list[str]:
     if not profiles:
         pytest.skip(
             "No profiles in ~/.claude-profiles/ — live tests need at least "
-            "one. Run `claude-lb add <name>` after `claude login`."
+            "one. Run `roost add <name>` after `claude login`."
         )
     return [p.name for p in profiles]
 

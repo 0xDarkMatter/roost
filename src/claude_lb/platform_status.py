@@ -1,8 +1,8 @@
 """Cached fetch of status.claude.com summary.
 
 Used by:
-- `claude-lb doctor` — always-fresh diagnostic check
-- `claude-lb status` — cached header above the profile table
+- `roost doctor` — always-fresh diagnostic check
+- `roost status` — cached header above the profile table
 
 The cache is small (a single JSON blob at `<config>/platform-status.json`) and
 short-lived (60s TTL). When a fresh fetch fails we fall back to whatever's in

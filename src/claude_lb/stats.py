@@ -1,6 +1,6 @@
 """Aggregations over picks.log + usage-log.ndjson.
 
-Powers `claude-lb stats` (picks.log) and `claude-lb report` (usage log).
+Powers `roost stats` (picks.log) and `roost report` (usage log).
 Both commands are pure read-side: they never write to either log.
 
 Schemas:

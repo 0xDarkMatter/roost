@@ -281,7 +281,7 @@ def test_exec_lease_acquired_and_released(tmp_path: Path) -> None:
         from claude_lb.exec_cmd import run_child
         result = run_child(
             ["echo", "hello"],
-            env_var_name="AXIOM_CLAUDE_PROFILE",
+            env_var_name="ROOST_PROFILE",
             profile_name="account-a",
             timeout=None,
             lease_profile=True,
@@ -305,7 +305,7 @@ def test_exec_no_lease_skips_lease() -> None:
         from claude_lb.exec_cmd import run_child
         run_child(
             ["echo", "hello"],
-            env_var_name="AXIOM_CLAUDE_PROFILE",
+            env_var_name="ROOST_PROFILE",
             profile_name="account-a",
             timeout=None,
             lease_profile=False,

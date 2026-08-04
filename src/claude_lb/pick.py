@@ -27,7 +27,7 @@ PICK_LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 
 # Atomic-replace retry budget. On Windows, os.replace fails with WinError 5
 # (Access is denied) when another process briefly holds the target open —
-# common when N parallel claude-lb invocations all write last-pick.json in
+# common when N parallel roost invocations all write last-pick.json in
 # the same millisecond. Retry-with-jitter is the documented Windows pattern.
 _REPLACE_MAX_ATTEMPTS = 5
 _REPLACE_BASE_DELAY_S = 0.05

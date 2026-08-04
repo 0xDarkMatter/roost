@@ -75,7 +75,7 @@ def _headers() -> dict[str, str]:
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": f"claude-lb/{__version__}",
+        "User-Agent": f"roost/{__version__}",
         "anthropic-beta": ANTHROPIC_BETA,
     }
 
@@ -187,7 +187,7 @@ async def refresh_profile(
     """Refresh one profile's OAuth token. Rewrites .credentials.json on success.
 
     Acquires a per-profile file lock (sibling `.credentials.json.lock`) before
-    reading the refresh token, so two parallel `claude-lb refresh` invocations
+    reading the refresh token, so two parallel `roost refresh` invocations
     against the same profile serialize. Parallel refreshes of DIFFERENT
     profiles still fan out concurrently — each profile has its own lock file.
 

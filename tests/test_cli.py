@@ -81,7 +81,7 @@ def _isolated_home(
 def test_version() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert "claude-lb" in result.stdout
+    assert "roost" in result.stdout
     assert "0.5.0" in result.stdout
 
 
@@ -239,7 +239,7 @@ def test_pick_export_emits_var_assignment(profile_factory) -> None:
     with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
         result = runner.invoke(app, ["pick", "--export"])
     assert result.exit_code == 0
-    assert result.stdout.strip() == "AXIOM_CLAUDE_PROFILE=account-a"
+    assert result.stdout.strip() == "ROOST_PROFILE=account-a"
 
 
 def test_pick_export_custom_var(profile_factory) -> None:
@@ -738,7 +738,7 @@ def test_pick_count_with_export_and_count_one_is_fine(profile_factory) -> None:
     with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
         result = runner.invoke(app, ["pick", "--count", "1", "--export"])
     assert result.exit_code == 0
-    assert result.stdout.strip() == "AXIOM_CLAUDE_PROFILE=account-a"
+    assert result.stdout.strip() == "ROOST_PROFILE=account-a"
 
 
 def test_pick_count_json_is_array_shape(profile_factory) -> None:
@@ -854,7 +854,7 @@ def test_exec_happy_path(profile_factory, _isolated_home: Path) -> None:
     assert len(stub_run.calls) == 1
     call = stub_run.calls[0]
     assert call["argv"] == ["echo", "hello"]
-    assert call["env_var_name"] == "AXIOM_CLAUDE_PROFILE"
+    assert call["env_var_name"] == "ROOST_PROFILE"
     assert call["profile_name"] == "account-a"
 
     log_text = (_isolated_home / "picks.log").read_text()
@@ -885,7 +885,7 @@ def test_exec_dry_run_prints_without_running(profile_factory) -> None:
         result = runner.invoke(app, ["exec", "--dry-run", "echo", "hello"])
     assert result.exit_code == 0
     assert len(stub_run.calls) == 0  # child never ran
-    assert "AXIOM_CLAUDE_PROFILE=account-a" in result.stdout
+    assert "ROOST_PROFILE=account-a" in result.stdout
     assert "echo" in result.stdout
 
 
@@ -1168,7 +1168,7 @@ def test_humanize_elapsed_days_band() -> None:
 
 
 # ---------------------------------------------------------------------------
-# claude-lb history
+# roost history
 # ---------------------------------------------------------------------------
 
 
@@ -1375,7 +1375,7 @@ def test_refresh_soon_and_expired_together_rejected(profile_factory) -> None:
 
 
 # ---------------------------------------------------------------------------
-# claude-lb add — onboarding helper
+# roost add — onboarding helper
 # ---------------------------------------------------------------------------
 
 
@@ -1396,7 +1396,7 @@ def _write_credentials_file(path: Path, *, with_refresh: bool = True) -> None:
 def test_add_imports_from_default_claude_dir(
     tmp_path: Path, credentials_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`claude-lb add NAME` defaults --from to ~/.claude/.credentials.json."""
+    """`roost add NAME` defaults --from to ~/.claude/.credentials.json."""
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setattr("pathlib.Path.home", lambda: fake_home)
@@ -1615,7 +1615,7 @@ def test_add_json_oauth_accessToken_legacy_shape_accepted(
 
 
 def test_refresh_no_selector_returns_validation_error(profile_factory) -> None:
-    """`claude-lb refresh` with no name and no flags should refuse — would
+    """`roost refresh` with no name and no flags should refuse — would
     otherwise be ambiguous between "all" and "nothing"."""
     profile_factory("account-a")
     result = runner.invoke(app, ["refresh"])
@@ -1703,12 +1703,12 @@ def test_refresh_expired_with_no_expired_profiles_json_envelope(
 
 
 def test_update_command_renders_status_text() -> None:
-    """`claude-lb update` (no --apply) prints the version + git status."""
+    """`roost update` (no --apply) prints the version + git status."""
     result = runner.invoke(app, ["update"])
     assert result.exit_code == 0
     flat = " ".join(result.stderr.split())
     # Always at least mentions the current version + a hint
-    assert "claude-lb" in flat
+    assert "roost" in flat
     assert "hint" in flat.lower()
 
 
@@ -1857,7 +1857,7 @@ def test_history_log_with_only_blank_lines(_isolated_home: Path) -> None:
 
 
 def test_exec_separator_only_no_argv_exits_validation(profile_factory) -> None:
-    """`claude-lb exec --` with nothing after the separator must not
+    """`roost exec --` with nothing after the separator must not
     silently treat `--` as the command."""
     profile_factory("account-a")
     with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):
@@ -1867,7 +1867,7 @@ def test_exec_separator_only_no_argv_exits_validation(profile_factory) -> None:
 
 
 def test_exec_separator_is_stripped_when_present(profile_factory) -> None:
-    """`claude-lb exec -- echo hi` and `claude-lb exec echo hi` produce the
+    """`roost exec -- echo hi` and `roost exec echo hi` produce the
     same child argv (the leading `--` is consumed, not passed to the child)."""
     profile_factory("account-a")
     stub_run = _stub_run_child_factory(rc_sequence=[0])
@@ -2214,7 +2214,7 @@ def test_status_force_refresh_propagates_to_loader(
 
 
 def test_probe_no_profiles_returns_unavailable() -> None:
-    """`claude-lb probe` with no profiles on disk should exit 9 (UNAVAILABLE)."""
+    """`roost probe` with no profiles on disk should exit 9 (UNAVAILABLE)."""
     result = runner.invoke(app, ["probe"])
     assert result.exit_code == 9
     flat = " ".join(result.stderr.split()).lower()
@@ -3021,14 +3021,16 @@ def test_pick_json_failure_emits_envelope_with_reason_code(
 
 
 def test_doctor_text_output_renders_check_lines(profile_factory) -> None:
-    """`claude-lb doctor` (no --json) should emit a header + per-check status
+    """`roost doctor` (no --json) should emit a header + per-check status
     lines on stderr — covers the text-rendering loop."""
     profile_factory("account-a")
     result = runner.invoke(app, ["doctor", "--skip-network"])
     assert result.exit_code == 0
     flat = " ".join(result.stderr.split())
-    assert "claude-lb doctor" in flat
-    assert "OK" in flat or "WARN" in flat
+    # Panel header carries the brand + subtitle; check names ride the body.
+    assert "roost" in flat
+    assert "doctor" in flat
+    assert "config_dir_writable" in flat
 
 
 def test_doctor_text_output_marks_warning_checks() -> None:
@@ -3057,8 +3059,12 @@ def test_doctor_text_output_marks_warning_checks() -> None:
         result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 1  # one check failed
     flat = " ".join(result.stderr.split())
-    assert "WARN" in flat
+    # Warn + fail checks both surface their names; the failure's full detail
+    # rides an alert sub-row, and the footer reports the failure count.
+    assert "warn-check" in flat
     assert "fail-check" in flat
+    assert "broke" in flat
+    assert "failed" in flat
 
 
 def test_history_text_output_renders_table(_isolated_home: Path) -> None:
@@ -3120,7 +3126,7 @@ def test_update_text_renders_when_install_dir_is_not_a_git_repo(
 
 
 def test_probe_text_output_renders_status_table(profile_factory) -> None:
-    """`claude-lb probe` without --json should render the status table to
+    """`roost probe` without --json should render the status table to
     stderr and a summary line to stdout — covers the text-output block."""
     profile_factory("account-a")
     with patch.object(cli_mod, "probe_many_sync", _stub_probe_many_sync):

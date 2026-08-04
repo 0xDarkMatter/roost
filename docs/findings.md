@@ -244,3 +244,83 @@ per-token billing changes the meaning), revisit. Don't add a "divided"
 helper field — the operator can divide at the call site, and we can't
 guarantee the unit is stable. README's "Monthly Overage" section now
 documents the empirical finding so users don't read 31000 AUD literally.
+
+---
+
+## 6. Claude auto-refreshes OAuth and writes back to the file it read from
+
+**Verified 2026-05-11.** Empirical test against `claude` v2.1.120 (PE32+
+Windows binary, `refreshOAuthToken` symbol present, `/oauth` endpoint
+strings present).
+
+**Method:**
+
+1. `roost session evolution7 --out /tmp/test/.credentials.json` (snapshot
+   captures live chain head).
+2. `jq` mutated `expiresAt` to a past timestamp; file hash recorded.
+3. `CLAUDE_CONFIG_DIR=/tmp/test claude -p "reply: PASS"` ran successfully.
+4. Re-inspected file: `accessToken`, `refreshToken`, and `expiresAt` had
+   all rotated. File hash changed.
+
+**Conclusion:**
+
+- Claude calls the OAuth refresh endpoint transparently when its current
+  access_token's `expiresAt` is past.
+- Claude writes the new chain (new access + new refresh + new expiresAt)
+  **back to the same file it read from** — not to any "source profile"
+  outside that file.
+
+**Architectural consequence — snapshots are not safe to give to claude
+under any workload that runs long enough to trigger a refresh:**
+
+When `roost snapshot` (or `roost session` as briefly shipped + rolled back
+in this finding's session) copies `~/.claude-profiles/<name>/.credentials.json`
+to `/tmp/snap.json` and the workload reads from `/tmp/snap.json`:
+
+1. Claude refreshes inside the snapshot.
+2. The OAuth server consumes the snapshot's `refreshToken` and issues a new
+   chain → written to the snapshot.
+3. The live `~/.claude-profiles/<name>/.credentials.json` still has the
+   *old* `refreshToken`. From the OAuth server's perspective, that token is
+   now dead.
+4. Next `roost refresh <name>` returns `REFRESH_REJECTED — invalid_grant`.
+   The profile is bricked from roost's perspective until someone copies
+   the snapshot's chain back to the live file or `claude /login` runs.
+
+This is structurally identical to the 2026-05-11 Axiom programbench trial 5
+failure mode, just with the direction of staleness reversed (there, roost
+rotated the live and orphaned the snapshot; here, claude rotates the
+snapshot and orphans the live).
+
+**Recommended pattern instead — direct profile dir:**
+
+```bash
+PROFILE=$(roost pick --strategy round-robin)
+CLAUDE_CONFIG_DIR=~/.claude-profiles/$PROFILE claude -p ...
+```
+
+Claude reads + writes the live file. The refresh chain stays in one
+place. Roost stays out of the refresh path entirely for the workload's
+duration. No snapshot, no lease, no orphan window. For long-running
+agents, dedicate one profile and exclude it from the rotation pool with
+`roost pick --avoid <agent-profile>`.
+
+**Concurrency note:** multiple concurrent claudes pointing at the same
+live profile share an access_token (Anthropic doesn't invalidate prior
+access_tokens on use — only `refreshToken` consume is single-use). The
+narrow risk is two claudes simultaneously deciding to refresh: first
+wins, second gets `invalid_grant` and retries reading the file (now with
+the winner's fresh chain). Pre-batch `roost refresh <profile>` before
+launching a parallel batch mints fresh tokens with ~8h headroom; if the
+batch finishes inside that window, no in-trial refresh fires.
+
+**Code path:** none in roost — the finding is about *not* building
+coordination primitives. `src/claude_lb/lease.py` and the `--lease` /
+`snapshot` surface still exist (v0.5.0) but are no longer the
+recommended trial-dispatch pattern. See README "Trial dispatch
+(recommended)" section.
+
+**Action for the future:** if `claude` ever changes its credentials-file
+write semantics (e.g., new path, opt-in flag, no-refresh mode), revisit
+this finding.
+

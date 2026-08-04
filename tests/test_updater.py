@@ -178,7 +178,7 @@ def test_would_self_lock_true_when_running_from_uv_tool_on_windows(
     monkeypatch.setattr(
         updater.sys,
         "prefix",
-        r"C:\Users\Mack\AppData\Roaming\uv\tools\claude-lb",
+        r"C:\Users\Mack\AppData\Roaming\uv\tools\roost",
     )
     assert updater._would_self_lock() is True
 
@@ -202,7 +202,7 @@ def test_apply_update_emits_clear_workaround_on_windows_self_lock(
     monkeypatch.setattr(
         updater.sys,
         "prefix",
-        r"C:\Users\Mack\AppData\Roaming\uv\tools\claude-lb",
+        r"C:\Users\Mack\AppData\Roaming\uv\tools\roost",
     )
     monkeypatch.setattr(updater.shutil, "which", lambda _: "/fake/uv")
 

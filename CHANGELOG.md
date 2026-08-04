@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ## [Unreleased]
 
+### Documentation
+
+- **OAuth auto-refresh finding (2026-05-11).** Empirical verification that
+  `claude` (Claude Code CLI) auto-refreshes its OAuth chain when the
+  access_token expires, writing the new chain back to the file it read from
+  (`$CLAUDE_CONFIG_DIR/.credentials.json`). This makes the snapshot pattern
+  introduced in v0.5.0 unsafe for any workload long enough to trigger a
+  refresh — the snapshot's new refresh_token diverges from the live source
+  profile's, server-side-invalidating the source. New recommended
+  trial-dispatch pattern: `CLAUDE_CONFIG_DIR=~/.claude-profiles/$(roost
+  pick)` directly against the live profile dir; let claude own the refresh
+  chain. See `docs/findings.md` §6 and the new "Trial dispatch (recommended
+  pattern)" section of the README. No code changes — the `--lease` and
+  `roost snapshot` surface remain available for sub-8h cases.
+
 ## [0.5.0] - Unreleased
 
 ### Added
@@ -197,7 +212,7 @@ child is a few milliseconds of JSON I/O at exec start and exit.
 
 ### Added
 
-- **`roost exec <cmd...>`** — pick a profile, set `AXIOM_CLAUDE_PROFILE`
+- **`roost exec <cmd...>`** — pick a profile, set `ROOST_PROFILE`
   (configurable via `--var-name`) in the child's env, exec the command,
   propagate child rc. stdin/stdout/stderr inherited so interactive children
   work unchanged. Ctrl+C forwarded on both POSIX and Windows. Key flags:
@@ -264,15 +279,15 @@ child is a few milliseconds of JSON I/O at exec start and exit.
   `uv tool install --reinstall --editable`.
 - `roost history` — read picks.log audit trail; see v0.2.0 for full flags.
 - `--json` on every command with `{data, meta}` envelope.
-- `pick --export` for shell-sourceable `AXIOM_CLAUDE_PROFILE=<name>`.
+- `pick --export` for shell-sourceable `ROOST_PROFILE=<name>`.
 - Monthly overage tracking (`usage.extra`) from `/api/oauth/usage` —
   `is_enabled`, `monthly_limit`, `used_credits`, `utilization`, `currency`.
 - `Plan` column in status table from `claudeAiOauth.subscriptionType`.
 - `probe --raw` — dump untouched `/api/oauth/usage` response body.
 - OAuth token extraction with three-shape fallback:
   `claudeAiOauth.accessToken` → `oauthAccessToken` → `accessToken`.
-- Cache at `~/.config/claude-lb/health.json` (Linux/macOS) or
-  `%APPDATA%\claude-lb\health.json` (Windows); atomic write-rename.
+- Cache at `~/.config/roost/health.json` (Linux/macOS) or
+  `%APPDATA%\roost\health.json` (Windows); atomic write-rename.
 - Pick log at `<config>/picks.log` (tab-separated, 10 MB rotation).
 - Shell completion via `--install-completion`.
 - Semantic exit codes 0–9 (Forma Protocol §4).

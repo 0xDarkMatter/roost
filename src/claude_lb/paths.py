@@ -3,19 +3,49 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 from platformdirs import user_config_dir
 
-APP_NAME = "claude-lb"
+APP_NAME = "roost"
+# Pre-rename app name. roost was formerly "claude-lb"; we relocate the old
+# config dir on first resolution so existing cache/picks.log/leases survive.
+_LEGACY_APP_NAME = "claude-lb"
+_migration_attempted = False
+
+
+def _migrate_legacy_config(legacy: Path, new_dir: Path) -> bool:
+    """Move a pre-rename config dir into place. Returns True iff a move ran.
+
+    No-op when the new dir already exists (already migrated / fresh install
+    under the new name), when the old dir is missing, or when the two resolve
+    to the same path (e.g. a custom override). Best-effort: the caller swallows
+    OSErrors, since a fresh empty config is an acceptable fallback.
+    """
+    if new_dir.exists() or legacy == new_dir or not legacy.is_dir():
+        return False
+    new_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(legacy), str(new_dir))
+    return True
 
 
 def config_dir() -> Path:
-    """Return ~/.config/claude-lb (Linux/macOS) or %APPDATA%/claude-lb (Windows).
+    """Return ~/.config/roost (Linux/macOS) or %APPDATA%/roost (Windows).
 
-    Respects $XDG_CONFIG_HOME on Linux/macOS via platformdirs.
+    Respects $XDG_CONFIG_HOME on Linux/macOS via platformdirs. On first call
+    per process, migrates the pre-rename ~/.config/claude-lb dir if present.
     """
-    return Path(user_config_dir(APP_NAME, appauthor=False, roaming=True))
+    new_dir = Path(user_config_dir(APP_NAME, appauthor=False, roaming=True))
+    global _migration_attempted
+    if not _migration_attempted:
+        _migration_attempted = True
+        legacy = Path(user_config_dir(_LEGACY_APP_NAME, appauthor=False, roaming=True))
+        try:
+            _migrate_legacy_config(legacy, new_dir)
+        except OSError:
+            pass
+    return new_dir
 
 
 def cache_path() -> Path:

@@ -59,7 +59,7 @@ Every other tool in this space (CLIProxyAPI, TeamClaude, vibeproxy, CCS) treats 
 
 ### 2. Cross-platform paths
 
-Windows config dir is `%APPDATA%\claude-lb\` not `~/.config/claude-lb/`. Use `platformdirs` (add to deps) or `pathlib.Path.home() / ...` with os-sniffing — either is fine, just pick one and document.
+Windows config dir is `%APPDATA%\roost\` not `~/.config/roost/`. Use `platformdirs` (add to deps) or `pathlib.Path.home() / ...` with os-sniffing — either is fine, just pick one and document.
 
 Credentials discovery path on Windows: `C:\Users\<user>\.claude-profiles\<name>\.credentials.json`. On Linux: `~/.claude-profiles/<name>/.credentials.json`. Both should work via `Path.home() / ".claude-profiles"`.
 

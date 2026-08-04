@@ -26,6 +26,7 @@ from .output import (
     render_status_table,
     stderr,
 )
+from .term import Term, emit_panel
 from .pick import (
     PickFailureReason,
     Strategy,
@@ -47,7 +48,7 @@ from .refresh import refresh_many_sync
 from .updater import apply_result_to_dict, apply_update, check_for_update, status_to_dict
 
 app = typer.Typer(
-    name="claude-lb",
+    name="roost",
     help="Pick the healthiest Claude Code Max profile — health taxonomy + load balancer.",
     no_args_is_help=True,
     # Typer adds `--install-completion` / `--show-completion` here for free.
@@ -170,12 +171,12 @@ REASON_MESSAGES: dict[PickFailureReason, str] = {
         "No authenticated profiles. Run: claude login --profile <name>"
     ),
     PickFailureReason.ALL_AUTH_EXPIRED: (
-        "All access tokens expired. Run: claude-lb refresh --expired"
+        "All access tokens expired. Run: roost refresh --expired"
     ),
     PickFailureReason.ALL_WEEKLY: "All profiles weekly-exhausted.",
     PickFailureReason.ALL_THROTTLED: "All profiles throttled.",
-    PickFailureReason.ALL_TERMINAL: "No profiles available. Run: claude-lb status",
-    PickFailureReason.REQUIRE_OK_NONE: "No profiles currently ok. Run: claude-lb probe",
+    PickFailureReason.ALL_TERMINAL: "No profiles available. Run: roost status",
+    PickFailureReason.REQUIRE_OK_NONE: "No profiles currently ok. Run: roost probe",
 }
 
 
@@ -326,7 +327,7 @@ def _attempt_auto_refresh(cache: HealthCache, names: list[str]) -> HealthCache:
 
 def _version_callback(value: bool) -> None:
     if value:
-        emit_text(f"claude-lb {__version__}")
+        emit_text(f"roost {__version__}")
         raise typer.Exit(EXIT_SUCCESS)
 
 
@@ -347,7 +348,7 @@ def main(
         typer.Option("--verbose", "-v", help="Enable debug logging to stderr."),
     ] = False,
 ) -> None:
-    """claude-lb — pick the healthiest Claude Code Max profile."""
+    """roost — pick the healthiest Claude Code Max profile."""
     _setup_logging(verbose)
 
 
@@ -670,8 +671,8 @@ def profiles_pick(
     ] = False,
     var_name: Annotated[
         str,
-        typer.Option("--var-name", help="Var name for --export (default AXIOM_CLAUDE_PROFILE)."),
-    ] = "AXIOM_CLAUDE_PROFILE",
+        typer.Option("--var-name", help="Var name for --export (default ROOST_PROFILE)."),
+    ] = "ROOST_PROFILE",
     json_output: Annotated[bool, typer.Option("--json")] = False,
     no_cache: Annotated[bool, typer.Option("--no-cache")] = False,
     max_age: Annotated[int | None, typer.Option("--max-age")] = None,
@@ -961,7 +962,7 @@ def top_pick(
     stickiness: Annotated[int | None, typer.Option("--stickiness")] = None,
     require_ok: Annotated[bool, typer.Option("--require-ok")] = False,
     export: Annotated[bool, typer.Option("--export")] = False,
-    var_name: Annotated[str, typer.Option("--var-name")] = "AXIOM_CLAUDE_PROFILE",
+    var_name: Annotated[str, typer.Option("--var-name")] = "ROOST_PROFILE",
     json_output: Annotated[bool, typer.Option("--json")] = False,
     no_cache: Annotated[bool, typer.Option("--no-cache")] = False,
     max_age: Annotated[int | None, typer.Option("--max-age")] = None,
@@ -1239,7 +1240,7 @@ def profiles_refresh(
                 "Refresh profiles expiring within this window: '30m', '1h', "
                 "'2d', '1w', or seconds. Includes already-expired tokens. "
                 "Cron-friendly anticipatory refresh: */15 * * * * "
-                "claude-lb refresh --soon 30m --json"
+                "roost refresh --soon 30m --json"
             ),
         ),
     ] = None,
@@ -1456,9 +1457,9 @@ def exec_cmd(
         str,
         typer.Option(
             "--var-name",
-            help="Env var name set to the picked profile (default AXIOM_CLAUDE_PROFILE).",
+            help="Env var name set to the picked profile (default ROOST_PROFILE).",
         ),
-    ] = "AXIOM_CLAUDE_PROFILE",
+    ] = "ROOST_PROFILE",
     retry_on_429: Annotated[
         int,
         typer.Option(
@@ -1528,14 +1529,14 @@ def exec_cmd(
         ),
     ] = "",
 ) -> None:
-    """Pick a profile, run a child command with AXIOM_CLAUDE_PROFILE set.
+    """Pick a profile, run a child command with ROOST_PROFILE set.
 
     Everything after the last flag is passed to the child. Use `--` to
-    disambiguate child flags from claude-lb's own flags:
+    disambiguate child flags from roost's own flags:
 
-        claude-lb exec --auto-refresh -- claude --dangerously-skip-permissions <args>
+        roost exec --auto-refresh -- claude --dangerously-skip-permissions <args>
 
-    claude-lb's exit code equals the child's exit code, so scripts can
+    roost's exit code equals the child's exit code, so scripts can
     treat this as a transparent wrapper. Picks are audited to picks.log
     with rc + duration for post-hoc investigation.
     """
@@ -1548,7 +1549,7 @@ def exec_cmd(
     if not argv:
         stderr.print(
             "[red]exec requires a command.[/red] "
-            "Example: claude-lb exec -- claude --help"
+            "Example: roost exec -- claude --help"
         )
         raise typer.Exit(EXIT_VALIDATION)
 
@@ -1713,10 +1714,10 @@ def add(
     Typical onboarding:
 
         claude login                # populates ~/.claude/.credentials.json
-        claude-lb add personal      # imports it as 'personal'
+        roost add personal      # imports it as 'personal'
         claude logout && claude login   # sign in to a different account
-        claude-lb add work          # imports the new state as 'work'
-        claude-lb status            # both visible, ready to balance
+        roost add work          # imports the new state as 'work'
+        roost status            # both visible, ready to balance
 
     Source file is copied (not moved) so the standard `claude` CLI keeps
     working unchanged. Profile name must match the discovery regex
@@ -1822,7 +1823,7 @@ def add(
         f"[green]added[/green] profile {name!r} → {dest}"
     )
     stderr.print(
-        "  next: claude-lb probe " + name + "  (or `claude-lb status` to see all)"
+        "  next: roost probe " + name + "  (or `roost status` to see all)"
     )
 
 
@@ -1909,7 +1910,7 @@ def remove(
 ) -> None:
     """Delete a profile directory + its cache entry.
 
-    Symmetric counterpart to `claude-lb add`. The profile directory under
+    Symmetric counterpart to `roost add`. The profile directory under
     ~/.claude-profiles/<name>/ is recursively removed; the health cache entry
     is invalidated; and last-pick.json is cleared if it pointed at this
     profile. The original credentials at ~/.claude/.credentials.json (the
@@ -1982,7 +1983,7 @@ def _do_rename(
         f"[green]renamed[/green] {old!r} → {new!r} ({result.path})"
     )
     stderr.print(
-        f"  next: claude-lb probe {new}  (re-classify health under the new name)"
+        f"  next: roost probe {new}  (re-classify health under the new name)"
     )
 
 
@@ -2596,7 +2597,7 @@ def report(
     """Aggregate `<config>/usage-log.ndjson` into per-profile metric summaries.
 
     Requires usage logging to be enabled (off by default — see
-    `claude-lb config usage-log on`). Reports min/max/avg/latest per profile
+    `roost config usage-log on`). Reports min/max/avg/latest per profile
     for the chosen metric, optionally rendering a Unicode sparkline of the
     time-series and a linear burn-rate projection.
     """
@@ -2635,7 +2636,7 @@ def report(
         # block, just warn.
         stderr.print(
             "[yellow]usage logging is off[/yellow] — "
-            "enable with `claude-lb config usage-log on` "
+            "enable with `roost config usage-log on` "
             "for fresh data going forward."
         )
 
@@ -2827,13 +2828,13 @@ def shellinit(
     Designed to be evaluated into the user's shell rc:
 
         # bash/zsh
-        eval "$(claude-lb shellinit)"
+        eval "$(roost shellinit)"
 
         # fish
-        claude-lb shellinit | source
+        roost shellinit | source
 
         # PowerShell
-        claude-lb shellinit | Out-String | Invoke-Expression
+        roost shellinit | Out-String | Invoke-Expression
 
     Once installed, every `claude` invocation routes through `roost exec
     --auto-refresh -- claude ...` — so profile selection, auth refresh, and
@@ -3022,8 +3023,8 @@ def top(
     """Live-refreshing status table. Ctrl+C to exit.
 
     Reads the cache on every tick; if a profile's entry is stale, the next
-    tick re-probes it (same logic as `claude-lb status`). For one-shot
-    snapshots, use `claude-lb status` — `top` is for "leave on a side
+    tick re-probes it (same logic as `roost status`). For one-shot
+    snapshots, use `roost status` — `top` is for "leave on a side
     monitor" workflows, especially during incidents.
     """
     from .top import run_live
@@ -3058,22 +3059,38 @@ def doctor(
         if not report.all_passed:
             raise typer.Exit(EXIT_ERROR)
         return
-    stderr.print(f"[bold]claude-lb doctor[/bold] (v{report.version})")
+    t = Term()
+    failed = [c.name for c in report.checks if not c.passed]
+    warned = [c for c in report.checks if c.passed and c.extra.get("warning")]
+    lines: list[str] = [
+        t.panel_open("roost", "roost · doctor", indicator=f"v{report.version}"),
+        t.vert(),
+    ]
     for check in report.checks:
         # WARN: passed but flagged a non-fatal concern (e.g. profiles without
         # refresh tokens — valid setup, just won't auto-heal).
         if check.passed and check.extra.get("warning"):
-            mark = "[yellow]WARN[/yellow]"
+            state = "warn"
         elif check.passed:
-            mark = "[green]OK[/green]"
+            state = "ok"
         else:
-            mark = "[red]FAIL[/red]"
-        stderr.print(f"  {mark}  {check.name}: {check.detail}")
-    if report.all_passed:
-        stderr.print("[green]All checks passed.[/green]")
+            state = "fail"
+        lines.append(t.check_row(state, check.name, check.detail))
+        # A failure is exactly when the operator needs the full remediation
+        # text — surface it untruncated as a red alert sub-row rather than
+        # losing it to the leaf-row width budget.
+        if state == "fail":
+            lines.append(t.alert_panel("critical", check.detail))
+    lines.append(t.vert())
+    if failed:
+        footer = t.health("critical", f"{len(failed)} failed")
+    elif warned:
+        footer = t.health("warning", f"{len(warned)} warning(s)")
     else:
-        failed = [c.name for c in report.checks if not c.passed]
-        stderr.print(f"[red]{len(failed)} check(s) failed:[/red] {', '.join(failed)}")
+        footer = t.health("healthy", "all clear")
+    lines.append(t.panel_close(left_text="roost doctor --json", right_text=footer))
+    emit_panel(lines)
+    if failed:
         raise typer.Exit(EXIT_ERROR)
 
 
@@ -3136,7 +3153,7 @@ def update(
     if json_output:
         emit_json(status_to_dict(status))
         return
-    stderr.print(f"[bold]claude-lb[/bold] {status.current_version}")
+    stderr.print(f"[bold]roost[/bold] {status.current_version}")
     if status.install_dir:  # pragma: no branch  -- check_for_update almost always finds the install dir
         stderr.print(f"  install: {status.install_dir}")
     if status.is_git_repo and status.local_commit:
