@@ -157,11 +157,16 @@ _STYLE = (
     ".rw-pick{font-size:11px;color:var(--rw-muted)}"
     ".rw-pick b{color:var(--rw-text);font-weight:600}"
     ".rw-mark{width:15px;height:15px;flex:none;color:#D97757}"
+    # Two invisible sections: profiles centred on the left, Anthropic's own
+    # status on the right. No rule between them — the gap does the separating.
     ".rw-cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,auto);"
-    "gap:10px 20px;align-items:start}"
-    "@media (max-width:560px){.rw-cols{grid-template-columns:minmax(0,1fr)}}"
-    ".rw-col-r{display:flex;flex-direction:column;gap:3px;min-width:180px}"
-    ".rw-rings{display:flex;flex-wrap:wrap;gap:12px;padding-top:2px}"
+    "gap:12px 24px;align-items:center}"
+    "@media (max-width:560px){.rw-cols{grid-template-columns:minmax(0,1fr)}"
+    ".rw-col-r{align-items:flex-start}}"
+    ".rw-col-l{display:flex;justify-content:center}"
+    ".rw-col-r{display:flex;flex-direction:column;gap:2px;min-width:190px}"
+    ".rw-rings{display:flex;flex-wrap:wrap;justify-content:center;gap:14px;"
+    "padding-top:2px}"
     ".rw-ringbox{display:flex;flex-direction:column;align-items:center;gap:2px;"
     "min-width:56px}"
     ".rw-ring{width:46px;height:46px;display:block}"
@@ -183,6 +188,17 @@ _STYLE = (
     "margin-top:3px;max-width:200px}"
     ".rw-day{display:block;width:100%;aspect-ratio:1;border-radius:1.5px;"
     "min-height:6px}"
+    # Per-card stat chips + trend strip, in the ff-monitor idiom: a compact
+    # metric row and a bar strip rather than prose.
+    ".rw-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;"
+    "font-size:10px;color:var(--rw-muted);border-top:1px solid var(--rw-border);"
+    "padding-top:6px;margin-top:1px}"
+    ".rw-stats b{display:block;color:var(--rw-text);font-weight:500;"
+    "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace;font-size:11px}"
+    ".rw-spark{display:flex;align-items:flex-end;gap:1px;height:16px;"
+    "margin-top:5px}"
+    ".rw-spark i{flex:1;min-width:1px;border-radius:1px;display:block;"
+    "background:var(--rw-idle)}"
     "</style>"
 )
 
@@ -215,6 +231,7 @@ def render_widget(
     *,
     max_bytes: int = 28_672,
     recommended: dict[str, Any] | None = None,
+    stats: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """Render the capacity-card page for `roost widget`.
 
@@ -239,11 +256,11 @@ def render_widget(
     working = [p for p in (profiles or []) if isinstance(p, dict)]
     original_count = len(working)
 
-    html = _render(working, meta, recommended)
+    html = _render(working, meta, recommended, stats)
     while len(html.encode("utf-8")) > max_bytes and working:
         working = sorted(working, key=_probed_sort_key)
         working.pop(0)
-        html = _render(working, meta, recommended)
+        html = _render(working, meta, recommended, stats)
 
     dropped = original_count - len(working)
     if dropped:
@@ -273,9 +290,12 @@ def _render(
     profiles: list[dict[str, Any]],
     meta: dict[str, Any],
     recommended: dict[str, Any] | None = None,
+    stats: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     now = datetime.now(UTC)
-    cards = "".join(_render_card(p, now) for p in profiles)
+    cards = "".join(
+        _render_card(p, now, (stats or {}).get(str(p.get("name")))) for p in profiles
+    )
     if cards:
         grid = f'<div class="rw-grid">{cards}</div>'
     else:
@@ -563,7 +583,11 @@ def _clip(text: object, limit: int = _INCIDENT_MAX_CHARS) -> str:
     return value[: limit - 1].rstrip() + "…"
 
 
-def _render_card(profile: dict[str, Any], now: datetime) -> str:
+def _render_card(
+    profile: dict[str, Any],
+    now: datetime,
+    stats: dict[str, Any] | None = None,
+) -> str:
     name = profile.get("name") or "unknown"
     health = profile.get("health") or "unknown"
     plan = profile.get("subscription_type")
@@ -589,9 +613,64 @@ def _render_card(profile: dict[str, Any], now: datetime) -> str:
         '<div class="rw-card">'
         f"{_render_header(name, health, plan)}"
         f'<div class="rw-gauges">{"".join(gauges)}</div>'
+        f"{_render_stats(stats)}"
         f"{_render_footer(profile, now, session_pct, weekly_pct, fable_pct, fable_limit)}"
         "</div>"
     )
+
+
+def _render_stats(stats: dict[str, Any] | None) -> str:
+    """Dispatch history + capacity trend for one profile.
+
+    Everything here comes from roost's own logs, not the usage API: `picks`
+    and `execs` from picks.log (the audit trail every pick and exec writes),
+    `eta` from the opt-in usage-log's linear burn-rate projection. The API
+    itself reports no tokens and no turns, so there is deliberately nothing
+    resembling a token count here — inventing one would be worse than the
+    blank space it fills.
+
+    Absent stats render nothing at all rather than a row of zeros: the usage
+    log is opt-in and off by default, and "0" would misread as "never
+    dispatched" instead of "not recorded".
+    """
+    if not isinstance(stats, dict) or not stats:
+        return ""
+    cells = []
+    picks = stats.get("picks")
+    if isinstance(picks, int):
+        cells.append(f"<span>Picks<b>{picks:,}</b></span>")
+    execs = stats.get("execs")
+    if isinstance(execs, int) and execs:
+        cells.append(f"<span>Execs<b>{execs:,}</b></span>")
+    eta = stats.get("eta")
+    if isinstance(eta, str) and eta:
+        cells.append(f"<span>Full in<b>{_esc(eta)}</b></span>")
+    row = f'<div class="rw-stats">{"".join(cells)}</div>' if cells else ""
+    return f"{row}{_render_spark(stats.get('trend'))}"
+
+
+def _render_spark(trend: Any) -> str:
+    """Bar strip of a profile's weekly-usage history, ff-monitor style.
+
+    Heights are scaled against 100% rather than the series' own max, so two
+    cards are directly comparable — a self-scaled strip would make a profile
+    idling at 3% look identical to one at 90%.
+    """
+    if not isinstance(trend, list) or len(trend) < 2:
+        return ""
+    bars = []
+    for value in trend[-28:]:
+        try:
+            pct = max(0.0, min(100.0, float(value)))
+        except (TypeError, ValueError):
+            continue
+        height = max(6.0, pct)
+        bars.append(
+            f'<i style="height:{height:.0f}%;background:{_severity_color(pct)}"></i>'
+        )
+    if not bars:
+        return ""
+    return f'<div class="rw-spark">{"".join(bars)}</div>'
 
 
 def _render_header(name: str, health: str, plan: object) -> str:
