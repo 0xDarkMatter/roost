@@ -432,38 +432,49 @@ def test_long_incident_description_is_bounded():
 # ---------------------------------------------------------------------------
 
 
-def test_square_gauges_render_three_columns_of_ten():
+def test_square_gauges_render_one_grid_per_window():
+    """Three 5x10 blocks: Session, Weekly, Fable.
+
+    Each block is ONE element painted with stacked gradients, not 50 tags.
+    Three cards' worth of real squares would be 600 elements and ~8 KB —
+    enough on its own to push the page past the inline-render budget.
+    """
     usage = _usage(session_pct=2, weekly_pct=76)
     html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
     card = html.split('<div class="rw-card">')[1]
-    stacks = re.findall(r'rw-sqstack">(.*?)</div>', card, re.S)
-    assert len(stacks) == 3, "one stack per window: Session, Weekly, Fable"
-    for stack in stacks:
-        assert stack.count("<i") == 10
+    grids = re.findall(r'rw-sqgrid" style="--p:(\d+)%', card)
+    assert len(grids) == 3
+    assert card.count("<i") == 0, "the grid is drawn, not built from tags"
 
 
-def test_square_gauge_lights_at_least_one_square_when_nonzero():
-    """2% rounds to nothing at 10%-per-square granularity.
+def test_square_gauge_lights_at_least_one_row_when_nonzero():
+    """2% rounds to nothing at 10%-per-row granularity.
 
-    An empty column beside a "2%" label reads as broken rather than as
-    nearly-empty, so a non-zero percent always lights one. The exact figure
-    is printed beneath, which is what makes the rounding safe.
+    An empty block beside a "2%" label reads as broken rather than as
+    nearly-empty. The exact figure is printed beneath, which is what makes
+    the rounding safe.
     """
     usage = _usage(session_pct=2, weekly_pct=0)
     html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
     card = html.split('<div class="rw-card">')[1]
-    stacks = re.findall(r'rw-sqstack">(.*?)</div>', card, re.S)
-    assert stacks[0].count('<i class=') == 1, "2% lights exactly one square"
-    assert stacks[1].count('<i class=') == 0, "0% lights none"
+    fills = [int(v) for v in re.findall(r'rw-sqgrid" style="--p:(\d+)%', card)]
+    assert fills[0] == 10, "2% lights exactly one row"
+    assert fills[1] == 0, "0% lights none"
 
 
-def test_square_gauge_fill_tracks_percentage():
-    usage = _usage(session_pct=50, weekly_pct=100)
+def test_square_gauge_fill_quantises_to_whole_rows():
+    """The fill boundary must land on a gap.
+
+    An unsnapped gradient slices a row of squares in half, which reads as a
+    rendering fault rather than as a value.
+    """
+    usage = _usage(session_pct=50, weekly_pct=76)
     html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
     card = html.split('<div class="rw-card">')[1]
-    stacks = re.findall(r'rw-sqstack">(.*?)</div>', card, re.S)
-    assert stacks[0].count('<i class=') == 5
-    assert stacks[1].count('<i class=') == 10
+    fills = [int(v) for v in re.findall(r'rw-sqgrid" style="--p:(\d+)%', card)]
+    assert fills[0] == 50
+    assert fills[1] == 80, "76% snaps to the nearest whole row"
+    assert all(f % 10 == 0 for f in fills), "every fill lands on a row edge"
 
 
 def test_view_toggle_is_css_only_no_script():

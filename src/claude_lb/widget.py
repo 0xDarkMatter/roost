@@ -187,10 +187,32 @@ _STYLE = (
     "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace}"
     ".rw-ringwin{font-size:9px;color:var(--rw-muted)}"
     # Component rows + incident grid (right column).
-    ".rw-comprow{display:flex;flex-direction:column;gap:2px;margin-bottom:5px}"
-    ".rw-cstrip{display:flex;gap:1px;height:9px;padding-left:12px}"
+    # Service list + ONE shared history strip that swaps on rollover. All
+    # strips occupy the same grid cell (grid-area 1/1) and are hidden except
+    # the hovered one, so the panel never grows and never shows five strips
+    # at once. Pure CSS: :has() detects "some row is hovered" to drop the
+    # default, and a per-index sibling rule reveals the matching strip.
+    # Eight rules covers more components than Anthropic has ever listed.
+    ".rw-strips{display:grid;margin-top:4px;min-height:26px}"
+    ".rw-s{grid-area:1/1;visibility:hidden}"
+    ".rw-s:first-child{visibility:visible}"
+    ".rw-svcs:has(.rw-svc:hover) .rw-s{visibility:hidden}"
+    ".rw-svc:nth-of-type(1):hover~.rw-strips .rw-s:nth-child(1),"
+    ".rw-svc:nth-of-type(2):hover~.rw-strips .rw-s:nth-child(2),"
+    ".rw-svc:nth-of-type(3):hover~.rw-strips .rw-s:nth-child(3),"
+    ".rw-svc:nth-of-type(4):hover~.rw-strips .rw-s:nth-child(4),"
+    ".rw-svc:nth-of-type(5):hover~.rw-strips .rw-s:nth-child(5),"
+    ".rw-svc:nth-of-type(6):hover~.rw-strips .rw-s:nth-child(6),"
+    ".rw-svc:nth-of-type(7):hover~.rw-strips .rw-s:nth-child(7),"
+    ".rw-svc:nth-of-type(8):hover~.rw-strips .rw-s:nth-child(8)"
+    "{visibility:visible}"
+    ".rw-svc{cursor:default;border-radius:3px}"
+    ".rw-svc:hover{background:var(--rw-track)}"
+    ".rw-scap{font-size:9px;color:var(--rw-muted);display:block;"
+    "margin-bottom:2px}"
+    ".rw-cstrip{display:flex;gap:1px;height:10px}"
     ".rw-cstrip i{flex:1;min-width:1px;border-radius:1px;display:block;"
-    "opacity:.85}"
+    "opacity:.9}"
     ".rw-comp{display:flex;align-items:center;gap:6px;font-size:10px;"
     "color:var(--rw-muted);line-height:1.5}"
     ".rw-cdot{width:6px;height:6px;border-radius:1.5px;flex:none}"
@@ -203,13 +225,21 @@ _STYLE = (
     "padding-top:6px;margin-top:1px}"
     ".rw-stats b{display:block;color:var(--rw-text);font-weight:500;"
     "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace;font-size:11px}"
-    # Square-grid gauges: one vertical stack per window, filling bottom-up.
-    ".rw-squares{display:none;gap:14px;justify-content:space-around;"
+    # Square-grid gauges. The 5x10 block of squares is drawn with THREE
+    # stacked gradients on a single element, not 50 <i> tags: two repeating
+    # gradients paint the card-coloured gaps that separate the squares, and
+    # one linear gradient underneath fills bottom-up to --p. Three cards'
+    # worth of real elements would have been 600 tags and roughly 8 KB —
+    # enough on its own to push the page past the budget that decides
+    # whether it renders inline. The gaps must be listed BEFORE the fill so
+    # they paint over it.
+    ".rw-squares{display:none;gap:16px;justify-content:space-around;"
     "padding:2px 0 1px}"
-    ".rw-sqcol{display:flex;flex-direction:column;align-items:center;gap:4px}"
-    ".rw-sqstack{display:flex;flex-direction:column-reverse;gap:2px}"
-    ".rw-sqstack i{width:16px;height:7px;border-radius:1.5px;display:block;"
-    "background:var(--rw-track)}"
+    ".rw-sqcol{display:flex;flex-direction:column;align-items:center;gap:5px}"
+    ".rw-sqgrid{width:43px;height:88px;background-image:"
+    "repeating-linear-gradient(to right,transparent 0 7px,var(--rw-card) 7px 9px),"
+    "repeating-linear-gradient(to bottom,transparent 0 7px,var(--rw-card) 7px 9px),"
+    "linear-gradient(to top,var(--f) var(--p),var(--rw-track) var(--p))}"
     ".rw-sqlabel{font-size:10px;color:var(--rw-muted)}"
     ".rw-sqval{font-size:11px;font-weight:500;"
     "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace}"
@@ -523,7 +553,8 @@ def _render_platform_panel(meta: dict[str, Any]) -> str:
 
     components = platform.get("components")
     if isinstance(components, list) and components:
-        rows = [_incident_window_label(platform)]
+        rows: list[str] = []
+        strips: list[str] = []
         for component in components[:5]:
             if not isinstance(component, dict):
                 continue
@@ -543,17 +574,22 @@ def _render_platform_panel(meta: dict[str, Any]) -> str:
             )
             raw_name = str(component.get("name") or "")
             rows.append(
-                '<div class="rw-comprow">'
-                f'<div class="rw-comp" title="{_esc(name)}: '
+                f'<div class="rw-svc rw-comp" title="{_esc(name)}: '
                 f'{_esc(state.replace("_", " "))}">'
                 f'<span class="rw-cdot" style="background:{colour}"></span>'
                 f'<span class="rw-cname">{_esc(name)}</span>'
                 f"{label}</div>"
-                f"{_component_strip(platform, raw_name)}"
-                "</div>"
+            )
+            strip = _component_strip(platform, raw_name)
+            strips.append(
+                f'<div class="rw-s"><span class="rw-scap">{_esc(name)} · '
+                f'{_esc(_incident_window_text(platform))}</span>{strip}</div>'
             )
         if rows:
-            blocks.append("".join(rows))
+            blocks.append(
+                f'<div class="rw-svcs">{"".join(rows)}'
+                f'<div class="rw-strips">{"".join(strips)}</div></div>'
+            )
 
     # No fleet-wide grid: with a strip under every component it would repeat
     # the same days in aggregate, and one noisy service would colour every
@@ -608,10 +644,10 @@ def _component_strip(platform: dict[str, Any], component: str) -> str:
 _STRIP_DAYS = 45
 
 
-def _incident_window_label(platform: dict[str, Any]) -> str:
-    """Names what the per-component strips actually cover.
+def _incident_window_text(platform: dict[str, Any]) -> str:
+    """Names what a strip actually covers.
 
-    Deliberately says "Incidents", never "uptime". Statuspage's public API
+    Deliberately says "incidents", never "uptime". Statuspage's public API
     exposes incident records, not uptime measurements — a day with nothing
     reported is a weaker claim than "100% up", and the percentage on their
     own status page is computed from data this API does not expose.
@@ -624,8 +660,8 @@ def _incident_window_label(platform: dict[str, Any]) -> str:
     """
     span = platform.get("history_days")
     if not isinstance(span, int) or span <= 0:
-        return '<div class="rw-gridlabel">Incidents · recent</div>'
-    return f'<div class="rw-gridlabel">Incidents · last {span} days</div>'
+        return "recent incidents"
+    return f"incidents, last {span} days"
 
 
 def _platform_summary(meta: dict[str, Any]) -> str:
@@ -722,7 +758,11 @@ def _render_card(
     )
 
 
-_SQUARES_PER_COLUMN = 10
+# 5 columns x 10 rows = 50 squares per window. The fill quantises to whole
+# rows, so the granularity is 10% even though 50 squares are drawn — the
+# density is for legibility at a glance, and the exact figure is printed
+# beneath, which is what keeps the rounding honest.
+_GRID_ROWS = 10
 
 
 def _gauge_column(label: str, pct: float | None) -> str:
@@ -738,23 +778,22 @@ def _gauge_column(label: str, pct: float | None) -> str:
     of the range by a few points is the lesser error, and only there.
     """
     if pct is None:
-        filled = 0
+        rows_filled = 0
         colour = _SEVERITY_GREY
-        cls = "c-n"
     else:
         clamped = max(0.0, min(100.0, pct))
-        filled = round(clamped / (100 / _SQUARES_PER_COLUMN))
+        rows_filled = round(clamped / (100 / _GRID_ROWS))
         if clamped > 0:
-            filled = max(1, filled)
+            rows_filled = max(1, rows_filled)
         colour = _severity_color(clamped)
-        cls = _severity_class(clamped)
-    cells = "".join(
-        f'<i class="{cls}"></i>' if i < filled else "<i></i>"
-        for i in range(_SQUARES_PER_COLUMN)
-    )
+    # Quantised to whole rows so the fill boundary always lands on a gap.
+    # An unsnapped gradient would slice a row of squares in half, which reads
+    # as a rendering fault rather than as a value.
+    fill_pct = rows_filled * (100 // _GRID_ROWS)
     return (
         '<div class="rw-sqcol">'
-        f'<div class="rw-sqstack">{cells}</div>'
+        f'<div class="rw-sqgrid" style="--p:{fill_pct}%;--f:{colour}" '
+        f'role="img" aria-label="{_esc(label)} {_fmt_pct(pct)} used"></div>'
         f'<span class="rw-sqlabel">{_esc(label)}</span>'
         f'<b class="rw-sqval" style="color:{colour}">{_fmt_pct(pct)}</b>'
         "</div>"
@@ -862,15 +901,6 @@ def _severity_color(pct: float) -> str:
     if pct >= 60:
         return _SEVERITY_AMBER
     return _SEVERITY_GREEN
-
-
-def _severity_class(pct: float) -> str:
-    """Class-name twin of `_severity_color`, for high-element-count grids."""
-    if pct >= 85:
-        return "c-r"
-    if pct >= 60:
-        return "c-o"
-    return "c-g"
 
 
 _IMPACT_CLASSES = {
