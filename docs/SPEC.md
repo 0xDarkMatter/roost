@@ -71,7 +71,7 @@ Single resource: `profiles`. For convenience, top-level aliases collapse the res
 | `roost profiles invalidate <name>` | `roost invalidate <name>` | Drop cache for a profile; forces re-probe |
 | `roost profiles refresh [<name>\|--all\|--expired]` | `roost refresh ...` | Refresh OAuth tokens (§10) |
 | `roost exec <cmd...>` | — | Pick a profile, run a child command with `ROOST_PROFILE` set; propagate child rc |
-| `roost widget` | — | Self-contained HTML capacity cards on stdout for Claude Code's `show_widget` tool; `--max-kb` sets the byte budget (default 28) |
+| `roost widget` | — | Self-contained HTML fleet dashboard on stdout for Claude Code's `show_widget` tool. Header (per-profile capacity rings, current read-only recommendation, Claude Status panel with per-service incident calendars) above per-profile capacity cards. `--max-kb` sets the byte budget (default 28); over budget it sheds render detail before it drops a profile card |
 | `roost doctor` | — | Diagnose local setup (§11) |
 | `roost update [--apply]` | — | Check or apply an in-place upgrade |
 | `roost --version` | — | Print semver, exit 0 |

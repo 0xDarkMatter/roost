@@ -326,9 +326,33 @@ Overage bars) to stderr instead of the table — same data, denser per-profile v
 `roost widget` renders the same data as a single self-contained HTML fragment on
 **stdout**, sized for Claude Code's `show_widget` tool: no `<script>` tag at all, no
 CDN script or stylesheet, no webfont, no outbound request of any kind — the tool
-renders it behind a strict CSP that blocks all of them. `render_widget()` enforces a
-hard byte budget (`--max-kb`, default 28 KiB) by dropping the least-recently-probed
-profiles until the page fits, warning on stderr if anything was dropped.
+renders it behind a strict CSP that blocks all of them.
+
+The page is a fleet dashboard header above a grid of per-profile cards:
+
+| Element | What it shows |
+|---------|---------------|
+| **Header** | Profile counts, the profile `pick` would currently return, and a concentric ring per profile — outer arc Weekly, inner arc Fable |
+| **Claude Status panel** | Live component states from status.claude.com, beside a per-service incident calendar. Hover a service to swap the calendar to that service's history |
+| **Profile card** | Session / Weekly / Fable / Overage as bars or as 10×10 square grids, each with its own absolute reset time, plus dispatch stats from roost's own logs |
+| **Bars / Grid toggle** | Switches every card between the two gauge styles. Pure CSS — a hidden checkbox and a sibling selector, so the page keeps its no-`<script>` guarantee |
+
+The recommendation in the header uses **`which` semantics**: it runs the pick
+algorithm without writing `picks.log` or moving the stickiness pointer, so
+rendering a dashboard never changes which profile your next dispatch gets.
+
+The incident calendar is labelled **incidents**, never *uptime*. Statuspage's
+public API exposes incident records, not uptime measurements, and it returns
+only the most recent ~50 incidents — so the window is read from the response
+(currently ~29 days) rather than assumed. A day with nothing reported is
+"no incident reported", which is a weaker claim than "100% up".
+
+`--max-kb` (default 28) is the byte budget that decides whether `show_widget`
+renders the page inline or spools it to a file. When the page would exceed it,
+roost sheds **detail** first — the alternate gauge view, then the per-service
+history — and only drops a profile card as a last resort, warning on stderr if
+it does. A fleet overview that quietly omits an account is worse than one
+missing a nicety.
 
 ### Picking
 

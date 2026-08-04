@@ -7,6 +7,62 @@ Format: [Keep a Changelog](https://keepachangelog.com/)
 
 ### Added
 
+- **`roost widget` is a fleet dashboard, not just a card grid.** A header
+  above the profile cards carries fleet counts, the profile `pick` would
+  currently return, and a concentric ring per profile (outer arc Weekly,
+  inner arc Fable — the two windows exhaust independently, and the gap
+  between them is the point). Beside it, a **Claude Status** panel shows live
+  component states from status.claude.com next to a per-service incident
+  calendar; hovering a service swaps the calendar to that service's history.
+  The recommendation uses `which` semantics — it runs the pick algorithm
+  without writing `picks.log` or moving the stickiness pointer, so rendering
+  a dashboard never changes which profile the next dispatch gets.
+- **Bars / Grid toggle**, switching every card between horizontal bars and
+  10×10 square grids. Implemented with a hidden checkbox and sibling
+  selectors — no JavaScript, so the page keeps its "no `<script>` at all"
+  property, which is what makes the ban on `alert`/`confirm`/`prompt`
+  structural rather than conventional.
+- **Per-component incident history** (`PlatformStatus.component_days`),
+  derived from the incidents payload already fetched — no extra request.
+  Each series carries the same dates, order and length as the fleet-wide
+  `incident_days`, so parallel grids need no alignment logic.
+
+### Fixed
+
+- **The widget dropped a profile to stay under its byte budget.** A
+  four-profile fleet rendered three cards: the budget removed the
+  least-recently-probed profile — precisely the account least likely to be
+  missed — and the stderr warning was easily swallowed by a redirect.
+  `render_widget()` now steps down a detail ladder (`full` → `compact` →
+  `minimal`), shedding the alternate gauge view and then the per-service
+  calendars, and only drops a card as a last resort. A fleet overview that
+  silently omits an account is worse than one missing a nicety.
+- **Square-grid gauges rendered soft.** They had been sized fluidly with
+  percentage gradient stops, so every cell edge fell on a fractional pixel
+  and the browser antialiased all 200 of them. Geometry is now whole pixels
+  throughout, with the CSS derived from the same constants as the fill maths
+  so the two cannot drift apart.
+- **Model-scoped resets never rendered.** The CLI passes the status payload
+  in-process, where `build_status_payload` hand-formats top-level timestamps
+  to ISO strings but dumps nested `limits[]` wholesale — so a scoped limit's
+  `resets_at` arrived as a `datetime` while the widget's parser accepted only
+  strings. Every widget test fed JSON-shaped strings, so the suite stayed
+  green while the rendered card silently lost the line.
+- **Panel glyphs were mojibake on Windows.** Both stdout and stderr default
+  to the console codepage, which cannot encode the box-drawing, bullet and
+  dash characters the widget and `term.py` emit. `term.ensure_utf8()` now
+  upgrades either stream; the ASCII fallback remains for terminals that
+  genuinely cannot display Unicode.
+
+### Removed
+
+- **Exec failure rate and median exec duration from the profile cards.** Both
+  were misleading on a card whose job is "is this profile healthy?". `rc` is
+  the *child's* exit code, so a bad prompt or a Ctrl+C read as the profile
+  failing; and the samples never expired — one profile's "Failed 100%" was
+  six runs inside three minutes on a single day months earlier. Median timed
+  the command rather than the account. `Picks` and `Full in` remain.
+
 - **Model-scoped capacity (`limits[]`/`spend`) parsing and the `model_limit`
   health state.** Anthropic moved per-model usage (currently the Fable model)
   out of the `seven_day_sonnet`/`seven_day_opus` windows — now `null` on every

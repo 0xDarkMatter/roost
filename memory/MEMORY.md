@@ -38,12 +38,42 @@ worth remembering as a class of failure, not just an incident.
   Exactly one limit per profile carries it. The classifier gates on it;
   reporting must not (filtering the display makes a genuine 0% read as "no
   data"). This distinction caused a real bug — see AGENTS.md.
-- New surfaces: `roost widget` (self-contained HTML capacity cards for
+- New surfaces: `roost widget` (self-contained HTML fleet dashboard for
   `show_widget`, styled to match fleetflow's ff-monitor), `roost status
   --cards` (terminal cards via `term.py`), `report --metric fable_pct |
   spend_pct`, and a `usage_field_drift` doctor check.
-- Built via a fleetflow run (`fable`) — 7 lanes, file-disjoint, orchestrator
-  owned all `cli.py` wiring.
+- Built via a fleetflow run (`fable`) — 9 lanes, file-disjoint, orchestrator
+  owned all `cli.py` wiring. A Codex refuter lane found four real defects
+  including a dropped `model_reset_at` in a seam no lane owned.
+- **Tests: 934 mocked + 28 live.** Nothing pushed — 36 commits ahead of
+  `origin/main`.
+
+### The widget went through heavy design iteration (2026-08-04)
+
+Most of the operator's feedback was about *honesty of display*, and the
+resulting invariants are now AGENTS.md rules 33–39. The ones most likely to
+be undone by accident:
+
+- **The byte budget sheds detail before it sheds a profile** (rule 33). It
+  shipped the other way round and silently rendered three cards for a
+  four-profile fleet. Bars are the CSS default, so dropping bar markup
+  without the `rw-sq-only` class leaves cards with *no* gauges.
+- **The Bars/Grid toggle is CSS-only on purpose** (rule 34) — that is what
+  keeps "no `<script>`" structurally true. The checkbox must precede what it
+  restyles; the service rows and `.rw-strips` must stay siblings. Both break
+  silently, with no error.
+- **Square grids are gradient-painted on whole-pixel stops** (rule 35).
+  Percentages made them fluid and antialiased every edge.
+- **Exec failure rate and median were removed as misleading** (rule 37).
+  Don't re-add them without a recency window — `rc` is the child's exit code.
+
+## Standing design calls from the operator
+
+- Title case for widget labels, never uppercase micro-labels (fleetflow uses
+  uppercase; roost deliberately does not).
+- The status panel is **Claude Status**, never "Anthropic".
+- Reset times are absolute local wall-clock ("Resets Sat 2:00 PM"), relative
+  only inside the last hour. "in 144h" answers nothing.
 - **v0.3.0 highlights:** platform-status awareness — `status` and `doctor` consult `https://status.claude.com/api/v2/summary.json`, surfaced as a one-line stderr header above the `status` table when there's a non-resolved incident. Cache at `<config>/platform-status.json`, 60s TTL with stale-fallback. Shared module `src/claude_lb/platform_status.py`. AGENTS.md rule 20 codifies "best-effort, never load-bearing".
 
 ### [Unreleased] Tier 1–4 batch (2026-04-27)
