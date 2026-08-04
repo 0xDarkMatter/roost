@@ -191,9 +191,12 @@ def test_oversized_fleet_drops_profiles_and_warns():
         )
         for i in range(80)
     ]
+    # Budget must clear the fixed chrome (style block + dashboard header,
+    # ~3.5 KB) or nothing can fit and the drop path is not what is being
+    # tested — see test_budget_below_fixed_chrome_warns for that case.
     with pytest.warns(Warning, match="dropped"):
-        html = render_widget(profiles, {"count": 80, "ok": 80}, max_bytes=4_000)
-    assert len(html.encode("utf-8")) <= 4_000
+        html = render_widget(profiles, {"count": 80, "ok": 80}, max_bytes=8_000)
+    assert len(html.encode("utf-8")) <= 8_000
     # The most-recently-probed profile (agent-with-...-000) must survive the drop.
     assert "agent-with-a-fairly-long-profile-name-000" in html
 
@@ -291,3 +294,127 @@ def test_theme_is_not_hardcoded_dark():
     assert 'data-theme="light"' in html
     # Palette vars are scoped to the fragment, never leaked onto the host page.
     assert ":root{" not in html.replace(" ", "")
+
+
+# ---------------------------------------------------------------------------
+# Dashboard header
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_renders_title_and_counts():
+    html = render_widget([_profile(), _profile(name="b")], {"count": 2, "ok": 2})
+    assert "rw-head" in html
+    assert "2 profiles" in html
+    assert "2 ok" in html
+
+
+def test_dashboard_renders_recommendation():
+    html = render_widget(
+        [_profile()],
+        {"count": 1, "ok": 1},
+        recommended={"name": "evolution7", "rationale": "least-used"},
+    )
+    assert "Recommended" in html
+    assert "evolution7" in html
+    assert "least-used" in html
+
+
+def test_dashboard_reports_no_candidate_explicitly():
+    """An explicit "none" beats an absent row — the operator asked."""
+    html = render_widget(
+        [_profile(health="auth_dead")],
+        {"count": 1, "ok": 0},
+        recommended={"reason": "All profiles auth-dead."},
+    )
+    assert "Recommended" in html
+    assert "All profiles auth-dead." in html
+
+
+def test_dashboard_omits_recommendation_when_not_supplied():
+    html = render_widget([_profile()], {"count": 1, "ok": 1})
+    assert "Recommended" not in html
+
+
+def test_dashboard_ring_uses_the_binding_window_not_the_first():
+    """The ring must show the WORST window, not whichever is read first.
+
+    A profile at weekly 5% but Fable 90% has 10% of headroom, not 95%.
+    Showing the wrong one would invert the whole point of the overview.
+    """
+    usage = _usage(
+        session_pct=1,
+        weekly_pct=5,
+        limits=[
+            {
+                "kind": "weekly_scoped",
+                "percent": 90,
+                "model": "Fable",
+                "is_active": True,
+                "resets_at": _iso(datetime.now(UTC) + timedelta(days=2)),
+            }
+        ],
+    )
+    html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
+    head = html.split('<div class="rw-head">')[1].split('<div class="rw-grid">')[0]
+    assert "90%" in head
+    assert ">Fable<" in head
+
+
+def test_dashboard_ring_shows_state_not_percent_for_unhealthy():
+    """A dead profile at 5% usage is not 95% available."""
+    html = render_widget(
+        [_profile(health="auth_dead", usage=_usage(weekly_pct=5))],
+        {"count": 1, "ok": 0},
+    )
+    head = html.split('<div class="rw-head">')[1].split('<div class="rw-grid">')[0]
+    assert "5%" not in head
+
+
+def test_dashboard_ring_handles_null_usage():
+    html = render_widget([_profile(usage=None)], {"count": 1, "ok": 1})
+    assert "rw-ringbox" in html
+
+
+def test_dashboard_shows_platform_status():
+    meta = {
+        "count": 1,
+        "ok": 1,
+        "platform_status": {"indicator": "none", "description": "All Systems Operational"},
+    }
+    html = render_widget([_profile()], meta)
+    assert "Anthropic: All Systems Operational" in html
+
+
+def test_dashboard_rings_are_pure_svg_no_external_refs():
+    html = render_widget(
+        [_profile(name=f"p{i}") for i in range(4)], {"count": 4, "ok": 4}
+    )
+    # Count the markup, not the string — the CSS carries a .rw-ringbox rule.
+    assert html.count('<div class="rw-ringbox">') == 4
+    assert "<svg" in html
+    assert "http" not in html
+
+
+def test_budget_below_fixed_chrome_warns_instead_of_lying():
+    """Dropping profiles cannot shrink the style block or the header.
+
+    Silently returning an over-budget page is the failure the budget exists
+    to prevent: the caller only finds out when show_widget declines to
+    render it inline.
+    """
+    with pytest.warns(Warning, match="cannot be reduced"):
+        html = render_widget([], {"count": 0, "ok": 0}, max_bytes=1)
+    assert len(html.encode("utf-8")) > 1
+
+
+def test_long_incident_description_is_bounded():
+    """The one unbounded field in the payload cannot blow the budget."""
+    meta = {
+        "count": 1,
+        "ok": 1,
+        "platform_status": {"indicator": "major", "description": "x" * 30_000},
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        html = render_widget([_profile()], meta)
+    assert len(html.encode("utf-8")) < 28_672

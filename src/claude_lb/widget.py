@@ -35,9 +35,12 @@ from typing import Any
 # roost's cards read as the same family as the fleet monitor and the summon
 # session picker. Deliberately NOT the chat host's design tokens: this is a
 # technical/instrument register (8px corners, 1px rules, square pips,
-# uppercase micro-labels, monospace figures), and host tokens would pull it
-# toward the softer editorial look of the surrounding page. Change it here and
-# in ff-monitor.html together.
+# monospace figures), and host tokens would pull it toward the softer
+# editorial look of the surrounding page. Change it here and in
+# ff-monitor.html together.
+#
+# Labels are Title case, not the uppercase+letter-spacing ff-monitor uses for
+# its micro-labels — an explicit call from the repo owner. Keep it that way.
 #
 # Scoped to `.rw` rather than `:root` because this renders as a FRAGMENT inside
 # a host page — writing `:root` would leak roost's palette onto everything else
@@ -91,6 +94,27 @@ _STYLE = (
     ".rw-reset{font-size:10px;color:var(--rw-muted);margin-top:1px}"
     ".rw-foot{border-top:1px solid var(--rw-border);margin-top:1px;padding-top:5px;"
     "font-size:10px;color:var(--rw-muted)}"
+    # Dashboard header — the fleet-level summary that sits above the grid.
+    # Same layout doctrine as fleetflow's ff-monitor: pinned summary, cards
+    # beneath.
+    ".rw-head{background:var(--rw-card);border:1px solid var(--rw-border);"
+    "border-radius:8px;padding:10px 12px;margin:0 0 8px;display:flex;"
+    "flex-direction:column;gap:8px}"
+    ".rw-head-row{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}"
+    ".rw-title{font-size:13px;font-weight:600;letter-spacing:.01em}"
+    ".rw-counts{font-size:11px;color:var(--rw-muted)}"
+    ".rw-status{font-size:11px;color:var(--rw-muted);margin-left:auto}"
+    ".rw-pick{font-size:11px;color:var(--rw-muted)}"
+    ".rw-pick b{color:var(--rw-text);font-weight:600}"
+    ".rw-rings{display:flex;flex-wrap:wrap;gap:14px;padding-top:2px}"
+    ".rw-ringbox{display:flex;flex-direction:column;align-items:center;gap:3px;"
+    "min-width:56px}"
+    ".rw-ring{width:44px;height:44px;display:block}"
+    ".rw-ringpct{font-size:10px;font-weight:500;"
+    "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace}"
+    ".rw-ringname{font-size:10px;color:var(--rw-muted);max-width:72px;"
+    "overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+    ".rw-ringwin{font-size:9px;color:var(--rw-muted)}"
     "</style>"
 )
 
@@ -100,9 +124,10 @@ _SEVERITY_AMBER = "#BA7517"
 _SEVERITY_RED = "#E24B4A"
 _SEVERITY_GREY = "#8a8a86"
 
-# Health-state -> pip/text colour. `model_limit` isn't in the taxonomy yet
-# (see models.Health) but is named in the widget spec, so it's mapped
-# defensively for forward compat; unknown values fall back to grey.
+# Health-state -> pip/text colour. Amber for the states that clear on their
+# own once a window resets, red for the ones needing intervention. Unknown
+# values fall back to grey rather than raising — the taxonomy can gain a
+# state without this renderer being updated in the same commit.
 _HEALTH_COLORS = {
     "ok": _SEVERITY_GREEN,
     "rate_limited": _SEVERITY_AMBER,
@@ -117,14 +142,26 @@ _HEALTH_COLORS = {
 
 
 def render_widget(
-    profiles: list[dict[str, Any]], meta: dict[str, Any], *, max_bytes: int = 28_672
+    profiles: list[dict[str, Any]],
+    meta: dict[str, Any],
+    *,
+    max_bytes: int = 28_672,
+    recommended: dict[str, Any] | None = None,
 ) -> str:
     """Render the capacity-card page for `roost widget`.
 
     `profiles` mirrors `status --json`'s `data[]`; `meta` mirrors its
-    `meta` object (used for the summary header's totals and any
+    `meta` object (used for the dashboard header's totals and any
     platform-status incident line). Both are read defensively via
     `.get(...)` — see the module docstring for why.
+
+    `recommended` is what `pick` WOULD return: `{"name", "rationale"}`, or
+    `{"reason"}` when nothing is selectable. Pass `None` to omit the row
+    entirely. It is supplied by the caller rather than computed here
+    precisely so this renderer stays free of pick's machinery — and so the
+    caller is the one accountable for using read-only `which` semantics
+    (AGENTS.md rule 21). Rendering a dashboard must never move the
+    stickiness pointer or append to picks.log.
 
     Drops the least-recently-probed profiles (oldest `probed_at` first)
     until the page fits `max_bytes`, warning via `warnings.warn` if it had
@@ -134,11 +171,11 @@ def render_widget(
     working = [p for p in (profiles or []) if isinstance(p, dict)]
     original_count = len(working)
 
-    html = _render(working, meta)
+    html = _render(working, meta, recommended)
     while len(html.encode("utf-8")) > max_bytes and working:
         working = sorted(working, key=_probed_sort_key)
         working.pop(0)
-        html = _render(working, meta)
+        html = _render(working, meta, recommended)
 
     dropped = original_count - len(working)
     if dropped:
@@ -164,33 +201,153 @@ def render_widget(
     return html
 
 
-def _render(profiles: list[dict[str, Any]], meta: dict[str, Any]) -> str:
+def _render(
+    profiles: list[dict[str, Any]],
+    meta: dict[str, Any],
+    recommended: dict[str, Any] | None = None,
+) -> str:
     now = datetime.now(UTC)
     cards = "".join(_render_card(p, now) for p in profiles)
     if cards:
         grid = f'<div class="rw-grid">{cards}</div>'
     else:
         grid = '<div class="rw-empty">No profiles discovered — run <code>roost probe</code> first.</div>'
+    head = _render_dashboard(profiles, meta, recommended)
     # Everything lives inside .rw so the palette custom properties stay scoped
     # to this fragment instead of leaking onto the host page.
-    return f'{_STYLE}<div class="rw">{_render_summary(profiles, meta)}{grid}</div>'
+    return f'{_STYLE}<div class="rw">{head}{grid}</div>'
 
 
-def _render_summary(profiles: list[dict[str, Any]], meta: dict[str, Any]) -> str:
+def _binding_window(profile: dict[str, Any]) -> tuple[str, float | None]:
+    """The window closest to exhausting, i.e. what actually gates this profile.
+
+    Returns (label, percent). A fleet-level ring wants one number per profile,
+    and the honest one is the *worst* window — a profile at weekly 5% but
+    Fable 90% has 10% of headroom, not 95%. Naming the window alongside the
+    number keeps that legible rather than mysterious.
+    """
+    usage = profile.get("usage")
+    usage = usage if isinstance(usage, dict) else None
+    if usage is None:
+        return ("—", None)
+    fable_limit = _active_fable_limit(usage)
+    windows = (
+        ("Session", _as_number(usage.get("session_pct"))),
+        ("Weekly", _as_number(usage.get("weekly_pct"))),
+        ("Fable", _as_number(fable_limit.get("percent")) if fable_limit else None),
+    )
+    known = [(label, pct) for label, pct in windows if pct is not None]
+    if not known:
+        return ("—", None)
+    return max(known, key=lambda w: w[1])
+
+
+def _ring(profile: dict[str, Any]) -> str:
+    """One donut gauge: binding-window percent for a single profile.
+
+    r=15.9155 makes the circumference exactly 100, so stroke-dasharray maps
+    1:1 to percent with no arithmetic. Pure SVG — no canvas, no library, and
+    nothing that needs a network fetch the show_widget CSP would block.
+    """
+    name = str(profile.get("name") or "unknown")
+    label, pct = _binding_window(profile)
+    health = str(profile.get("health") or "unknown")
+    if pct is None:
+        colour = _SEVERITY_GREY
+        dash = 0.0
+        text = "—"
+    else:
+        colour = _severity_color(pct)
+        dash = max(0.0, min(100.0, pct))
+        text = f"{int(pct) if float(pct).is_integer() else round(pct, 1)}%"
+    # An unhealthy profile reads as its state, not as a percentage — a
+    # dead profile at 5% usage is not 95% available.
+    if health not in ("ok", "model_limit"):
+        colour = _HEALTH_COLORS.get(health, _SEVERITY_GREY)
+        text = "!"
+        dash = 100.0
+    return (
+        '<div class="rw-ringbox">'
+        '<svg class="rw-ring" viewBox="0 0 36 36" role="img" '
+        f'aria-label="{_esc(name)}: {_esc(label)} {_esc(text)}">'
+        '<circle cx="18" cy="18" r="15.9155" fill="none" '
+        'stroke="var(--rw-track)" stroke-width="3.2"/>'
+        f'<circle cx="18" cy="18" r="15.9155" fill="none" stroke="{colour}" '
+        f'stroke-width="3.2" stroke-linecap="round" '
+        f'stroke-dasharray="{dash:g} {100 - dash:g}" '
+        'transform="rotate(-90 18 18)"/>'
+        f'<text x="18" y="21" text-anchor="middle" font-size="10" '
+        f'fill="{colour}" font-family="ui-monospace,Consolas,monospace">'
+        f"{_esc(text)}</text>"
+        "</svg>"
+        f'<span class="rw-ringname" title="{_esc(name)}">{_esc(name)}</span>'
+        f'<span class="rw-ringwin">{_esc(label)}</span>'
+        "</div>"
+    )
+
+
+def _render_dashboard(
+    profiles: list[dict[str, Any]],
+    meta: dict[str, Any],
+    recommended: dict[str, Any] | None,
+) -> str:
+    """Fleet-level header: counts, platform status, recommendation, rings."""
     total = meta.get("count")
     if not isinstance(total, int):
         total = len(profiles)
     ok = meta.get("ok")
     if not isinstance(ok, int):
         ok = sum(1 for p in profiles if p.get("health") == "ok")
-    line = (
-        '<div class="rw-summary">'
-        f'<span>{total} profile{"" if total == 1 else "s"}</span>'
-        f"<span>{ok} ok</span>"
+
+    status_text = _platform_summary(meta)
+    status = f'<span class="rw-status">{_esc(status_text)}</span>' if status_text else ""
+
+    pick_row = ""
+    if recommended and recommended.get("name"):
+        why = recommended.get("rationale")
+        why_text = f' <span class="rw-ringwin">{_esc(why)}</span>' if why else ""
+        pick_row = (
+            f'<div class="rw-pick">Recommended: <b>{_esc(recommended["name"])}</b>'
+            f"{why_text}</div>"
+        )
+    elif recommended is not None:
+        # An explicit no-candidate answer is more useful than an absent row.
+        reason = recommended.get("reason") or "no profile currently selectable"
+        pick_row = f'<div class="rw-pick">Recommended: <b>none</b> — {_esc(reason)}</div>'
+
+    rings = "".join(_ring(p) for p in profiles)
+    ring_row = f'<div class="rw-rings">{rings}</div>' if rings else ""
+
+    return (
+        '<div class="rw-head">'
+        '<div class="rw-head-row">'
+        '<span class="rw-title">roost</span>'
+        f'<span class="rw-counts">{total} profile{"" if total == 1 else "s"} · '
+        f"{ok} ok</span>"
+        f"{status}"
+        "</div>"
+        f"{pick_row}{ring_row}"
         f"{_incident_line(meta)}"
         "</div>"
     )
-    return line
+
+
+def _platform_summary(meta: dict[str, Any]) -> str:
+    """One-line Anthropic platform state, or '' when it is unknown."""
+    platform_status = meta.get("platform_status")
+    if not isinstance(platform_status, dict):
+        return ""
+    description = platform_status.get("description")
+    if isinstance(description, str) and description:
+        # Bounded for the same reason _incident_line is: a long Statuspage
+        # description is the only unbounded field in the payload, and no
+        # amount of dropping profiles can claw those bytes back.
+        return f"Anthropic: {_clip(description)}"
+    indicator = platform_status.get("indicator")
+    if not indicator:
+        return ""
+    return f"Anthropic: {str(indicator).replace('_', ' ')}"
+
 
 
 def _incident_line(meta: dict[str, Any]) -> str:
@@ -201,13 +358,20 @@ def _incident_line(meta: dict[str, Any]) -> str:
     if not indicator or indicator == "none":
         return ""
     label = platform_status.get("description") or str(indicator).replace("_", " ")
-    # Bounded because it is the one unbounded field in the payload: a long
-    # Statuspage description would otherwise blow the byte budget on its own,
-    # and dropping profiles cannot claw that back.
-    label = str(label)
-    if len(label) > _INCIDENT_MAX_CHARS:
-        label = label[: _INCIDENT_MAX_CHARS - 1].rstrip() + "…"
-    return f'<span class="rw-incident">status.claude.com: {_esc(label)}</span>'
+    return f'<span class="rw-incident">status.claude.com: {_esc(_clip(label))}</span>'
+
+
+def _clip(text: object, limit: int = _INCIDENT_MAX_CHARS) -> str:
+    """Bound a free-text field from the payload.
+
+    Statuspage descriptions are the only unbounded input the renderer takes,
+    and the byte budget cannot be recovered by dropping profiles — the text
+    is in the fixed chrome.
+    """
+    value = str(text)
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "…"
 
 
 def _render_card(profile: dict[str, Any], now: datetime) -> str:

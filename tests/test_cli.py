@@ -4954,3 +4954,29 @@ def test_all_model_limit_maps_to_semantic_exit_code() -> None:
             f"{reason} falls back to the generic error code"
         )
     assert cli.REASON_TO_EXIT[PickFailureReason.ALL_MODEL_LIMIT] == cli.EXIT_UNAVAILABLE
+
+
+def test_widget_is_read_only_and_never_contaminates_pick_state(
+    profile_factory, _isolated_home: Path
+) -> None:
+    """Rendering the dashboard must not move the stickiness pointer.
+
+    The header names the profile `pick` would return, which means the widget
+    command runs the pick algorithm. If it did so through the `pick` command
+    path it would append to picks.log and rewrite last-pick.json — and merely
+    *looking* at the fleet would change which profile the next dispatch gets
+    (AGENTS.md rule 21). `pick()` itself is pure; the side effects live in the
+    CLI layer, which is exactly why this must call the function, not the
+    command.
+    """
+    profile_factory("a")
+    profile_factory("b")
+    config = _isolated_home
+
+    with patch("claude_lb.cli._load_platform_status", return_value=None):
+        result = runner.invoke(app, ["widget"])
+
+    assert result.exit_code == 0, result.output
+    assert "Recommended" in result.stdout
+    assert not (config / "picks.log").exists(), "widget wrote to the audit log"
+    assert not (config / "last-pick.json").exists(), "widget moved the sticky pointer"

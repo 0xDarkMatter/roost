@@ -616,8 +616,35 @@ def status_widget(
             payload["data"],
             payload["meta"],
             max_bytes=max_kb * 1024,
+            recommended=_recommended_profile(cache, names),
         )
     )
+
+
+def _recommended_profile(cache: HealthCache, names: list[str]) -> dict[str, Any]:
+    """What `pick` WOULD return, with `which`'s read-only guarantee.
+
+    `pick()` itself is pure — the side effects (`append_pick_log`,
+    `write_last_pick`) live here in the CLI layer, so calling it directly is
+    safe. That is the whole point: rendering a dashboard must never move the
+    stickiness pointer or write an audit entry, or merely *looking* at the
+    fleet would change which profile the next dispatch gets (AGENTS.md rule
+    21). Do not "simplify" this into a call to the pick command.
+
+    Stickiness is disabled deliberately. A sticky answer reports whatever was
+    picked last rather than what is healthiest now, which is the opposite of
+    what a fleet overview is for.
+    """
+    outcome = pick(cache, names, strategy=Strategy.LEAST_USED, stickiness_s=0)
+    if outcome.chosen is not None:
+        return {"name": outcome.chosen.name, "rationale": outcome.rationale}
+    return {
+        "reason": REASON_MESSAGES.get(
+            outcome.reason, "no profile currently selectable"
+        )
+        if outcome.reason is not None
+        else "no profile currently selectable"
+    }
 
 
 # ---------------------------------------------------------------------------
