@@ -9,12 +9,13 @@ from pydantic import BaseModel, Field
 
 
 class Health(str, Enum):
-    """Eight-state health taxonomy (SPEC §6)."""
+    """Nine-state health taxonomy (SPEC §6)."""
 
     OK = "ok"
     RATE_LIMITED = "rate_limited"
     SESSION_LIMIT = "session_limit"
     WEEKLY_LIMIT = "weekly_limit"
+    MODEL_LIMIT = "model_limit"
     AUTH_EXPIRED = "auth_expired"
     AUTH_DEAD = "auth_dead"
     NETWORK_ERROR = "network_error"
@@ -35,6 +36,7 @@ class Health(str, Enum):
         return self in (
             Health.RATE_LIMITED,
             Health.SESSION_LIMIT,
+            Health.MODEL_LIMIT,
             Health.AUTH_EXPIRED,
             Health.NETWORK_ERROR,
             Health.UNKNOWN,
@@ -68,12 +70,61 @@ class ExtraUsage(BaseModel):
         return self.utilization is not None and self.utilization >= 100
 
 
+class ScopedLimit(BaseModel):
+    """One entry from the top-level `limits[]` array (new response shape).
+
+    Model-scoped capacity (currently Fable) lives here now, replacing the
+    `seven_day_sonnet`/`seven_day_opus` windows that are `null` on every
+    profile under the new shape. `scope.model.id` is null upstream today —
+    `display_name` ("Fable") is the only model identifier available, so
+    lookups key off it case-insensitively (see `Usage.model_pct`).
+    `kind` observed so far: "session", "weekly_all", "weekly_scoped".
+    """
+
+    kind: str
+    group: str | None = None
+    percent: int | None = None
+    severity: str | None = None
+    resets_at: datetime | None = None
+    model: str | None = None
+    surface: str | None = None
+    is_active: bool = False
+
+    @property
+    def is_exhausted(self) -> bool:
+        return self.percent is not None and self.percent >= 100
+
+
+class Spend(BaseModel):
+    """Monthly overage spend block (top-level `spend`, sibling to `extra_usage`).
+
+    `exponent` is the minor-currency-unit power (e.g. 2 => cents); previously
+    this was undocumented and empirically x100 (docs/findings.md §5) — the
+    API now states it explicitly via this field.
+    """
+
+    used_minor: int | None = None
+    currency: str | None = None
+    exponent: int | None = None
+    limit_minor: int | None = None
+    percent: int | None = None
+    severity: str | None = None
+    enabled: bool = False
+
+
 class Usage(BaseModel):
     """Usage percentages sourced from /api/oauth/usage (SPEC §7).
 
     Window percentages are 0-100 integers, rounded from the upstream float.
     `None` means the corresponding window was absent or the probe could not
     read it (e.g. 403 scope-missing fallback).
+
+    `sonnet_pct`/`opus_pct` are populated from the legacy `seven_day_sonnet`/
+    `seven_day_opus` windows, which are `null` on every profile under the
+    new response shape but may still populate for accounts that haven't
+    migrated (or older Pro/Team responses) — kept for `usage_log.py`/
+    `stats.py` backwards-compat. Model-scoped capacity now lives in `limits`;
+    use `model_pct()`/`fable_pct` to read it with the same fallback.
     """
 
     session_pct: int | None = None
@@ -81,6 +132,29 @@ class Usage(BaseModel):
     sonnet_pct: int | None = None
     opus_pct: int | None = None
     extra: ExtraUsage | None = None
+    limits: list[ScopedLimit] = Field(default_factory=list)
+    spend: Spend | None = None
+
+    def model_pct(self, name: str) -> int | None:
+        """Active scoped-limit percent for `name` (case-insensitive).
+
+        Prefers `limits[]`; falls back to the legacy `sonnet_pct`/`opus_pct`
+        windows for those two names so accounts still returning them don't
+        regress to None.
+        """
+        lname = name.lower()
+        for limit in self.limits:
+            if limit.is_active and limit.model is not None and limit.model.lower() == lname:
+                return limit.percent
+        if lname == "sonnet":
+            return self.sonnet_pct
+        if lname == "opus":
+            return self.opus_pct
+        return None
+
+    @property
+    def fable_pct(self) -> int | None:
+        return self.model_pct("fable")
 
 
 class ProfileHealth(BaseModel):
@@ -94,6 +168,7 @@ class ProfileHealth(BaseModel):
     retry_after_s: int | None = None
     session_reset_at: datetime | None = None
     weekly_reset_at: datetime | None = None
+    model_reset_at: datetime | None = None
     usage: Usage | None = None
     probe_latency_ms: int | None = None
     credentials_mtime: float | None = None
@@ -133,4 +208,5 @@ class ClassificationResult(BaseModel):
     retry_after_s: int | None = None
     session_reset_at: datetime | None = None
     weekly_reset_at: datetime | None = None
+    model_reset_at: datetime | None = None
     usage: Usage | None = None

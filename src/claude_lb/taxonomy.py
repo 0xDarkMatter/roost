@@ -1,8 +1,11 @@
-"""Seven-state health classifier (SPEC §6).
+"""Eight-state health classifier (SPEC §6).
 
 Every probe response from Anthropic's `/api/oauth/usage` endpoint is funnelled
-through `classify()`, which returns one of seven `Health` states plus the
-supporting usage metadata (`session_pct`, `weekly_pct`, reset timestamps).
+through `classify()`, which returns one of eight `Health` states plus the
+supporting usage metadata (`session_pct`, `weekly_pct`, reset timestamps). The
+ninth `Health` state, AUTH_EXPIRED, is never returned by `classify()` — it is
+assigned locally by `probe.py` from credential expiry, before a network probe
+is even attempted.
 
 Classification order (first match wins):
 
@@ -10,6 +13,7 @@ Classification order (first match wins):
     2. HTTP 200
          seven_day.utilization >= 100          → WEEKLY_LIMIT
          five_hour.utilization >= 100          → SESSION_LIMIT
+         any active limits[] entry >= 100%     → MODEL_LIMIT
          else                                  → OK
     3. HTTP 401                                → AUTH_DEAD
     4. HTTP 403 with "scope requirement"       → OK (usage: null)
@@ -27,7 +31,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .models import ClassificationResult, ErrorInfo, ExtraUsage, Health, Usage
+from .models import (
+    ClassificationResult,
+    ErrorInfo,
+    ExtraUsage,
+    Health,
+    ScopedLimit,
+    Spend,
+    Usage,
+)
 
 
 @dataclass
@@ -124,6 +136,82 @@ def _build_extra_usage(body: dict[str, Any] | None) -> ExtraUsage | None:
     )
 
 
+def _build_scoped_limits(body: dict[str, Any] | None) -> list[ScopedLimit]:
+    """Parse the top-level `limits[]` array (model-scoped capacity, e.g. Fable).
+
+    Defensive by design: a missing key, a non-list value, non-dict entries,
+    and a null/missing `scope` must all degrade to an empty-or-partial list,
+    never raise — this endpoint's shape has already changed once without
+    notice and roost must keep classifying instead of crashing the probe.
+    """
+    if not isinstance(body, dict):
+        return []
+    raw = body.get("limits")
+    if not isinstance(raw, list):
+        return []
+    limits: list[ScopedLimit] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        model_name: str | None = None
+        surface: str | None = None
+        scope = item.get("scope")
+        if isinstance(scope, dict):
+            model = scope.get("model")
+            if isinstance(model, dict) and isinstance(model.get("display_name"), str):
+                model_name = model["display_name"]
+            if isinstance(scope.get("surface"), str):
+                surface = scope["surface"]
+        limits.append(
+            ScopedLimit(
+                kind=str(item.get("kind", "")),
+                group=str(item["group"]) if isinstance(item.get("group"), str) else None,
+                percent=_utilization_to_pct(item.get("percent")),
+                severity=str(item["severity"]) if isinstance(item.get("severity"), str) else None,
+                resets_at=_parse_iso(item.get("resets_at")),
+                model=model_name,
+                surface=surface,
+                is_active=bool(item.get("is_active", False)),
+            )
+        )
+    return limits
+
+
+def _build_spend(body: dict[str, Any] | None) -> Spend | None:
+    """Extract the top-level `spend` block (monthly overage in minor units).
+
+    Returns None when the field is absent or not a dict, mirroring
+    `_build_extra_usage`'s degrade-gracefully contract.
+    """
+    spend = _window(body, "spend")
+    if spend is None:
+        return None
+    used = spend.get("used")
+    used_minor: int | None = None
+    currency: str | None = None
+    exponent: int | None = None
+    if isinstance(used, dict):
+        if isinstance(used.get("amount_minor"), int):
+            used_minor = used["amount_minor"]
+        if isinstance(used.get("currency"), str):
+            currency = used["currency"]
+        if isinstance(used.get("exponent"), int):
+            exponent = used["exponent"]
+    limit = spend.get("limit")
+    limit_minor: int | None = None
+    if isinstance(limit, dict) and isinstance(limit.get("amount_minor"), int):
+        limit_minor = limit["amount_minor"]
+    return Spend(
+        used_minor=used_minor,
+        currency=currency,
+        exponent=exponent,
+        limit_minor=limit_minor,
+        percent=_utilization_to_pct(spend.get("percent")),
+        severity=str(spend["severity"]) if isinstance(spend.get("severity"), str) else None,
+        enabled=bool(spend.get("enabled", False)),
+    )
+
+
 def _build_usage(body: dict[str, Any] | None) -> Usage:
     """Assemble a Usage model from the /api/oauth/usage response body."""
     five_hour = _window(body, "five_hour") or {}
@@ -136,6 +224,8 @@ def _build_usage(body: dict[str, Any] | None) -> Usage:
         sonnet_pct=_utilization_to_pct(sonnet.get("utilization")),
         opus_pct=_utilization_to_pct(opus.get("utilization")),
         extra=_build_extra_usage(body),
+        limits=_build_scoped_limits(body),
+        spend=_build_spend(body),
     )
 
 
@@ -192,6 +282,22 @@ def _classify_200(
             weekly_reset_at=weekly_reset,
         )
 
+    # Model-scoped capacity (e.g. Fable) exhausts independently of the
+    # aggregate weekly/session windows — a profile can be well under its
+    # weekly_all cap while its model-scoped allotment is spent (see
+    # tests/fixtures/oauth-usage/limits-fable-exhausted.json: weekly_all=76,
+    # Fable=100). Only ACTIVE limits gate selection; `is_active: false` means
+    # the entry is informational, not currently enforced.
+    for limit in usage.limits:
+        if limit.is_active and limit.is_exhausted:
+            return ClassificationResult(
+                health=Health.MODEL_LIMIT,
+                usage=usage,
+                session_reset_at=session_reset,
+                weekly_reset_at=weekly_reset,
+                model_reset_at=limit.resets_at,
+            )
+
     return ClassificationResult(
         health=Health.OK,
         usage=usage,
@@ -205,7 +311,7 @@ def classify(
     probed_at: datetime | None = None,
     prev_health: Health | None = None,
 ) -> ClassificationResult:
-    """Classify a probe outcome into one of seven Health states.
+    """Classify a probe outcome into one of eight Health states.
 
     `prev_health` is accepted for call-site stability but no longer used —
     the /api/oauth/usage endpoint provides real utilization numbers, so the
@@ -275,6 +381,7 @@ DEFAULT_TTL_SECONDS: dict[Health, int | None] = {
     Health.RATE_LIMITED: None,  # computed from retry_after
     Health.SESSION_LIMIT: None,  # computed from session_reset_at
     Health.WEEKLY_LIMIT: None,  # computed from weekly_reset_at
+    Health.MODEL_LIMIT: None,  # computed from model_reset_at
     Health.AUTH_DEAD: None,  # never expires; manual invalidate
     Health.NETWORK_ERROR: 30,
     Health.UNKNOWN: 60,
@@ -293,6 +400,10 @@ def compute_expires_at(
         return result.weekly_reset_at or _default_weekly_reset(probed_at)
     if h is Health.SESSION_LIMIT:
         return result.session_reset_at or _default_session_reset(probed_at)
+    if h is Health.MODEL_LIMIT:
+        # Fall back to the weekly default (not session) — a model-scoped
+        # window mirrors the weekly cadence in every fixture observed so far.
+        return result.model_reset_at or _default_weekly_reset(probed_at)
     if h is Health.RATE_LIMITED:
         retry_seconds: int = result.retry_after_s or 60
         return probed_at + timedelta(seconds=retry_seconds)

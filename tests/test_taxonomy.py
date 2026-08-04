@@ -294,3 +294,173 @@ def test_compute_expires_at_unknown_is_60s() -> None:
 def test_classification_priority(probe_kwargs: dict, expected: Health) -> None:
     result = classify(ProbeInput(**probe_kwargs))
     assert result.health is expected
+
+
+# ---------------------------------------------------------------------------
+# Model-scoped limits (limits[] / MODEL_LIMIT) — new response shape
+# ---------------------------------------------------------------------------
+
+
+def test_limits_fable_normal_classifies_ok() -> None:
+    body = load_json(USAGE_FIXTURES / "limits-fable-normal.json")
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.health is Health.OK
+    assert result.usage is not None
+    assert result.usage.fable_pct == 10
+
+
+def test_limits_fable_critical_still_classifies_ok() -> None:
+    """90% is critical severity but not exhausted — still OK."""
+    body = load_json(USAGE_FIXTURES / "limits-fable-critical.json")
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.health is Health.OK
+    assert result.usage is not None
+    assert result.usage.fable_pct == 90
+
+
+def test_limits_fable_exhausted_classifies_model_limit() -> None:
+    body = load_json(USAGE_FIXTURES / "limits-fable-exhausted.json")
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.health is Health.MODEL_LIMIT
+    assert result.usage is not None
+    assert result.usage.fable_pct == 100
+    assert result.model_reset_at == datetime(
+        2026, 8, 6, 2, 59, 59, 528368, tzinfo=UTC
+    )
+
+
+def test_no_limits_key_classifies_same_as_before() -> None:
+    """Regression guard: fixtures without a top-level `limits` key (the old
+    response shape) must classify exactly as they did before this packet."""
+    body = load_json(USAGE_FIXTURES / "ok.json")
+    assert "limits" not in body
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.health is Health.OK
+    assert result.usage is not None
+    assert result.usage.limits == []
+    assert result.usage.fable_pct is None
+
+
+def test_inactive_scoped_limit_at_100_does_not_trigger_model_limit() -> None:
+    """is_active: false means the limit isn't currently enforced."""
+    body = {
+        "five_hour": {"utilization": 2.0},
+        "seven_day": {"utilization": 5.0},
+        "limits": [
+            {
+                "kind": "weekly_scoped",
+                "percent": 100,
+                "is_active": False,
+                "scope": {"model": {"display_name": "Fable"}},
+            }
+        ],
+    }
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.health is Health.OK
+    assert result.usage is not None
+    # model_pct() also requires is_active, so an inactive 100% entry is
+    # invisible to it too — not just to the health classifier.
+    assert result.usage.fable_pct is None
+
+
+def test_weekly_exhausted_and_model_exhausted_prefers_weekly_limit() -> None:
+    """Weekly (broader, longer-lasting) beats model-scoped when both fire."""
+    body = {
+        "five_hour": {"utilization": 2.0},
+        "seven_day": {"utilization": 100.0},
+        "limits": [
+            {
+                "kind": "weekly_scoped",
+                "percent": 100,
+                "is_active": True,
+                "scope": {"model": {"display_name": "Fable"}},
+            }
+        ],
+    }
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.health is Health.WEEKLY_LIMIT
+
+
+def test_compute_expires_at_model_limit_uses_scoped_reset() -> None:
+    body = load_json(USAGE_FIXTURES / "limits-fable-exhausted.json")
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    expires = compute_expires_at(result, FIXED_NOW)
+    assert expires == datetime(2026, 8, 6, 2, 59, 59, 528368, tzinfo=UTC)
+
+
+def test_compute_expires_at_model_limit_falls_back_to_weekly_default() -> None:
+    """No resets_at on the triggering limit -> probed_at + 7d fallback."""
+    body = {
+        "five_hour": {"utilization": 2.0},
+        "seven_day": {"utilization": 5.0},
+        "limits": [
+            {
+                "kind": "weekly_scoped",
+                "percent": 100,
+                "is_active": True,
+                "resets_at": None,
+                "scope": {"model": {"display_name": "Fable"}},
+            }
+        ],
+    }
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.health is Health.MODEL_LIMIT
+    expires = compute_expires_at(result, FIXED_NOW)
+    assert expires == FIXED_NOW + timedelta(days=7)
+
+
+@pytest.mark.parametrize(
+    "malformed_limits",
+    [
+        "not a list",
+        [1, 2, 3],
+        ["a string entry"],
+        [{"kind": "weekly_scoped", "percent": 100, "is_active": True, "scope": None}],
+        [{"kind": "weekly_scoped", "is_active": True, "scope": {"model": None}}],
+        [{"scope": {"model": {"display_name": "Fable"}}}],
+    ],
+)
+def test_malformed_limits_never_raises(malformed_limits) -> None:
+    body = {
+        "five_hour": {"utilization": 2.0},
+        "seven_day": {"utilization": 5.0},
+        "limits": malformed_limits,
+    }
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.usage is not None
+    # Never raises, health degrades to OK/MODEL_LIMIT depending on content,
+    # but never crashes classification.
+    assert result.health in (Health.OK, Health.MODEL_LIMIT)
+
+
+def test_usage_model_pct_falls_back_to_legacy_sonnet_opus() -> None:
+    body = {
+        "five_hour": {"utilization": 1.0},
+        "seven_day": {"utilization": 2.0},
+        "seven_day_sonnet": {"utilization": 33.0},
+        "seven_day_opus": {"utilization": 44.0},
+    }
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.usage is not None
+    assert result.usage.model_pct("sonnet") == 33
+    assert result.usage.model_pct("opus") == 44
+    assert result.usage.model_pct("fable") is None
+
+
+def test_spend_block_parsed_when_present() -> None:
+    body = load_json(USAGE_FIXTURES / "limits-fable-normal.json")
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.usage is not None
+    spend = result.usage.spend
+    assert spend is not None
+    assert spend.used_minor == 0
+    assert spend.currency == "USD"
+    assert spend.exponent == 2
+    assert spend.enabled is False
+
+
+def test_spend_block_absent_is_none() -> None:
+    body = load_json(USAGE_FIXTURES / "ok.json")
+    result = classify(ProbeInput(status_code=200, body=body), probed_at=FIXED_NOW)
+    assert result.usage is not None
+    assert result.usage.spend is None
