@@ -6,13 +6,13 @@ import json
 import sys
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any
+from typing import IO, Any
 
 from rich.console import Console
 from rich.table import Table
 
 from .models import HealthCache, ProfileHealth
-from .term import Term, emit_panel
+from .term import Term, display_width, emit_panel
 
 stderr = Console(stderr=True)
 
@@ -135,6 +135,10 @@ def _health_style(health: str) -> str:
         "rate_limited": "yellow",
         "session_limit": "yellow",
         "weekly_limit": "red",
+        # Amber (rendered as Rich "yellow" — there's no distinct amber in the
+        # 8-color palette) matching session_limit/auth_expired: the account
+        # is alive and this clears on its own once model_reset_at passes.
+        "model_limit": "yellow",
         "auth_expired": "yellow",
         "auth_dead": "red",
         "network_error": "magenta",
@@ -178,10 +182,15 @@ def _render_extra_usage(extra: object) -> str:
 def render_status_table(entries: list[ProfileHealth]) -> None:
     """Render the status table to stderr.
 
-    Columns: Profile · Health · Session% · Weekly% · Sonnet% · Opus% · Overage · Resets in · Probed.
+    Columns: Profile · Health · Session% · Weekly% · Fable% · Sonnet% · Opus%
+    · Overage · Session in · Weekly in · Probed.
 
-    Per-model columns (Sonnet/Opus) are dropped when no entry has the data,
-    keeping the table compact for typical use.
+    Per-model columns are dropped when no entry has the data, keeping the
+    table compact for typical use. Fixed three (Fable/Sonnet/Opus) rather
+    than derived from the union of `usage.limits[].model` names — Anthropic
+    has only ever populated three model-scoped windows to date, and a fixed
+    set keeps column order deterministic for tests/scripts without needing
+    to sort a dynamic name list on every render.
     """
     if not entries:
         stderr.print("[yellow]No profiles discovered.[/yellow]")
@@ -190,6 +199,13 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
 
     # Optional columns: only show if at least one entry has the data.
     has_plan = any(e.subscription_type for e in entries)
+    has_fable = any(e.usage and e.usage.fable_pct is not None for e in entries)
+    # sonnet_pct/opus_pct come from the legacy seven_day_sonnet/seven_day_opus
+    # windows, which are null on every current Max account now that
+    # Anthropic moved per-model capacity into `limits[]` (see Usage
+    # docstring in models.py). They are NOT dead code: a Pro/Team account or
+    # an older server build may still populate them, so the columns stay,
+    # gated by the same has-data check as every other optional column.
     has_sonnet = any(e.usage and e.usage.sonnet_pct is not None for e in entries)
     has_opus = any(e.usage and e.usage.opus_pct is not None for e in entries)
     has_extra = any(e.usage and e.usage.extra is not None for e in entries)
@@ -201,6 +217,8 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
     table.add_column("Health")
     table.add_column("Session", justify="right")
     table.add_column("Weekly", justify="right")
+    if has_fable:
+        table.add_column("Fable", justify="right")
     if has_sonnet:
         table.add_column("Sonnet", justify="right")
     if has_opus:
@@ -239,6 +257,23 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
         elif e.health.value == "auth_dead":
             session_in = "claude login"
             weekly_in = "—"
+        elif e.health.value == "model_limit":
+            # Model-scoped exhaustion is orthogonal to the aggregate session
+            # window — the account isn't session-limited, so showing the
+            # model's own reset (model_reset_at) in the Session slot is the
+            # actionable answer to "when can I use this model again". Weekly
+            # keeps showing the real weekly reset since that window is still
+            # live and informative.
+            session_in = (
+                humanize_until(e.model_reset_at, now).removeprefix("in ")
+                if e.model_reset_at is not None
+                else "—"
+            )
+            weekly_in = (
+                humanize_until(e.weekly_reset_at, now).removeprefix("in ")
+                if e.weekly_reset_at is not None
+                else "—"
+            )
         else:
             session_in = (
                 humanize_until(e.session_reset_at, now).removeprefix("in ")
@@ -266,6 +301,10 @@ def render_status_table(entries: list[ProfileHealth]) -> None:
                 weekly_cell,
             ]
         )
+        if has_fable:
+            row.append(
+                _pct_cell(e.usage.fable_pct) if (e.usage and e.usage.fable_pct is not None) else "—"
+            )
         if has_sonnet:
             row.append(
                 _pct_cell(e.usage.sonnet_pct) if (e.usage and e.usage.sonnet_pct is not None) else "—"
@@ -417,3 +456,110 @@ def render_pick_explanation(
     lines.append(t.panel_close(left_text="pick decision", right_text=footer_health))
 
     emit_panel(lines)
+
+
+# Map roost's 9-state Health values onto term.Term's health-glyph vocabulary
+# (healthy/pending/warning/critical/busted/unknown — see term.py's _HEALTH
+# registry). This is a display-only mapping; it doesn't affect classification.
+_CARD_HEALTH_STATE: dict[str, str] = {
+    "ok": "healthy",
+    "session_limit": "pending",
+    # Amber, same rationale as _health_style: alive but degraded, clears on
+    # its own once model_reset_at passes.
+    "model_limit": "warning",
+    "rate_limited": "warning",
+    "auth_expired": "warning",
+    "weekly_limit": "critical",
+    "network_error": "critical",
+    "auth_dead": "busted",
+    "unknown": "unknown",
+}
+
+# (label, extractor) pairs for the four capacity windows a card shows, in
+# display order. extractor reads the percent from a Usage instance (never
+# called when usage is None — callers guard that).
+_CARD_WINDOWS: list[tuple[str, Any]] = [
+    ("Session", lambda u: u.session_pct),
+    ("Weekly", lambda u: u.weekly_pct),
+    ("Fable", lambda u: u.fable_pct),
+    ("Overage", lambda u: u.extra.utilization if u.extra else None),
+]
+
+
+def _bar_width_for(t: Term) -> int:
+    """Bar glyph count, shrunk to fit narrow terminals.
+
+    Reserves room for the left rail, a name column, the gap, and the percent
+    text so the row never overruns `t.width` on an 80-column-or-narrower tty.
+    """
+    return max(6, min(20, t.width - 34))
+
+
+def _capacity_bar(pct: int | None, t: Term, *, width: int) -> str:
+    """Render a proportional bar for one capacity window.
+
+    ASCII fallback (`#`/`-`) applies whenever `t.ascii` is set (TERM_ASCII=1
+    or a non-UTF locale) — the block glyphs (`█`/`░`) aren't guaranteed to
+    exist in every legacy/CI terminal font, and term.py's whole point is to
+    make that fallback automatic for every consumer.
+    """
+    if pct is None:
+        return t.paint("dim", "-" * width if t.ascii else "░" * width)
+    filled = max(0, min(width, round(width * min(pct, 100) / 100)))
+    full_ch = "#" if t.ascii else "█"
+    empty_ch = "-" if t.ascii else "░"
+    bar = full_ch * filled + empty_ch * (width - filled)
+    color = "red" if pct >= 100 else "yellow" if pct >= 80 else "green"
+    return t.paint(color, bar)
+
+
+def _capacity_row(label: str, pct: int | None, t: Term, *, name_col: int = 8) -> str:
+    pad = " " * max(name_col - display_width(label), 0)
+    # "-" under ascii_mode so a TERM_ASCII=1/non-UTF terminal never sees the
+    # em dash byte — every glyph on this row must honour the same fallback.
+    pct_text = f"{pct}%" if pct is not None else ("-" if t.ascii else "—")
+    bar = _capacity_bar(pct, t, width=_bar_width_for(t))
+    return f"{t.paint('dim', t.vert_g)}   {label}{pad} {bar}  {pct_text}"
+
+
+def _capacity_card_lines(entry: ProfileHealth, t: Term) -> list[str]:
+    """Build the panel lines for one profile's capacity card."""
+    health_str = entry.health.value
+    card_state = _CARD_HEALTH_STATE.get(health_str, "unknown")
+    plan = entry.subscription_type or ("-" if t.ascii else "—")
+
+    lines = [
+        t.panel_open("roost", entry.name, indicator=health_str),
+        t.vert(),
+        t.summary_line(f"plan: {plan}"),
+    ]
+    usage = entry.usage
+    for label, extractor in _CARD_WINDOWS:
+        # usage=None (Pro/Team accounts, see AGENTS.md) must render "—"
+        # placeholders, never a crash and never a misleading 0%.
+        pct = extractor(usage) if usage is not None else None
+        lines.append(_capacity_row(label, pct, t))
+    lines.append(t.vert())
+    lines.append(
+        t.panel_close(left_text="capacity", right_text=t.health(card_state, health_str))
+    )
+    return lines
+
+
+def render_capacity_cards(entries: list[ProfileHealth], *, file: IO[str] | None = None) -> None:
+    """Render one capacity card per profile to `file` (default stderr).
+
+    Human chrome only, never the data product roost's stdout contract
+    promises (SPEC §3 / AGENTS.md rule 8), so this is stderr-bound like every
+    other renderer in this module. Each card is its own panel (profile name +
+    health, plan, and a bar per Session/Weekly/Fable/Overage window); all
+    panels are written in one call so output stays coherent even when
+    stderr is redirected to a file.
+    """
+    out = file if file is not None else sys.stderr
+    t = Term(stream=out)
+    lines: list[str] = []
+    for entry in entries:
+        lines.extend(_capacity_card_lines(entry, t))
+    if lines:
+        emit_panel(lines, file=out)

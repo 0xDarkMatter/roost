@@ -695,3 +695,177 @@ def test_status_table_renders_auth_dead_remediation_in_session_column(
     rendered = captured.out + captured.err
     flat = " ".join(rendered.split())
     assert "claude login" in flat
+
+
+# ---------------------------------------------------------------------------
+# render_status_table — Fable column
+# ---------------------------------------------------------------------------
+
+
+def test_render_status_table_includes_fable_column_when_any_entry_has_it(
+    capsys,
+) -> None:
+    from claude_lb.models import ScopedLimit
+
+    entries = [
+        _entry(
+            "a",
+            Health.OK,
+            usage=Usage(
+                weekly_pct=10,
+                limits=[
+                    ScopedLimit(kind="weekly_scoped", model="Fable", percent=42, is_active=True)
+                ],
+            ),
+        ),
+    ]
+    output.render_status_table(entries)
+    captured = capsys.readouterr()
+    assert "Fable" in captured.err
+    assert "42%" in captured.err
+
+
+def test_render_status_table_omits_fable_column_when_absent(capsys) -> None:
+    entries = [_entry("a", Health.OK, usage=Usage(weekly_pct=10))]
+    output.render_status_table(entries)
+    captured = capsys.readouterr()
+    assert "Fable" not in captured.err
+
+
+def test_render_status_table_omits_sonnet_opus_when_all_null(capsys) -> None:
+    """Current real-world case: every Max account returns null sonnet_pct/
+    opus_pct now that per-model capacity lives in limits[] — the columns
+    must drop cleanly rather than render as an all-dash column."""
+    entries = [_entry("a", Health.OK, usage=Usage(session_pct=5, weekly_pct=10))]
+    output.render_status_table(entries)
+    captured = capsys.readouterr()
+    assert "Sonnet" not in captured.err
+    assert "Opus" not in captured.err
+
+
+# ---------------------------------------------------------------------------
+# render_status_table — MODEL_LIMIT rendering
+# ---------------------------------------------------------------------------
+
+
+def test_render_status_table_model_limit_state_word_and_reset(capsys, monkeypatch) -> None:
+    """MODEL_LIMIT must render its state word and use model_reset_at (not
+    session_reset_at, which is None here) for the Session-in cell."""
+    from datetime import UTC, datetime, timedelta
+
+    # Wide enough that Rich doesn't ellipsize "model_limit" in the narrow
+    # single-row table capsys's non-tty stderr would otherwise fall back to.
+    monkeypatch.setenv("COLUMNS", "200")
+    entries = [
+        _entry(
+            "a",
+            Health.MODEL_LIMIT,
+            model_reset_at=datetime.now(UTC) + timedelta(days=3, hours=12),
+            weekly_reset_at=None,
+        ),
+    ]
+    output.render_status_table(entries)
+    captured = capsys.readouterr()
+    flat = " ".join(captured.err.split())
+    assert "model_limit" in flat
+    # Would be "—" if the branch fell through to session_reset_at (None).
+    assert "3d" in flat
+
+
+def test_render_status_table_model_limit_is_amber_not_red_or_green() -> None:
+    """Colour is never the only signal, but model_limit should still get the
+    same amber/yellow styling as the other recoverable-by-waiting states."""
+    assert output._health_style("model_limit") == "yellow"
+
+
+# ---------------------------------------------------------------------------
+# render_capacity_cards
+# ---------------------------------------------------------------------------
+
+
+def _mixed_fleet_entries() -> list[ProfileHealth]:
+    from claude_lb.models import ScopedLimit
+
+    return [
+        _entry(
+            "healthy-acct",
+            Health.OK,
+            usage=Usage(
+                session_pct=10,
+                weekly_pct=20,
+                limits=[
+                    ScopedLimit(kind="weekly_scoped", model="Fable", percent=30, is_active=True)
+                ],
+            ),
+            subscription_type="max",
+        ),
+        _entry(
+            "model-limited-acct",
+            Health.MODEL_LIMIT,
+            model_reset_at=FIXED_NOW + timedelta(hours=2),
+            usage=Usage(
+                session_pct=5,
+                weekly_pct=40,
+                limits=[
+                    ScopedLimit(kind="weekly_scoped", model="Fable", percent=100, is_active=True)
+                ],
+            ),
+            subscription_type="max",
+        ),
+        _entry("dead-acct", Health.AUTH_DEAD),
+        _entry("pro-acct", Health.OK, usage=None, subscription_type="pro"),
+    ]
+
+
+def test_render_capacity_cards_renders_mixed_fleet() -> None:
+    buf = io.StringIO()
+    output.render_capacity_cards(_mixed_fleet_entries(), file=buf)
+    out = buf.getvalue()
+    assert "healthy-acct" in out
+    assert "model-limited-acct" in out
+    assert "model_limit" in out
+    assert "dead-acct" in out
+    assert "auth_dead" in out
+    assert "pro-acct" in out
+
+
+def test_render_capacity_cards_usage_none_renders_dash_never_zero_percent() -> None:
+    """A usage=None (Pro/Team) profile must show '—' placeholders — never a
+    crash, and never a misleading 0% that implies real telemetry exists."""
+    buf = io.StringIO()
+    output.render_capacity_cards([_entry("pro-acct", Health.OK, usage=None)], file=buf)
+    out = buf.getvalue()
+    assert "pro-acct" in out
+    assert "—" in out
+    assert "0%" not in out
+
+
+def test_render_capacity_cards_empty_entries_no_crash() -> None:
+    buf = io.StringIO()
+    output.render_capacity_cards([], file=buf)
+    assert buf.getvalue() == ""
+
+
+def test_render_capacity_cards_no_color_env_strips_ansi(monkeypatch) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    buf = io.StringIO()
+    output.render_capacity_cards(_mixed_fleet_entries(), file=buf)
+    out = buf.getvalue()
+    assert "\x1b[" not in out
+    # Percentage text still conveys everything without colour.
+    assert "100%" in out
+
+
+def test_render_capacity_cards_term_ascii_env_no_non_ascii_bytes(monkeypatch) -> None:
+    monkeypatch.setenv("TERM_ASCII", "1")
+    buf = io.StringIO()
+    output.render_capacity_cards(_mixed_fleet_entries(), file=buf)
+    out = buf.getvalue()
+    out.encode("ascii")  # raises UnicodeEncodeError if any non-ASCII byte slipped in
+
+
+def test_render_capacity_cards_default_goes_to_stderr_not_stdout(capsys) -> None:
+    output.render_capacity_cards(_mixed_fleet_entries())
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "healthy-acct" in captured.err
