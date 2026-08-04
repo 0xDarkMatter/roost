@@ -1,5 +1,19 @@
 # HANDOFF: roost v0.1 implementation
 
+> **SUPERSEDED — historical record only.** This was the build brief that
+> produced v0.1 in April 2026. Everything in it either shipped or was
+> deliberately dropped, and several of its "open questions" have since been
+> answered (there IS a usage API — `/api/oauth/usage`; the taxonomy has nine
+> states, not seven; refresh shipped in v0.2, not "deferred").
+>
+> **Do not treat any statement below as current.** The live docs are
+> [README.md](README.md) (user-facing), [AGENTS.md](AGENTS.md) (invariants an
+> agent cannot intuit), [docs/SPEC.md](docs/SPEC.md) (the specification), and
+> [docs/findings.md](docs/findings.md) (empirical answers to the questions
+> this document raised). Kept because the reasoning behind the original
+> non-goals — no proxy, no daemon, no multi-provider — is still the clearest
+> statement of what roost deliberately is not.
+
 **From:** Axiom building lane (0xDarkMatter)
 **Date:** 2026-04-24
 **Target:** Fresh headless or interactive agent

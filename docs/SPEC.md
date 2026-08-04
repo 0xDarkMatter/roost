@@ -342,15 +342,51 @@ The OAuth access token is read from `~/.claude-profiles/<name>/.credentials.json
 
 ```json
 {
-  "five_hour":  {"utilization": 9.0, "resets_at": "2026-04-24T14:00:00.019+00:00"},
-  "seven_day":  {"utilization": 6.0, "resets_at": "2026-04-25T04:00:00.019+00:00"},
-  "seven_day_sonnet": {"utilization": 0.0, "resets_at": null},
+  "five_hour":  {"utilization": 2.0, "resets_at": "2026-08-04T09:29:59.575+00:00"},
+  "seven_day":  {"utilization": 76.0, "resets_at": "2026-08-06T02:59:59.579+00:00"},
+  "seven_day_sonnet": null,
   "seven_day_opus":   null,
-  "extra_usage": {"is_enabled": true, "monthly_limit": 100000, "used_credits": 10649, "utilization": 10.6, "currency": "AUD"}
+  "limits": [
+    {"kind": "session",     "group": "session", "percent": 2,  "severity": "normal",
+     "resets_at": "2026-08-04T09:29:59.575+00:00", "scope": null, "is_active": false},
+    {"kind": "weekly_all",  "group": "weekly",  "percent": 76, "severity": "warning",
+     "resets_at": "2026-08-06T02:59:59.579+00:00", "scope": null, "is_active": false},
+    {"kind": "weekly_scoped", "group": "weekly", "percent": 90, "severity": "critical",
+     "resets_at": "2026-08-06T02:59:59.579+00:00", "is_active": true,
+     "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}
+  ],
+  "spend": {"used": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+            "limit": null, "percent": 0, "severity": "normal", "enabled": false},
+  "extra_usage": {"is_enabled": true, "monthly_limit": 100000, "used_credits": 10649,
+                  "utilization": 10.6, "currency": "AUD", "decimal_places": 2}
 }
 ```
 
-Only `five_hour`, `seven_day`, `seven_day_sonnet`, and `seven_day_opus` are consumed by the classifier. `extra_usage` (pay-per-use pool) is recorded but does not influence health state in v0.2.
+Consumed by the classifier: `five_hour`, `seven_day`, and `limits[]`.
+`seven_day_sonnet` / `seven_day_opus` are still read for backwards
+compatibility but are `null` on every current Max account — Anthropic moved
+model-scoped capacity into `limits[]`, where each entry carries `kind`
+(`session` | `weekly_all` | `weekly_scoped`), `percent`, `severity`
+(`normal` | `warning` | `critical`), `resets_at`, an optional `scope` naming
+the model, and `is_active`.
+
+`is_active` marks the constraint **currently binding** — exactly one entry per
+profile carries it — not "this limit is enforced". The classifier gates on it
+(only the binding constraint should push a profile out of the pick pool);
+reporting deliberately does not (filtering the display would render a genuine
+0% as "no data"). An active `weekly_scoped` entry at `percent >= 100`
+classifies as `model_limit`.
+
+`spend` and `extra_usage` (the pay-per-use pool) are recorded but do not
+influence health state. `spend.used.exponent` and `extra_usage.decimal_places`
+give the currency minor-unit power — previously undocumented and inferred
+empirically as ×100.
+
+The endpoint's shape has changed without notice before. `probe.detect_field_drift`
+compares each response's top-level keys against `KNOWN_USAGE_KEYS` and reports
+unknown, missing, and present-but-null modelled keys; `roost doctor` surfaces
+it at WARN level. It is a tripwire, never a schema — drift must never fail a
+probe.
 
 ### Response classification
 
