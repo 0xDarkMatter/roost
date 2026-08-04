@@ -1,4 +1,4 @@
-"""Cached fetch of status.claude.com summary.
+"""Cached fetch of status.claude.com summary + incident-day history.
 
 Used by:
 - `roost doctor` — always-fresh diagnostic check
@@ -10,6 +10,11 @@ the cache — stale info is more useful than nothing, especially during the
 exact incidents this surface is meant to surface. Atomic write-rename via
 tempfile, same pattern as the health cache.
 
+Two upstream endpoints feed PlatformStatus: summary.json (indicator, active
+incidents, per-component status) and incidents.json (reduced to a per-day
+history for dashboard widgets). Both fetches are best-effort per Rule 20 in
+AGENTS.md — see fetch_incident_days() for how the incidents side fails safe.
+
 The shape of the data here is shared between modules; doctor and status both
 consume PlatformStatus directly.
 """
@@ -20,7 +25,7 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +34,24 @@ import httpx
 from .paths import config_dir, ensure_config_dir
 
 STATUS_PAGE_URL = "https://status.claude.com/api/v2/summary.json"
+INCIDENTS_PAGE_URL = "https://status.claude.com/api/v2/incidents.json"
 STATUS_CACHE_TTL_S = 60
 STATUS_CACHE_TIMEOUT_S = 2.0  # tighter than doctor's 3s — `status` is hot path
 _SCHEMA_VERSION = 1
+
+# Statuspage's own impact vocabulary, ranked worst-wins. Do NOT sort these as
+# strings — "critical" < "major" alphabetically would invert the ranking.
+_IMPACT_RANK: dict[str, int] = {
+    "none": 0,
+    "maintenance": 1,
+    "minor": 2,
+    "major": 3,
+    "critical": 4,
+}
+
+
+def _worst_impact(a: str, b: str) -> str:
+    return a if _IMPACT_RANK.get(a, 0) >= _IMPACT_RANK.get(b, 0) else b
 
 
 @dataclass
@@ -40,6 +60,19 @@ class PlatformStatus:
     description: str
     active_incidents: list[dict[str, Any]] = field(default_factory=list)
     degraded_components: list[dict[str, Any]] = field(default_factory=list)
+    components: list[dict[str, Any]] = field(default_factory=list)  # every non-group component
+    # Per-UTC-calendar-day incident record, oldest -> newest, contiguous (clean
+    # days included as impact="none"). This is NOT an uptime series — it is a
+    # reduction of *reported* incidents.json entries. A day with no incident
+    # touching it means "nothing was reported that day", not "measured 100%
+    # uptime" — Statuspage's public API doesn't expose uptime measurements at
+    # all, so never relabel this field or its docs as uptime.
+    incident_days: list[dict[str, Any]] = field(default_factory=list)
+    # How many days incident_days actually spans. incidents.json only returns
+    # the ~50 most recent incidents (observed ~28 days of coverage, not a
+    # fixed 90-day window) — always derive this from the fetched data instead
+    # of hardcoding a window size, so a consumer can label the grid honestly.
+    history_days: int = 0
     fetched_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     fetch_error: str | None = None  # set when fresh fetch failed AND no cache to use
 
@@ -85,12 +118,105 @@ def _parse_summary(payload: dict[str, Any]) -> PlatformStatus:
         for c in (payload.get("components") or [])
         if str(c.get("status") or "operational").lower() != "operational"
     ]
+    # Statuspage "group" rows are containers for other components (e.g. "API"
+    # grouping "API - US" / "API - EU"), not real components — including them
+    # would render as duplicate/empty entries in a per-component list.
+    components = [
+        {"name": c.get("name"), "status": c.get("status")}
+        for c in (payload.get("components") or [])
+        if not c.get("group")
+    ]
     return PlatformStatus(
         indicator=indicator,
         description=description,
         active_incidents=active,
         degraded_components=degraded,
+        components=components,
     )
+
+
+def _parse_incident_timestamp(raw: Any) -> datetime | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _reduce_incident_days(
+    payload: dict[str, Any], *, now: datetime | None = None
+) -> tuple[list[dict[str, Any]], int]:
+    """Reduce raw incidents.json into one contiguous record per UTC calendar day.
+
+    A multi-day incident (created_at .. resolved_at, or .. now if unresolved)
+    marks every day it touched, not just its start day. When two incidents
+    share a day, the day's impact is the worse of the two (see _worst_impact).
+    Gaps between the earliest and latest touched day are filled with
+    impact="none"/count=0 so a consumer gets a contiguous grid without having
+    to fill gaps itself.
+    """
+    ref_now = now or datetime.now(UTC)
+    by_day: dict[date, dict[str, Any]] = {}
+    for inc in payload.get("incidents") or []:
+        created = _parse_incident_timestamp(inc.get("created_at"))
+        if created is None:
+            continue
+        resolved = _parse_incident_timestamp(inc.get("resolved_at"))
+        end = resolved or ref_now  # unresolved incidents span through to today
+        if end < created:
+            end = created
+        impact = str(inc.get("impact") or "none").lower()
+        if impact not in _IMPACT_RANK:
+            impact = "none"
+
+        day = created.date()
+        end_day = end.date()
+        while day <= end_day:
+            entry = by_day.get(day)
+            if entry is None:
+                by_day[day] = {"impact": impact, "count": 1}
+            else:
+                entry["impact"] = _worst_impact(entry["impact"], impact)
+                entry["count"] += 1
+            day += timedelta(days=1)
+
+    if not by_day:
+        return [], 0
+
+    range_start, range_end = min(by_day), max(by_day)
+    days: list[dict[str, Any]] = []
+    cursor = range_start
+    while cursor <= range_end:
+        entry = by_day.get(cursor, {"impact": "none", "count": 0})
+        days.append(
+            {"date": cursor.isoformat(), "impact": entry["impact"], "count": entry["count"]}
+        )
+        cursor += timedelta(days=1)
+
+    return days, (range_end - range_start).days + 1
+
+
+def fetch_incident_days(
+    timeout_s: float = STATUS_CACHE_TIMEOUT_S,
+) -> tuple[list[dict[str, Any]], int]:
+    """One-shot fetch + reduce of incidents.json.
+
+    Best-effort like the rest of this module (Rule 20): any failure — network,
+    HTTP error, malformed JSON, or an unexpected payload shape — returns
+    ([], 0) rather than raising. This is enrichment on top of enrichment;
+    it must never be able to take down the summary fetch it accompanies.
+    """
+    try:
+        response = httpx.get(INCIDENTS_PAGE_URL, timeout=timeout_s)
+        response.raise_for_status()
+        payload = response.json()
+        return _reduce_incident_days(payload)
+    except Exception:  # noqa: BLE001 -- best-effort enrichment, see docstring
+        return [], 0
 
 
 def fetch_platform_status(timeout_s: float = STATUS_CACHE_TIMEOUT_S) -> PlatformStatus:
@@ -120,6 +246,9 @@ def _write_cache(status: PlatformStatus) -> None:
         "description": status.description,
         "active_incidents": status.active_incidents,
         "degraded_components": status.degraded_components,
+        "components": status.components,
+        "incident_days": status.incident_days,
+        "history_days": status.history_days,
     }
     try:
         fd, tmp = tempfile.mkstemp(prefix=".platform-status-", dir=str(target_dir))
@@ -162,6 +291,11 @@ def _read_cache() -> PlatformStatus | None:
         description=str(payload.get("description") or "(no description)"),
         active_incidents=list(payload.get("active_incidents") or []),
         degraded_components=list(payload.get("degraded_components") or []),
+        # .get() defaults handle a cache file written by a pre-history version
+        # of this module, which has neither key.
+        components=list(payload.get("components") or []),
+        incident_days=list(payload.get("incident_days") or []),
+        history_days=int(payload.get("history_days") or 0),
         fetched_at=fetched_at,
     )
 
@@ -183,6 +317,12 @@ def load_or_fetch(
                                         set so callers can render "unreachable"
       - force_refresh=True           -> always fetch; on failure, fall back to
                                         stale cache as above
+
+    The incidents.json fetch (component/incident-day history) rides along
+    with the summary fetch ONLY when the summary itself is being fetched
+    fresh — i.e. on a cache miss or force_refresh. A fresh-cache hit stays a
+    zero-network call, same as before this history feature existed, so the
+    hot path (`status` on every invocation) isn't made any slower.
     """
     cached = _read_cache()
     if not force_refresh and cached is not None and cached.age_seconds() < ttl_s:
@@ -198,6 +338,8 @@ def load_or_fetch(
             description="status.claude.com unreachable",
             fetch_error=f"{type(exc).__name__}: {exc}",
         )
+
+    fresh.incident_days, fresh.history_days = fetch_incident_days(timeout_s=timeout_s)
 
     _write_cache(fresh)
     return fresh
@@ -256,6 +398,9 @@ def to_json_meta(status: PlatformStatus) -> dict[str, Any]:
         "description": status.description,
         "active_incidents": status.active_incidents,
         "degraded_components": status.degraded_components,
+        "components": status.components,
+        "incident_days": status.incident_days,
+        "history_days": status.history_days,
         "fetched_at": status.fetched_at.isoformat().replace("+00:00", "Z"),
         "age_seconds": int(status.age_seconds()),
         "fetch_error": status.fetch_error,

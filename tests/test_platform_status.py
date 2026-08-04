@@ -82,6 +82,193 @@ def test_parse_monitoring_incident_with_clean_indicator_warns() -> None:
     assert status.has_warning is True
 
 
+def test_parse_summary_captures_all_components_including_operational() -> None:
+    status = ps._parse_summary(_summary(components=[
+        {"name": "API", "status": "operational"},
+        {"name": "Console", "status": "degraded_performance"},
+    ]))
+    names = {c["name"] for c in status.components}
+    assert names == {"API", "Console"}
+
+
+def test_parse_summary_drops_group_components() -> None:
+    status = ps._parse_summary(_summary(components=[
+        {"name": "API Group", "status": "operational", "group": True},
+        {"name": "API - US", "status": "operational"},
+    ]))
+    names = {c["name"] for c in status.components}
+    assert names == {"API - US"}
+    assert "API Group" not in names
+
+
+def test_parse_summary_degraded_components_regression() -> None:
+    """Existing degraded_components filtering must be unaffected by adding
+    the new `components` field alongside it."""
+    status = ps._parse_summary(_summary(components=[
+        {"name": "API", "status": "operational"},
+        {"name": "Console", "status": "degraded_performance"},
+        {"name": "Group", "status": "operational", "group": True},
+    ]))
+    assert len(status.degraded_components) == 1
+    assert status.degraded_components[0]["name"] == "Console"
+
+
+# ---------------------------------------------------------------------------
+# Incident-day history — _reduce_incident_days + fetch_incident_days
+# ---------------------------------------------------------------------------
+
+
+def _incidents_payload(incidents: list[dict]) -> dict:
+    return {"page": {"name": "Claude"}, "incidents": incidents}
+
+
+def test_reduce_incident_days_single_day_incident() -> None:
+    payload = _incidents_payload([
+        {
+            "name": "Blip",
+            "impact": "minor",
+            "created_at": "2026-07-07T10:00:00Z",
+            "resolved_at": "2026-07-07T11:00:00Z",
+        }
+    ])
+    days, history_days = ps._reduce_incident_days(payload)
+    assert days == [{"date": "2026-07-07", "impact": "minor", "count": 1}]
+    assert history_days == 1
+
+
+def test_reduce_incident_days_multi_day_incident_marks_every_day() -> None:
+    payload = _incidents_payload([
+        {
+            "name": "Long outage",
+            "impact": "major",
+            "created_at": "2026-07-07T22:00:00Z",
+            "resolved_at": "2026-07-09T02:00:00Z",
+        }
+    ])
+    days, history_days = ps._reduce_incident_days(payload)
+    dates = [d["date"] for d in days]
+    assert dates == ["2026-07-07", "2026-07-08", "2026-07-09"]
+    assert all(d["impact"] == "major" for d in days)
+    assert history_days == 3
+
+
+def test_reduce_incident_days_worst_impact_wins_on_shared_day() -> None:
+    payload = _incidents_payload([
+        {
+            "name": "Minor blip",
+            "impact": "minor",
+            "created_at": "2026-07-07T01:00:00Z",
+            "resolved_at": "2026-07-07T02:00:00Z",
+        },
+        {
+            "name": "Major outage",
+            "impact": "major",
+            "created_at": "2026-07-07T10:00:00Z",
+            "resolved_at": "2026-07-07T12:00:00Z",
+        },
+    ])
+    days, _ = ps._reduce_incident_days(payload)
+    assert len(days) == 1
+    assert days[0]["impact"] == "major"
+    assert days[0]["count"] == 2
+
+
+def test_reduce_incident_days_fills_clean_days_between_incidents() -> None:
+    payload = _incidents_payload([
+        {
+            "name": "First",
+            "impact": "minor",
+            "created_at": "2026-07-01T00:00:00Z",
+            "resolved_at": "2026-07-01T01:00:00Z",
+        },
+        {
+            "name": "Second",
+            "impact": "minor",
+            "created_at": "2026-07-04T00:00:00Z",
+            "resolved_at": "2026-07-04T01:00:00Z",
+        },
+    ])
+    days, history_days = ps._reduce_incident_days(payload)
+    assert history_days == 4
+    by_date = {d["date"]: d for d in days}
+    assert by_date["2026-07-02"]["impact"] == "none"
+    assert by_date["2026-07-02"]["count"] == 0
+    assert by_date["2026-07-03"]["impact"] == "none"
+
+
+def test_reduce_incident_days_history_days_reflects_actual_span_not_constant() -> None:
+    """history_days must be derived from the fetched data, never a hardcoded
+    window like 90 — incidents.json itself only reaches back ~28 days."""
+    payload = _incidents_payload([
+        {
+            "name": "Solo",
+            "impact": "minor",
+            "created_at": "2026-07-07T00:00:00Z",
+            "resolved_at": "2026-07-07T01:00:00Z",
+        }
+    ])
+    _, history_days = ps._reduce_incident_days(payload)
+    assert history_days == 1
+    assert history_days != 90
+
+
+def test_reduce_incident_days_unresolved_incident_spans_through_now() -> None:
+    now = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
+    payload = _incidents_payload([
+        {
+            "name": "Ongoing",
+            "impact": "critical",
+            "created_at": "2026-07-08T00:00:00Z",
+            "resolved_at": None,
+        }
+    ])
+    days, history_days = ps._reduce_incident_days(payload, now=now)
+    dates = [d["date"] for d in days]
+    assert dates == ["2026-07-08", "2026-07-09", "2026-07-10"]
+    assert history_days == 3
+
+
+def test_reduce_incident_days_empty_payload_returns_empty() -> None:
+    days, history_days = ps._reduce_incident_days(_incidents_payload([]))
+    assert days == []
+    assert history_days == 0
+
+
+def test_fetch_incident_days_success(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get(ps.INCIDENTS_PAGE_URL).respond(200, json=_incidents_payload([
+        {
+            "name": "Blip",
+            "impact": "minor",
+            "created_at": "2026-07-07T10:00:00Z",
+            "resolved_at": "2026-07-07T11:00:00Z",
+        }
+    ]))
+    days, history_days = ps.fetch_incident_days(timeout_s=1.0)
+    assert history_days == 1
+    assert days[0]["date"] == "2026-07-07"
+
+
+def test_fetch_incident_days_timeout_returns_empty(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get(ps.INCIDENTS_PAGE_URL).mock(side_effect=httpx.TimeoutException("slow"))
+    days, history_days = ps.fetch_incident_days(timeout_s=1.0)
+    assert days == []
+    assert history_days == 0
+
+
+def test_fetch_incident_days_http_error_returns_empty(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get(ps.INCIDENTS_PAGE_URL).respond(500)
+    days, history_days = ps.fetch_incident_days(timeout_s=1.0)
+    assert days == []
+    assert history_days == 0
+
+
+def test_fetch_incident_days_malformed_json_returns_empty(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get(ps.INCIDENTS_PAGE_URL).respond(200, content=b"<html>")
+    days, history_days = ps.fetch_incident_days(timeout_s=1.0)
+    assert days == []
+    assert history_days == 0
+
+
 # ---------------------------------------------------------------------------
 # fetch_platform_status — direct (used by doctor)
 # ---------------------------------------------------------------------------
@@ -248,6 +435,66 @@ def test_load_or_fetch_ignores_corrupt_cache(
     assert respx_mock.calls.call_count == 1
 
 
+def test_load_or_fetch_populates_incident_days_on_cache_miss(
+    respx_mock: respx.MockRouter, _isolate: Path
+) -> None:
+    respx_mock.get(ps.STATUS_PAGE_URL).respond(200, json=_summary())
+    respx_mock.get(ps.INCIDENTS_PAGE_URL).respond(200, json=_incidents_payload([
+        {
+            "name": "Blip",
+            "impact": "minor",
+            "created_at": "2026-07-07T10:00:00Z",
+            "resolved_at": "2026-07-07T11:00:00Z",
+        }
+    ]))
+    result = ps.load_or_fetch(timeout_s=1.0)
+    assert result is not None
+    assert result.history_days == 1
+    assert result.incident_days[0]["date"] == "2026-07-07"
+    cache_file = _isolate / "platform-status.json"
+    payload = json.loads(cache_file.read_text())
+    assert payload["history_days"] == 1
+    assert payload["incident_days"][0]["date"] == "2026-07-07"
+
+
+def test_load_or_fetch_incidents_failure_does_not_break_summary(
+    respx_mock: respx.MockRouter, _isolate: Path
+) -> None:
+    """The summary fetch must still succeed even when incidents.json dies —
+    the two fetches are independent best-effort calls (Rule 20)."""
+    respx_mock.get(ps.STATUS_PAGE_URL).respond(200, json=_summary(description="Operational"))
+    respx_mock.get(ps.INCIDENTS_PAGE_URL).respond(500)
+    result = ps.load_or_fetch(timeout_s=1.0)
+    assert result is not None
+    assert result.description == "Operational"
+    assert result.incident_days == []
+    assert result.history_days == 0
+
+
+def test_load_or_fetch_fresh_cache_hit_does_not_fetch_incidents(
+    respx_mock: respx.MockRouter, _isolate: Path
+) -> None:
+    """Fresh-cache path stays a zero-network hot path — no incidents fetch
+    either, so the history feature never slows down the common case."""
+    cache_file = _isolate / "platform-status.json"
+    cache_file.write_text(json.dumps({
+        "schema_version": ps._SCHEMA_VERSION,
+        "fetched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "indicator": "none",
+        "description": "All Systems Operational",
+        "active_incidents": [],
+        "degraded_components": [],
+        "components": [],
+        "incident_days": [{"date": "2026-07-07", "impact": "minor", "count": 1}],
+        "history_days": 1,
+    }))
+    # No respx routes registered at all — any HTTP call would raise.
+    result = ps.load_or_fetch(timeout_s=1.0)
+    assert result is not None
+    assert result.history_days == 1
+    assert respx_mock.calls.call_count == 0
+
+
 # ---------------------------------------------------------------------------
 # format_status_line
 # ---------------------------------------------------------------------------
@@ -320,9 +567,43 @@ def test_to_json_meta_round_trips_fields() -> None:
     assert meta["fetch_error"] is None
 
 
+def test_to_json_meta_includes_components_and_history_fields() -> None:
+    status = ps._parse_summary(_summary(components=[
+        {"name": "API", "status": "operational"},
+    ]))
+    status.incident_days = [{"date": "2026-07-07", "impact": "minor", "count": 1}]
+    status.history_days = 1
+    meta = ps.to_json_meta(status)
+    assert meta["components"][0]["name"] == "API"
+    assert meta["incident_days"][0]["date"] == "2026-07-07"
+    assert meta["history_days"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Corrupt-cache field-mismatch variants — every guard branch in _read_cache
 # ---------------------------------------------------------------------------
+
+
+def test_read_cache_handles_old_shape_without_components_or_incident_days(
+    _isolate: Path,
+) -> None:
+    """A cache file written by a pre-history version of this module has
+    neither `components` nor `incident_days`/`history_days` — loading it must
+    yield sane empty defaults, never a KeyError."""
+    cache_file = _isolate / "platform-status.json"
+    cache_file.write_text(json.dumps({
+        "schema_version": ps._SCHEMA_VERSION,
+        "fetched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "indicator": "none",
+        "description": "All Systems Operational",
+        "active_incidents": [],
+        "degraded_components": [],
+    }))
+    result = ps._read_cache()
+    assert result is not None
+    assert result.components == []
+    assert result.incident_days == []
+    assert result.history_days == 0
 
 
 def test_read_cache_returns_none_when_fetched_at_field_missing(
