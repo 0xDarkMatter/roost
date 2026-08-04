@@ -324,3 +324,89 @@ recommended trial-dispatch pattern. See README "Trial dispatch
 write semantics (e.g., new path, opt-in flag, no-refresh mode), revisit
 this finding.
 
+---
+
+## 7. Anthropic moved model-scoped capacity into `limits[]`/`spend`, silently nulling `seven_day_sonnet`/`seven_day_opus` (2026-08-04)
+
+**Observed 2026-08-04.** Live `/api/oauth/usage` probes across the local
+four-profile fleet.
+
+**What changed:** the two windows roost previously read for per-model
+capacity — `seven_day_sonnet.utilization` and `seven_day_opus.utilization` —
+now return `null` on every profile probed. Per-model capacity (today, only
+the Fable model) moved to a new top-level `limits[]` array, entries shaped:
+
+```json
+{
+  "kind": "weekly_scoped",
+  "group": "weekly",
+  "percent": 90,
+  "severity": "critical",
+  "resets_at": "2026-08-06T02:59:59.528368+00:00",
+  "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null},
+  "is_active": true
+}
+```
+
+alongside a sibling `weekly_all` entry that carries the same aggregate
+weekly percentage `seven_day.utilization` always has (that field itself did
+**not** go null — only the per-model windows did). A parallel top-level
+`spend` block appeared too, replacing the informal unit-guessing this
+document's "extra_usage `monthly_limit`/`used_credits` unit" finding above
+records with an explicit `exponent` field (see README "Monthly Overage" for
+how `roost` uses it).
+
+`scope.model.id` is `null` upstream — `display_name` (`"Fable"`) is the only
+model identifier the response provides, so any lookup against `limits[]`
+entries has to key off the display name, case-insensitively.
+
+**Evidence:** three fixtures captured the same day —
+`tests/fixtures/oauth-usage/limits-fable-{normal,critical,exhausted}.json` —
+plus the live four-profile fleet reading that surfaced the risk in the first
+place: one profile sat at `weekly_all` 76% (comfortably `ok` under both the
+old and new aggregate signal) while its `weekly_scoped` Fable entry was
+already at 90% (`limits-fable-critical.json`). A synthetic extension of the
+same shape to Fable `percent: 100` (`limits-fable-exhausted.json`) confirmed
+the fully-exhausted case is reachable, not hypothetical. Under a classifier
+that only reads `seven_day`/`five_hour`, both cases classify `ok` and stay
+eligible for `pick` — a profile could burn every request against an
+already-exhausted Fable allotment before anything told the operator why.
+
+**Why it went unnoticed:** the old fields didn't error, disappear, or change
+shape — they degraded to `null`, and `null` was already a valid, common
+value for those fields (any Pro/Team profile, or a Max profile that simply
+hadn't touched Sonnet/Opus that week, returned `null` before this change
+too). A silent degrade-to-null looks identical to "no data for this window,"
+so nothing in the existing classifier, tests, or manual spot-checks had a
+reason to flag it. The endpoint returned `HTTP 200` throughout; there was no
+error to notice.
+
+**The tripwire added:** `probe.detect_field_drift()` compares a live
+response's top-level keys against `probe.KNOWN_USAGE_KEYS` (everything
+roost has seen) and `probe.MODELLED_USAGE_KEYS` (the strict subset roost's
+classifier/pick logic actually reads), returning `unknown` / `missing` /
+`null_modelled` lists. `roost doctor`'s `usage_field_drift` check runs it
+against one live profile on every `doctor` invocation and reports any of the
+three as a WARN-level finding — never a failure, per `AGENTS.md` rule 20,
+because an Anthropic-side schema change is not a local misconfiguration.
+This is the check that would have caught `seven_day_opus`/`seven_day_sonnet`
+going `null` the moment it happened, instead of it surfacing only once
+someone built the Fable feature and went looking for why the columns were
+empty.
+
+**Code path:** `models.py::ScopedLimit`/`Spend` (the new shapes),
+`taxonomy.py::_build_scoped_limits`/`_build_spend`/`_classify_200` (parsing
++ the `MODEL_LIMIT` classification branch), `probe.py::detect_field_drift`
+(the tripwire), `doctor.py::_check_usage_field_drift` (surfaces it),
+`pick.py` (`MODEL_LIMIT` in the filter ladder, `ALL_MODEL_LIMIT` failure
+reason), `widget.py::_active_fable_limit` and `output.py` (display).
+
+**Action for the future:** if Anthropic changes this shape again, `roost
+doctor` will report it as an `unknown`/`missing`/`null_modelled` WARN on the
+next run — that is the signal to look at, not a fixed inspection cadence.
+When a new field is deliberately read, add it to
+`probe.MODELLED_USAGE_KEYS`; when a new field is deliberately ignored, add
+it to `probe.KNOWN_USAGE_KEYS` so the drift check stops flagging it as
+`unknown`. Don't add a key to either set without having looked at what it
+actually contains.
+

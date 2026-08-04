@@ -71,6 +71,7 @@ Single resource: `profiles`. For convenience, top-level aliases collapse the res
 | `roost profiles invalidate <name>` | `roost invalidate <name>` | Drop cache for a profile; forces re-probe |
 | `roost profiles refresh [<name>\|--all\|--expired]` | `roost refresh ...` | Refresh OAuth tokens (§10) |
 | `roost exec <cmd...>` | — | Pick a profile, run a child command with `ROOST_PROFILE` set; propagate child rc |
+| `roost widget` | — | Self-contained HTML capacity cards on stdout for Claude Code's `show_widget` tool; `--max-kb` sets the byte budget (default 28) |
 | `roost doctor` | — | Diagnose local setup (§11) |
 | `roost update [--apply]` | — | Check or apply an in-place upgrade |
 | `roost --version` | — | Print semver, exit 0 |
@@ -209,6 +210,14 @@ Standard Forma (§5) mapping:
 | 8 | TIMEOUT | Probe timed out (uses `--timeout`, default 10s) |
 | 9 | UNAVAILABLE | All profiles in terminal-bad states (`weekly_limit` / `auth_dead`) |
 
+**`model_limit` gap:** `pick`'s `ALL_MODEL_LIMIT` failure reason (all profiles
+`model_limit`-exhausted) has no entry in `cli.REASON_TO_EXIT` — it currently
+falls through that dict's `.get(reason, EXIT_ERROR)` default and returns
+generic code `1` with the generic "Pick failed." message, not a code of its
+own the way `ALL_WEEKLY` gets `9`. Scripts that branch on exit code cannot
+currently distinguish "all profiles model-limited" from "something else went
+wrong." See `src/claude_lb/cli.py`.
+
 ### Scripting example
 
 ```bash
@@ -244,7 +253,7 @@ Always: data-structured JSON to stdout when `--json`, human message to stderr, s
 
 ## 6. Health Taxonomy
 
-**The heart of the tool.** Seven states, each with a distinct signal source, TTL, and next-action. All signals come from a single probe against `/api/oauth/usage` (see §7).
+**The heart of the tool.** Nine states, each with a distinct signal source, TTL, and next-action. All signals come from a single probe against `/api/oauth/usage` (see §7), except `auth_expired` which is a local check against the stored token's `expiresAt` and never touches the network.
 
 | State | Detection | TTL in cache | Next-action hint |
 |---|---|---|---|
@@ -252,6 +261,8 @@ Always: data-structured JSON to stdout when `--json`, human message to stderr, s
 | `rate_limited` | HTTP 429 on the usage endpoint itself (rare) | `retry-after` seconds, else 60 s | Retry in N seconds |
 | `session_limit` | HTTP 200 with `five_hour.utilization >= 100` | until `five_hour.resets_at` (parsed from body, else +5 h from probe) | Skip until session reset |
 | `weekly_limit` | HTTP 200 with `seven_day.utilization >= 100` | until `seven_day.resets_at` (parsed from body, else +7 days from probe) | Skip until weekly reset; operator tier upgrade may be needed |
+| `model_limit` | HTTP 200 with an *active* entry in the top-level `limits[]` array at `percent >= 100`, while `seven_day`/`five_hour` are both still under 100 (model-scoped capacity, currently Fable, exhausts independently of the aggregate windows) | until that limit's `resets_at`, else the same +7-day default as `weekly_limit` | Skip until that model's window resets |
+| `auth_expired` | Local: stored `expiresAt` is past — no network call made | invalidates on refresh | `roost refresh <name>` |
 | `auth_dead` | HTTP 401, body `error.type == authentication_error` | infinite (manual invalidation only) | `claude login --profile <name>` |
 | `network_error` | timeout / DNS / TLS / refused | 30 sec | Transient; retry |
 | `unknown` | any other response (5xx, non-scope 403, malformed body) | 60 sec | Logged for operator review |
@@ -259,10 +270,13 @@ Always: data-structured JSON to stdout when `--json`, human message to stderr, s
 ### Classification order (first match wins)
 
 ```
+0. if local access-token expiresAt is past:  auth_expired  (no network call)
 1. if exception (timeout, DNS, TLS):        network_error
 2. if HTTP 200:
      if seven_day.utilization >= 100:        weekly_limit
      elif five_hour.utilization >= 100:      session_limit
+     elif any active limits[] entry
+          has percent >= 100:                model_limit
      else:                                    ok
 3. if HTTP 401:                              auth_dead
 4. if HTTP 403:
@@ -271,6 +285,12 @@ Always: data-structured JSON to stdout when `--json`, human message to stderr, s
 5. if HTTP 429:                              rate_limited (with retry-after if present)
 6. otherwise:                                unknown
 ```
+
+Only an `is_active: true` entry in `limits[]` can trigger `model_limit` — an
+inactive-but-exhausted entry is informational only (see §9's filter-ladder
+note and `AGENTS.md` rule 29). `weekly_limit`/`session_limit` are checked
+before `model_limit`, so a profile that is both weekly-exhausted and
+model-exhausted classifies as `weekly_limit`.
 
 **No keyword matching.** Utilization numbers are the direct signal; the 429 keyword lists from v0.1 (`patterns.py`) are retired.
 

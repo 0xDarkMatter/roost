@@ -314,9 +314,21 @@ roost probe account-a                   # Live-probe one
 roost status                         # Cached table + Anthropic platform-status header (stderr) + summary (stdout)
 roost status --no-cache              # Ignore cache; full re-probe (incl. status.claude.com)
 roost status --no-platform-status    # Skip the status.claude.com fetch
+roost status --cards                 # Render one capacity-card panel per profile instead of the table
+roost widget                         # Self-contained HTML capacity cards for Claude Code's show_widget tool
 roost show account-a                    # Detail for one profile
 roost invalidate account-a              # Drop this profile's cache entry
 ```
+
+`--cards` renders one capacity-card panel per profile (Session / Weekly / Fable /
+Overage bars) to stderr instead of the table — same data, denser per-profile view.
+
+`roost widget` renders the same data as a single self-contained HTML fragment on
+**stdout**, sized for Claude Code's `show_widget` tool: no `<script>` tag at all, no
+CDN script or stylesheet, no webfont, no outbound request of any kind — the tool
+renders it behind a strict CSP that blocks all of them. `render_widget()` enforces a
+hard byte budget (`--max-kb`, default 28 KiB) by dropping the least-recently-probed
+profiles until the page fits, warning on stderr if anything was dropped.
 
 ### Picking
 
@@ -538,7 +550,7 @@ roost config usage-log status        # Check current state
 roost config usage-log off           # Disable
 
 roost report                         # Per-profile min/max/avg of weekly_pct
-roost report --metric session_pct    # Other metrics: session_pct | sonnet_pct | opus_pct | overage_pct
+roost report --metric session_pct    # Other metrics: session_pct | fable_pct | sonnet_pct | opus_pct | overage_pct | spend_pct
 roost report --sparkline             # Add a Unicode sparkline of the time-series
 roost report --project               # Linear burn-rate forecast: ETA → 100%
 roost report --since 1d --json       # Filter + structured output
@@ -630,7 +642,7 @@ both text and JSON modes.
 
 ## Health Taxonomy
 
-Eight states. Signals come from a single probe against `/api/oauth/usage`
+Nine states. Signals come from a single probe against `/api/oauth/usage`
 plus a local check of the stored token's `expiresAt`.
 
 | State | Detection | TTL | Next action |
@@ -639,12 +651,18 @@ plus a local check of the stored token's `expiresAt`.
 | `rate_limited` | 429 on usage endpoint | `retry-after` s, else 60 s | Retry in N seconds |
 | `session_limit` | HTTP 200 with `five_hour.utilization >= 100` | until `five_hour.resets_at` | Skip until session reset |
 | `weekly_limit` | HTTP 200 with `seven_day.utilization >= 100` | until `seven_day.resets_at` | Skip until weekly reset |
+| `model_limit` | HTTP 200 with an *active* `limits[]` entry at `percent >= 100`, while `seven_day`/`five_hour` are both still under 100 (e.g. the aggregate weekly window at 76% with the Fable-scoped window exhausted) | until that limit's `resets_at` | Skip until that model's window resets |
 | `auth_expired` | Local: stored `expiresAt` is past (no network call) | invalidates on refresh | `roost refresh <name>` |
 | `auth_dead` | HTTP 401 on usage endpoint | manual | `claude login --profile <name>` |
 | `network_error` | timeout / DNS / TLS / refused | 30 s | Transient; retry |
 | `unknown` | other 4xx/5xx, malformed body | 60 s | Inspect with `show` |
 
-Classification order: network exception → local-expiry → 200+utilization → 401 → 403+scope-check → 429 → unknown. See [`docs/SPEC.md`](docs/SPEC.md) §6 + [`src/claude_lb/taxonomy.py`](src/claude_lb/taxonomy.py).
+Classification order: network exception → local-expiry → 200 (weekly → session →
+active model-scoped limit → ok) → 401 → 403+scope-check → 429 → unknown.
+`weekly_limit`/`session_limit` are checked before `model_limit`, so a profile that's
+both weekly-exhausted and model-exhausted reports `weekly_limit` — the broader,
+longer-lasting condition wins. See [`docs/SPEC.md`](docs/SPEC.md) §6 +
+[`src/claude_lb/taxonomy.py`](src/claude_lb/taxonomy.py).
 
 ## Picker Strategies
 
@@ -674,7 +692,7 @@ Stickiness window: `--stickiness <s>` or `CLAUDE_LB_STICKINESS=<s>`. Set to `0` 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Unexpected error |
+| 1 | Unexpected error — also the current fallback for `pick`/`which`/`exec` when every profile is `model_limit`-exhausted. `ALL_MODEL_LIMIT` has no dedicated entry in `cli.REASON_TO_EXIT`, so it falls through to this generic code with the generic "Pick failed." message rather than a code of its own like `ALL_WEEKLY` gets. |
 | 2 | `AUTH_REQUIRED` — all profiles `auth_dead` or `auth_expired`; run `roost refresh --expired` or `claude login` |
 | 3 | `NOT_FOUND` — unknown profile given to `show` / `probe` / `refresh` / `invalidate` |
 | 4 | `VALIDATION` — bad flag (e.g. unknown strategy, or `refresh` with no args) |
@@ -682,7 +700,7 @@ Stickiness window: `--stickiness <s>` or `CLAUDE_LB_STICKINESS=<s>`. Set to `0` 
 | 6 | `RATE_LIMITED` — all profiles throttled |
 | 7 | `CONFLICT` — `refresh` blocked: either a file-lock race (another process is refreshing the same profile), or the profile is leased by an active `roost exec` child (`LEASE_HELD`). Retry after the child exits. |
 | 8 | `TIMEOUT` |
-| 9 | `UNAVAILABLE` — no profiles, or all terminal-bad |
+| 9 | `UNAVAILABLE` — no profiles, or all terminal-bad (`NO_PROFILES`, `ALL_WEEKLY`, `ALL_TERMINAL`) |
 
 ## Environment Variables
 
@@ -697,8 +715,8 @@ Stickiness window: `--stickiness <s>` or `CLAUDE_LB_STICKINESS=<s>`. Set to `0` 
 ## Diagnostics
 
 ```bash
-roost doctor                 # Check config dir, profiles, credentials, cache, network, status.claude.com
-roost doctor --skip-network  # Offline variant (also skips status-page check)
+roost doctor                 # Check config dir, profiles, credentials, cache, network, status.claude.com, usage-field drift
+roost doctor --skip-network  # Offline variant (also skips status-page + drift checks)
 roost doctor --json          # Machine-readable
 
 roost update                 # Version + git-upstream ahead/behind check
@@ -706,6 +724,14 @@ roost update --json          # meta.update_available tells you if behind
 roost update --apply         # git pull --ff-only + uv tool install --reinstall --editable
 roost update --apply --no-pull  # Just re-sync deps (useful when a new dep was added locally)
 ```
+
+**`usage_field_drift`:** `roost doctor` probes one profile and diffs the raw
+`/api/oauth/usage` response's top-level keys against what `roost` knows about
+(`unknown` keys, `missing` modelled keys, or a modelled key present-but-`null`).
+Always WARN-level — an Anthropic-side schema change is never a local
+misconfiguration, so this check never fails the doctor run. It's the check
+that would have caught the `seven_day_opus`/`seven_day_sonnet`-going-null
+shift (see `docs/findings.md`) before it went unnoticed for weeks.
 
 **Windows self-upgrade caveat:** on Windows, `roost update --apply` can't
 reinstall itself while running — the current process has its own `.pyd` files
@@ -766,14 +792,20 @@ still works but falls back to the hard weekly/session caps until the next
 month. The status table shows an **Overage** column (colour-coded) when any
 profile has overage enabled.
 
-> **Unit caveat:** `monthly_limit` and `used_credits` are integers from
-> Anthropic's API. The unit is undocumented. Empirically, the numbers only
-> make sense as **currency minor units (×100)** — so `monthly_limit: 31000`
-> with `currency: "AUD"` is **$310 AUD**, not $31,000 AUD. `roost`
-> doesn't reinterpret these — it stores them raw and reports `utilization`
-> as a percentage, which is the only field guaranteed to mean the same thing
-> regardless of unit. If you need the displayed dollar amount, divide by 100
-> at the call site.
+> **Unit caveat (now documented upstream):** `monthly_limit` and `used_credits`
+> (the `extra_usage` block above) are integers whose unit was originally
+> undocumented — empirically ×100 currency minor units, i.e. `monthly_limit:
+> 31000` with `currency: "AUD"` meant **$310 AUD**, not $31,000 AUD (see
+> `docs/findings.md`). Anthropic's API now states the exponent explicitly,
+> though on two different blocks: `extra_usage.decimal_places` (not parsed by
+> `roost` — `ExtraUsage` doesn't model this field) and a newer sibling
+> top-level `spend` block, where `spend.used.exponent` / `spend.limit.exponent`
+> give the same minor-unit power (2 = cents) and `roost` stores it verbatim
+> as `Usage.spend.exponent`. `roost` does **not** convert `spend.used_minor` /
+> `spend.limit_minor` using the exponent — it stores them raw, same as
+> `extra_usage` always has, and reports `percent` as the unit-safe signal for
+> both. If you need the displayed dollar amount, divide `used_minor` by
+> `10 ** exponent` at the call site.
 
 ## Platform status (status.claude.com)
 
