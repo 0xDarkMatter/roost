@@ -569,6 +569,10 @@ def test_health_is_transient_for_recoverable_states() -> None:
     transient = {
         Health.RATE_LIMITED,
         Health.SESSION_LIMIT,
+        # A scoped model limit recovers on its own window's reset, exactly
+        # like SESSION_LIMIT — the account stays usable for other models
+        # meanwhile, so it is never terminal.
+        Health.MODEL_LIMIT,
         Health.AUTH_EXPIRED,
         Health.NETWORK_ERROR,
         Health.UNKNOWN,
