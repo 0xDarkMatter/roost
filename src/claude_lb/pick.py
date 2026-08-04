@@ -279,12 +279,27 @@ def _is_selectable(entry: ProfileHealth, now: datetime, require_ok: bool) -> boo
     return True
 
 
+def _blocking_reset(entry: ProfileHealth) -> datetime | None:
+    """The timestamp that governs THIS entry's blocking condition.
+
+    A profile carries several reset timestamps at once, and only one of them
+    actually gates it. A model-limited profile whose session window rolls over
+    in an hour is still model-limited until its scoped window resets days
+    later — reporting the session reset as its recovery time tells a caller to
+    retry into the same failure.
+    """
+    if entry.health is Health.WEEKLY_LIMIT:
+        return entry.weekly_reset_at or entry.expires_at
+    if entry.health is Health.SESSION_LIMIT:
+        return entry.session_reset_at or entry.expires_at
+    if entry.health is Health.MODEL_LIMIT:
+        return entry.model_reset_at or entry.expires_at
+    # RATE_LIMITED and everything else recover when the cache entry does.
+    return entry.expires_at
+
+
 def _earliest_recovery(entries: list[ProfileHealth]) -> datetime | None:
-    candidates: list[datetime] = []
-    for e in entries:
-        for ts in (e.weekly_reset_at, e.session_reset_at, e.model_reset_at, e.expires_at):
-            if ts is not None:
-                candidates.append(ts)
+    candidates = [ts for e in entries if (ts := _blocking_reset(e)) is not None]
     return min(candidates) if candidates else None
 
 

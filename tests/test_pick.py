@@ -1224,3 +1224,24 @@ def test_model_limit_mixed_with_ok_prefers_ok() -> None:
     outcome = pick(cache, ["limited", "ok"], now=FIXED_NOW)
     assert outcome.chosen is not None
     assert outcome.chosen.name == "ok"
+
+
+def test_earliest_recovery_uses_the_blocking_window_not_the_soonest() -> None:
+    """A profile recovers when ITS blocking window resets, not the soonest one.
+
+    A model-limited profile whose session window rolls over in an hour is
+    still model-limited until the scoped window resets days later. Reporting
+    the session reset told a caller to retry straight into the same failure.
+    """
+    from claude_lb.pick import _earliest_recovery
+
+    soon = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
+    later = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    entry = ProfileHealth(
+        name="a",
+        health=Health.MODEL_LIMIT,
+        probed_at=soon,
+        session_reset_at=soon,
+        model_reset_at=later,
+    )
+    assert _earliest_recovery([entry]) == later

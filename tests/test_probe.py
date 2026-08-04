@@ -505,3 +505,18 @@ def test_detect_field_drift_does_not_mutate_body() -> None:
     before = json.loads(json.dumps(body))
     detect_field_drift(body)
     assert body == before
+
+
+def test_detect_field_drift_never_raises_on_non_string_keys() -> None:
+    """The docstring promises "never raises" — hold it to that.
+
+    JSON objects can only have string keys, so this cannot happen from a real
+    response, but sorted() previously threw TypeError comparing str to int
+    for a hand-built dict. A tripwire that can crash its caller is worse than
+    no tripwire.
+    """
+    from claude_lb.probe import detect_field_drift
+
+    result = detect_field_drift({1: None, "quokka_sunset": None})
+    assert "quokka_sunset" in result["unknown"]
+    assert "1" in result["unknown"]

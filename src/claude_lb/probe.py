@@ -65,7 +65,11 @@ def detect_field_drift(body: dict[str, Any] | None) -> dict[str, list[str]]:
         # against, so it is not itself drift-worthy (e.g. a 204/empty probe
         # response shouldn't be reported as "every key went missing").
         return {"unknown": [], "missing": [], "null_modelled": []}
-    keys = set(body.keys())
+    # Coerce keys to str before sorting. JSON objects can only have string
+    # keys, so this never fires on a real response — but the contract above
+    # says "never raises", and a caller passing a hand-built dict with a
+    # non-str key made `sorted()` throw TypeError comparing str to int.
+    keys = {k if isinstance(k, str) else str(k) for k in body}
     return {
         "unknown": sorted(keys - KNOWN_USAGE_KEYS),
         "missing": sorted(MODELLED_USAGE_KEYS - keys),
@@ -157,6 +161,11 @@ def _classification_to_health(
         retry_after_s=result.retry_after_s,
         session_reset_at=result.session_reset_at,
         weekly_reset_at=result.weekly_reset_at,
+        # Must be carried through: the classifier computes it, but a
+        # ProfileHealth is what gets cached and rendered. Dropping it left a
+        # model-limited profile with no actionable reset — the status table
+        # showed "—" and the filter ladder had nothing to compare against.
+        model_reset_at=result.model_reset_at,
         usage=result.usage,
         probe_latency_ms=latency_ms,
         credentials_mtime=profile.credentials_mtime,

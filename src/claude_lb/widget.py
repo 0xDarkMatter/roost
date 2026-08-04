@@ -45,6 +45,8 @@ from typing import Any
 # cards track light/dark both standalone (opened as a file) and inside the chat
 # host's own theme toggle. An earlier build hardcoded dark values as var()
 # fallbacks, which rendered every card dark on a light desktop.
+_INCIDENT_MAX_CHARS = 160
+
 _STYLE = (
     "<style>"
     ".rw{color-scheme:light dark;"
@@ -65,10 +67,8 @@ _STYLE = (
     ".rw *{box-sizing:border-box}"
     ".rw-mono{font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace}"
     ".rw-summary{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;"
-    "margin:0 0 10px;font-size:10px;color:var(--rw-muted);"
-    "text-transform:uppercase;letter-spacing:.08em}"
-    ".rw-incident{width:100%;color:var(--rw-warn);text-transform:none;"
-    "letter-spacing:0;font-size:11px}"
+    "margin:0 0 10px;font-size:11px;color:var(--rw-muted);letter-spacing:.02em}"
+    ".rw-incident{width:100%;color:var(--rw-warn);letter-spacing:0;font-size:11px}"
     ".rw-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));"
     "gap:8px}"
     ".rw-empty{font-size:11px;color:var(--rw-muted);padding:1rem 0}"
@@ -78,14 +78,12 @@ _STYLE = (
     ".rw-hd{display:flex;align-items:center;gap:7px;flex-wrap:wrap;row-gap:4px}"
     ".rw-pip{width:8px;height:8px;border-radius:1.5px;flex:none}"
     ".rw-name{font-size:12px;font-weight:600;overflow-wrap:anywhere}"
-    ".rw-state{font-size:10px;color:var(--rw-muted);text-transform:uppercase;"
-    "letter-spacing:.06em}"
-    ".rw-tag{font-size:10px;color:var(--rw-muted);text-transform:uppercase;"
-    "letter-spacing:.06em;margin-left:auto}"
+    ".rw-state{font-size:11px;color:var(--rw-muted);letter-spacing:.02em}"
+    ".rw-tag{font-size:11px;color:var(--rw-muted);letter-spacing:.02em;"
+    "margin-left:auto}"
     ".rw-gauges{display:flex;flex-direction:column;gap:5px}"
     ".rw-glabel{display:flex;justify-content:space-between;align-items:baseline;"
-    "gap:8px;font-size:10px;color:var(--rw-muted);text-transform:uppercase;"
-    "letter-spacing:.08em}"
+    "gap:8px;font-size:11px;color:var(--rw-muted);letter-spacing:.02em}"
     ".rw-val{font-size:11px;font-weight:500;letter-spacing:0}"
     ".rw-gtrack{height:4px;border-radius:1px;background:var(--rw-track);"
     "overflow:hidden;margin-top:2px}"
@@ -149,6 +147,20 @@ def render_widget(
             f"to stay under the {max_bytes}-byte show_widget inline-render budget",
             stacklevel=2,
         )
+    # Dropping profiles cannot shrink the fixed chrome (the style block and
+    # the summary header). With a small enough budget, or a pathological
+    # incident description, the page can still overshoot after the last
+    # profile is gone — and silently returning an over-budget page is exactly
+    # the failure the budget exists to prevent, because the caller only finds
+    # out when show_widget declines to render it inline. Say so instead.
+    size = len(html.encode("utf-8"))
+    if size > max_bytes:
+        warnings.warn(
+            f"roost widget: page is {size} bytes, over the {max_bytes}-byte "
+            "budget, and cannot be reduced further — the fixed chrome alone "
+            "exceeds it. show_widget may refuse to render this inline.",
+            stacklevel=2,
+        )
     return html
 
 
@@ -189,6 +201,12 @@ def _incident_line(meta: dict[str, Any]) -> str:
     if not indicator or indicator == "none":
         return ""
     label = platform_status.get("description") or str(indicator).replace("_", " ")
+    # Bounded because it is the one unbounded field in the payload: a long
+    # Statuspage description would otherwise blow the byte budget on its own,
+    # and dropping profiles cannot claw that back.
+    label = str(label)
+    if len(label) > _INCIDENT_MAX_CHARS:
+        label = label[: _INCIDENT_MAX_CHARS - 1].rstrip() + "…"
     return f'<span class="rw-incident">status.claude.com: {_esc(label)}</span>'
 
 
