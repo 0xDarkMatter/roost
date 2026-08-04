@@ -73,6 +73,15 @@ class PlatformStatus:
     # fixed 90-day window) — always derive this from the fetched data instead
     # of hardcoding a window size, so a consumer can label the grid honestly.
     history_days: int = 0
+    # Per-component breakdown of the same day series. Every value list has
+    # the SAME dates, in the same order, and the same length as
+    # `incident_days` (clean days included as impact="none") — a consumer
+    # renders these as parallel grids and must not have to align them
+    # itself. Only components present in `components` get a key; an
+    # incident naming a component that's since been renamed/removed still
+    # folds into the fleet-wide `incident_days` but never creates a stray
+    # key here.
+    component_days: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     fetched_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     fetch_error: str | None = None  # set when fresh fetch failed AND no cache to use
 
@@ -200,6 +209,91 @@ def _reduce_incident_days(
     return days, (range_end - range_start).days + 1
 
 
+def _reduce_component_days(
+    payload: dict[str, Any],
+    known_components: set[str],
+    incident_days: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Attribute each incident's day-span to every component it names.
+
+    Walks the same incidents.json payload `_reduce_incident_days` already
+    reduced, but keyed per-component instead of fleet-wide. Deliberately
+    fills every series to the SAME dates as `incident_days` (not each
+    component's own first/last incident) — that's what lets a consumer
+    render fleet-wide and per-component grids side by side with zero
+    alignment logic of its own.
+    """
+    if not incident_days or not known_components:
+        return {}
+
+    ref_now = now or datetime.now(UTC)
+    by_component: dict[str, dict[date, dict[str, Any]]] = {}
+    for inc in payload.get("incidents") or []:
+        created = _parse_incident_timestamp(inc.get("created_at"))
+        if created is None:
+            continue
+        resolved = _parse_incident_timestamp(inc.get("resolved_at"))
+        end = resolved or ref_now
+        if end < created:
+            end = created
+        impact = str(inc.get("impact") or "none").lower()
+        if impact not in _IMPACT_RANK:
+            impact = "none"
+
+        # Only components still present in the current summary get tracked —
+        # a renamed/removed component's incidents still count toward the
+        # fleet-wide reduction but must not fabricate a stray key here.
+        comp_names = {
+            c.get("name")
+            for c in (inc.get("components") or [])
+            if c.get("name") in known_components
+        }
+        if not comp_names:
+            continue
+
+        day = created.date()
+        end_day = end.date()
+        while day <= end_day:
+            for name in comp_names:
+                comp_map = by_component.setdefault(name, {})
+                entry = comp_map.get(day)
+                if entry is None:
+                    comp_map[day] = {"impact": impact, "count": 1}
+                else:
+                    entry["impact"] = _worst_impact(entry["impact"], impact)
+                    entry["count"] += 1
+            day += timedelta(days=1)
+
+    result: dict[str, list[dict[str, Any]]] = {}
+    for name in known_components:
+        comp_map = by_component.get(name, {})
+        series: list[dict[str, Any]] = []
+        for entry in incident_days:
+            day = date.fromisoformat(entry["date"])
+            comp_entry = comp_map.get(day, {"impact": "none", "count": 0})
+            series.append(
+                {"date": entry["date"], "impact": comp_entry["impact"], "count": comp_entry["count"]}
+            )
+        result[name] = series
+    return result
+
+
+def _fetch_incidents_payload(timeout_s: float) -> dict[str, Any] | None:
+    """Shared HTTP fetch for incidents.json. Returns None on any failure —
+    network, HTTP error, or malformed JSON — never raises. See Rule 20."""
+    try:
+        response = httpx.get(INCIDENTS_PAGE_URL, timeout=timeout_s)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:  # noqa: BLE001 -- best-effort enrichment
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
 def fetch_incident_days(
     timeout_s: float = STATUS_CACHE_TIMEOUT_S,
 ) -> tuple[list[dict[str, Any]], int]:
@@ -210,13 +304,34 @@ def fetch_incident_days(
     ([], 0) rather than raising. This is enrichment on top of enrichment;
     it must never be able to take down the summary fetch it accompanies.
     """
+    payload = _fetch_incidents_payload(timeout_s)
+    if payload is None:
+        return [], 0
     try:
-        response = httpx.get(INCIDENTS_PAGE_URL, timeout=timeout_s)
-        response.raise_for_status()
-        payload = response.json()
         return _reduce_incident_days(payload)
     except Exception:  # noqa: BLE001 -- best-effort enrichment, see docstring
         return [], 0
+
+
+def fetch_incident_and_component_days(
+    known_components: set[str],
+    timeout_s: float = STATUS_CACHE_TIMEOUT_S,
+) -> tuple[list[dict[str, Any]], int, dict[str, list[dict[str, Any]]]]:
+    """One-shot fetch + reduce of incidents.json, fleet-wide AND per-component.
+
+    A single HTTP call feeds both reductions — `component_days` is derived
+    from the same payload, never a second request. Best-effort: any failure
+    returns ([], 0, {}) rather than raising.
+    """
+    payload = _fetch_incidents_payload(timeout_s)
+    if payload is None:
+        return [], 0, {}
+    try:
+        days, history_days = _reduce_incident_days(payload)
+        component_days = _reduce_component_days(payload, known_components, days)
+        return days, history_days, component_days
+    except Exception:  # noqa: BLE001 -- best-effort enrichment
+        return [], 0, {}
 
 
 def fetch_platform_status(timeout_s: float = STATUS_CACHE_TIMEOUT_S) -> PlatformStatus:
@@ -249,6 +364,7 @@ def _write_cache(status: PlatformStatus) -> None:
         "components": status.components,
         "incident_days": status.incident_days,
         "history_days": status.history_days,
+        "component_days": status.component_days,
     }
     try:
         fd, tmp = tempfile.mkstemp(prefix=".platform-status-", dir=str(target_dir))
@@ -292,10 +408,13 @@ def _read_cache() -> PlatformStatus | None:
         active_incidents=list(payload.get("active_incidents") or []),
         degraded_components=list(payload.get("degraded_components") or []),
         # .get() defaults handle a cache file written by a pre-history version
-        # of this module, which has neither key.
+        # of this module, which has neither key. `component_days` is newer
+        # still — a cache from before this field existed has neither key,
+        # and must load to an empty dict, not raise.
         components=list(payload.get("components") or []),
         incident_days=list(payload.get("incident_days") or []),
         history_days=int(payload.get("history_days") or 0),
+        component_days=dict(payload.get("component_days") or {}),
         fetched_at=fetched_at,
     )
 
@@ -339,7 +458,10 @@ def load_or_fetch(
             fetch_error=f"{type(exc).__name__}: {exc}",
         )
 
-    fresh.incident_days, fresh.history_days = fetch_incident_days(timeout_s=timeout_s)
+    known_components = {c["name"] for c in fresh.components if c.get("name")}
+    fresh.incident_days, fresh.history_days, fresh.component_days = (
+        fetch_incident_and_component_days(known_components, timeout_s=timeout_s)
+    )
 
     _write_cache(fresh)
     return fresh
@@ -401,6 +523,7 @@ def to_json_meta(status: PlatformStatus) -> dict[str, Any]:
         "components": status.components,
         "incident_days": status.incident_days,
         "history_days": status.history_days,
+        "component_days": status.component_days,
         "fetched_at": status.fetched_at.isoformat().replace("+00:00", "Z"),
         "age_seconds": int(status.age_seconds()),
         "fetch_error": status.fetch_error,
