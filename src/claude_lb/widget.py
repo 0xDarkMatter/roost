@@ -31,36 +31,68 @@ import warnings
 from datetime import UTC, datetime
 from typing import Any
 
+# Palette and metrics are lifted verbatim from fleetflow's ff-monitor.html so
+# roost's cards read as the same family as the fleet monitor and the summon
+# session picker. Deliberately NOT the chat host's design tokens: this is a
+# technical/instrument register (8px corners, 1px rules, square pips,
+# uppercase micro-labels, monospace figures), and host tokens would pull it
+# toward the softer editorial look of the surrounding page. Change it here and
+# in ff-monitor.html together.
+#
+# Scoped to `.rw` rather than `:root` because this renders as a FRAGMENT inside
+# a host page — writing `:root` would leak roost's palette onto everything else
+# on it. The prefers-color-scheme block plus the data-theme overrides mean the
+# cards track light/dark both standalone (opened as a file) and inside the chat
+# host's own theme toggle. An earlier build hardcoded dark values as var()
+# fallbacks, which rendered every card dark on a light desktop.
 _STYLE = (
     "<style>"
-    "*{box-sizing:border-box}"
-    ".rw-summary{font-family:\"Segoe UI\",Roboto,\"Helvetica Neue\",sans-serif;"
-    "font-size:13px;color:var(--text-secondary,#a8a6a0);margin:0 0 12px;"
-    "display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center}"
-    ".rw-incident{width:100%;color:#BA7517;font-size:12px}"
-    ".rw-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));"
-    "gap:12px;font-family:\"Segoe UI\",Roboto,\"Helvetica Neue\",sans-serif}"
-    ".rw-empty{font-family:\"Segoe UI\",Roboto,\"Helvetica Neue\",sans-serif;"
-    "font-size:13px;color:var(--text-muted,#7a7872);padding:1rem 0}"
-    ".rw-card{background:var(--surface-2,#262624);border:.5px solid var(--border,#3a3a38);"
-    "border-radius:var(--radius,12px);padding:14px 16px;display:flex;"
-    "flex-direction:column;gap:9px;min-width:0}"
-    ".rw-hd{display:flex;align-items:center;gap:7px;flex-wrap:wrap;row-gap:6px}"
-    ".rw-pip{width:9px;height:9px;border-radius:50%;flex:none}"
-    ".rw-name{font-size:15px;font-weight:600;color:var(--text-primary,#e8e6e0);"
-    "overflow-wrap:anywhere}"
-    ".rw-state{font-size:12px;color:var(--text-secondary,#a8a6a0)}"
-    ".rw-tag{font-size:10px;border-radius:5px;padding:1px 6px;"
-    "border:.5px solid var(--border-strong,#4a4a46);color:var(--text-muted,#7a7872);"
-    "margin-left:auto}"
-    ".rw-gauges{display:flex;flex-direction:column;gap:6px}"
-    ".rw-gauge{display:flex;flex-direction:column;gap:3px}"
-    ".rw-glabel{display:flex;justify-content:space-between;font-size:11px;"
-    "color:var(--text-secondary,#a8a6a0)}"
-    ".rw-gtrack{height:6px;border-radius:3px;background:var(--surface-1,#1c1c1a);"
-    "overflow:hidden}"
-    ".rw-gfill{height:100%;border-radius:3px}"
-    ".rw-foot{font-size:11px;color:var(--text-muted,#7a7872);margin-top:2px}"
+    ".rw{color-scheme:light dark;"
+    "--rw-card:#fff;--rw-border:#e4e2dd;--rw-text:#1a1a17;--rw-muted:#8a887f;"
+    "--rw-track:#efeee9;"
+    "--rw-ok:#1d9e75;--rw-bad:#e24b4a;--rw-warn:#c8871b;--rw-idle:#d3d1c7;"
+    "font:12px/1.45 \"Segoe UI\",\"Helvetica Neue\",ui-sans-serif,sans-serif;"
+    "color:var(--rw-text)}"
+    "@media (prefers-color-scheme:dark){.rw{"
+    "--rw-card:#262624;--rw-border:#3a3936;--rw-text:#ececea;--rw-muted:#8f8d85;"
+    "--rw-track:#1c1c1a;--rw-warn:#e0a233;--rw-idle:#444441}}"
+    ":root[data-theme=\"dark\"] .rw{"
+    "--rw-card:#262624;--rw-border:#3a3936;--rw-text:#ececea;--rw-muted:#8f8d85;"
+    "--rw-track:#1c1c1a;--rw-warn:#e0a233;--rw-idle:#444441}"
+    ":root[data-theme=\"light\"] .rw{"
+    "--rw-card:#fff;--rw-border:#e4e2dd;--rw-text:#1a1a17;--rw-muted:#8a887f;"
+    "--rw-track:#efeee9;--rw-warn:#c8871b;--rw-idle:#d3d1c7}"
+    ".rw *{box-sizing:border-box}"
+    ".rw-mono{font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace}"
+    ".rw-summary{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;"
+    "margin:0 0 10px;font-size:10px;color:var(--rw-muted);"
+    "text-transform:uppercase;letter-spacing:.08em}"
+    ".rw-incident{width:100%;color:var(--rw-warn);text-transform:none;"
+    "letter-spacing:0;font-size:11px}"
+    ".rw-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));"
+    "gap:8px}"
+    ".rw-empty{font-size:11px;color:var(--rw-muted);padding:1rem 0}"
+    ".rw-card{background:var(--rw-card);border:1px solid var(--rw-border);"
+    "border-radius:8px;padding:8px 10px;display:flex;flex-direction:column;"
+    "gap:7px;min-width:0}"
+    ".rw-hd{display:flex;align-items:center;gap:7px;flex-wrap:wrap;row-gap:4px}"
+    ".rw-pip{width:8px;height:8px;border-radius:1.5px;flex:none}"
+    ".rw-name{font-size:12px;font-weight:600;overflow-wrap:anywhere}"
+    ".rw-state{font-size:10px;color:var(--rw-muted);text-transform:uppercase;"
+    "letter-spacing:.06em}"
+    ".rw-tag{font-size:10px;color:var(--rw-muted);text-transform:uppercase;"
+    "letter-spacing:.06em;margin-left:auto}"
+    ".rw-gauges{display:flex;flex-direction:column;gap:5px}"
+    ".rw-glabel{display:flex;justify-content:space-between;align-items:baseline;"
+    "gap:8px;font-size:10px;color:var(--rw-muted);text-transform:uppercase;"
+    "letter-spacing:.08em}"
+    ".rw-val{font-size:11px;font-weight:500;letter-spacing:0}"
+    ".rw-gtrack{height:4px;border-radius:1px;background:var(--rw-track);"
+    "overflow:hidden;margin-top:2px}"
+    ".rw-gfill{height:100%;border-radius:1px}"
+    ".rw-reset{font-size:10px;color:var(--rw-muted);margin-top:1px}"
+    ".rw-foot{border-top:1px solid var(--rw-border);margin-top:1px;padding-top:5px;"
+    "font-size:10px;color:var(--rw-muted)}"
     "</style>"
 )
 
@@ -127,7 +159,9 @@ def _render(profiles: list[dict[str, Any]], meta: dict[str, Any]) -> str:
         grid = f'<div class="rw-grid">{cards}</div>'
     else:
         grid = '<div class="rw-empty">No profiles discovered — run <code>roost probe</code> first.</div>'
-    return f"{_STYLE}{_render_summary(profiles, meta)}{grid}"
+    # Everything lives inside .rw so the palette custom properties stay scoped
+    # to this fragment instead of leaking onto the host page.
+    return f'{_STYLE}<div class="rw">{_render_summary(profiles, meta)}{grid}</div>'
 
 
 def _render_summary(profiles: list[dict[str, Any]], meta: dict[str, Any]) -> str:
@@ -171,13 +205,14 @@ def _render_card(profile: dict[str, Any], now: datetime) -> str:
     fable_pct = _as_number(fable_limit.get("percent")) if fable_limit else None
     overage_pct = _overage_pct(usage)
 
+    fable_reset = _parse_dt(fable_limit.get("resets_at")) if fable_limit else None
     gauges = [
-        _gauge_row("Session", session_pct),
-        _gauge_row("Weekly", weekly_pct),
-        _gauge_row("Fable", fable_pct),
+        _gauge_row("Session", session_pct, _parse_dt(profile.get("session_reset_at")), now),
+        _gauge_row("Weekly", weekly_pct, _parse_dt(profile.get("weekly_reset_at")), now),
+        _gauge_row("Fable", fable_pct, fable_reset, now),
     ]
     if overage_pct is not None:
-        gauges.append(_gauge_row("Overage", overage_pct))
+        gauges.append(_gauge_row("Overage", overage_pct, None, now))
 
     return (
         '<div class="rw-card">'
@@ -209,44 +244,46 @@ def _render_footer(
     fable_pct: float | None,
     fable_limit: dict[str, Any] | None,
 ) -> str:
+    # Resets now render per-window on each gauge, so the footer carries only
+    # probe freshness — the one fact that belongs to the card as a whole.
+    del session_pct, weekly_pct, fable_pct, fable_limit
     probed_at = _parse_dt(profile.get("probed_at"))
     age = _relative_age(probed_at, now) if probed_at is not None else "—"
-
-    # Whichever window is closest to exhaustion drives the reset line.
-    candidates: list[tuple[float, datetime]] = []
-    session_reset = _parse_dt(profile.get("session_reset_at"))
-    if session_pct is not None and session_reset is not None:
-        candidates.append((session_pct, session_reset))
-    weekly_reset = _parse_dt(profile.get("weekly_reset_at"))
-    if weekly_pct is not None and weekly_reset is not None:
-        candidates.append((weekly_pct, weekly_reset))
-    if fable_pct is not None and fable_limit is not None:
-        fable_reset = _parse_dt(fable_limit.get("resets_at"))
-        if fable_reset is not None:
-            candidates.append((fable_pct, fable_reset))
-
-    reset_text = ""
-    if candidates:
-        reset_dt = max(candidates, key=lambda c: c[0])[1]
-        reset_text = f" · resets {_relative_future(reset_dt, now)}"
-
-    return f'<div class="rw-foot">probed {age}{reset_text}</div>'
+    return f'<div class="rw-foot">probed {_esc(age)}</div>'
 
 
-def _gauge_row(label: str, pct: float | None) -> str:
+def _gauge_row(
+    label: str,
+    pct: float | None,
+    reset: datetime | None,
+    now: datetime,
+) -> str:
+    """One capacity window: label, percent, bar, and its own reset time.
+
+    Each window carries its own reset because they genuinely differ — the
+    session window rolls every few hours while the weekly and model-scoped
+    ones share a much later boundary. Claude's own usage panel shows them
+    per-row for the same reason; a single card-level reset would have to pick
+    one and silently misattribute the others.
+    """
     if pct is None:
         return (
             f'<div class="rw-gauge"><div class="rw-glabel"><span>{label}</span>'
-            '<span>—</span></div><div class="rw-gtrack"></div></div>'
+            '<span class="rw-val rw-mono">—</span></div>'
+            '<div class="rw-gtrack"></div></div>'
         )
     clamped = max(0.0, min(100.0, pct))
     color = _severity_color(clamped)
     display = int(pct) if float(pct).is_integer() else round(pct, 1)
+    reset_line = ""
+    if reset is not None:
+        reset_line = f'<div class="rw-reset">Resets {_esc(_format_reset(reset, now))}</div>'
     return (
         f'<div class="rw-gauge"><div class="rw-glabel"><span>{label}</span>'
-        f'<span style="color:{color}">{display}%</span></div>'
+        f'<span class="rw-val rw-mono" style="color:{color}">{display}% used</span></div>'
         f'<div class="rw-gtrack"><div class="rw-gfill" '
-        f'style="width:{clamped:g}%;background:{color}"></div></div></div>'
+        f'style="width:{clamped:g}%;background:{color}"></div></div>'
+        f"{reset_line}</div>"
     )
 
 
@@ -298,6 +335,17 @@ def _as_number(value: object) -> float | None:
 
 
 def _parse_dt(value: object) -> datetime | None:
+    """Accept both an ISO string and a live `datetime`.
+
+    Both shapes genuinely reach here. The CLI passes the payload in-process,
+    where `build_status_payload` hand-formats the top-level reset fields to
+    ISO strings but dumps nested `limits[]` wholesale — so their `resets_at`
+    is still a `datetime` object. Rejecting non-strings silently dropped
+    every model-scoped reset in the rendered card while the string-fed tests
+    stayed green.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -327,17 +375,32 @@ def _relative_age(dt: datetime, now: datetime) -> str:
     return f"{int(delta / 86400)}d ago"
 
 
-def _relative_future(dt: datetime, now: datetime) -> str:
+def _format_reset(dt: datetime, now: datetime) -> str:
+    """Absolute local wall-clock time for a reset, e.g. "Sat 2:00 PM".
+
+    Mirrors Claude's own usage panel: relative only inside the last hour
+    ("in 44 min"), absolute beyond it. A relative figure like "in 144h" is
+    unreadable — nobody converts that to "Saturday afternoon" in their head,
+    which is the only form that answers "can I run this tonight?".
+
+    Rendered in LOCAL time, since the reset is something the operator plans
+    their day around. The upstream timestamps are UTC, so this must convert;
+    printing UTC as though it were local would be off by the whole offset.
+    The date is added past a week out, where a bare weekday stops being
+    unambiguous.
+    """
     delta = (dt - now).total_seconds()
     if delta <= 0:
         return "now"
-    if delta < 60:
-        return f"in {int(delta)}s"
     if delta < 3600:
-        return f"in {int(delta / 60)}m"
-    if delta < 48 * 3600:
-        return f"in {int(delta / 3600)}h"
-    return f"in {int(delta / 86400)}d"
+        return f"in {max(1, int(delta / 60))} min"
+    local = dt.astimezone()
+    # %-I / %#I are platform-specific, so strip the leading zero by hand.
+    hour = local.strftime("%I").lstrip("0") or "12"
+    stamp = f"{hour}:{local.strftime('%M %p')}"
+    if delta < 7 * 86400:
+        return f"{local.strftime('%a')} {stamp}"
+    return f"{local.strftime('%a %d %b')} {stamp}"
 
 
 def _esc(value: object) -> str:

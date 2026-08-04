@@ -3,6 +3,7 @@ CSP/byte-budget/decoupling constraints this renderer must honour."""
 
 from __future__ import annotations
 
+import re
 import warnings
 from datetime import UTC, datetime, timedelta
 
@@ -228,3 +229,65 @@ def test_summary_header_omits_incident_line_when_operational():
     meta = {"count": 1, "ok": 1, "platform_status": {"indicator": "none"}}
     html = render_widget(profiles, meta)
     assert '<span class="rw-incident"' not in html
+
+
+def test_reset_accepts_live_datetime_not_just_iso_string():
+    """The CLI passes the payload in-process, where nested timestamps stay live.
+
+    `build_status_payload` hand-formats the top-level reset fields to ISO
+    strings but dumps nested `limits[]` wholesale, so a scoped limit's
+    `resets_at` arrives as a real `datetime`. Every test here fed
+    JSON-shaped strings, so an earlier `_parse_dt` that rejected non-strings
+    stayed green while the rendered card silently dropped every model-scoped
+    reset line. Assert both shapes.
+    """
+    reset = datetime.now(UTC) + timedelta(days=3)
+    for value in (reset, _iso(reset)):
+        usage = _usage(
+            limits=[
+                {
+                    "kind": "weekly_scoped",
+                    "group": "weekly",
+                    "percent": 85,
+                    "severity": "warning",
+                    "resets_at": value,
+                    "model": "Fable",
+                    "surface": None,
+                    "is_active": True,
+                }
+            ]
+        )
+        html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
+        assert "Resets" in html, f"no reset line rendered for {type(value).__name__}"
+
+
+def test_reset_uses_absolute_time_beyond_an_hour():
+    """Relative offsets past an hour are unreadable — "in 144h" answers nothing."""
+    usage = _usage(
+        limits=[
+            {
+                "kind": "weekly_scoped",
+                "percent": 50,
+                "resets_at": datetime.now(UTC) + timedelta(days=3),
+                "model": "Fable",
+                "is_active": True,
+            }
+        ]
+    )
+    html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
+    assert re.search(r"Resets \w{3} \d{1,2}:\d{2} [AP]M", html)
+    assert "in 72h" not in html
+
+
+def test_theme_is_not_hardcoded_dark():
+    """Cards must track the viewer's theme in both directions.
+
+    An earlier build used dark values as `var()` fallbacks, so a fragment
+    rendered outside the chat host (opened as a file) was locked dark on a
+    light desktop.
+    """
+    html = render_widget([_profile()], {"count": 1, "ok": 1})
+    assert "prefers-color-scheme:dark" in html.replace(" ", "")
+    assert 'data-theme="light"' in html
+    # Palette vars are scoped to the fragment, never leaked onto the host page.
+    assert ":root{" not in html.replace(" ", "")
