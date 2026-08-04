@@ -191,12 +191,14 @@ def test_oversized_fleet_drops_profiles_and_warns():
         )
         for i in range(80)
     ]
-    # Budget must clear the fixed chrome (style block, Claude mark, and
-    # dashboard header — ~7 KB) or nothing can fit and the drop path is not
-    # what is being tested — see test_budget_below_fixed_chrome_warns.
+    # Budget must clear the fixed chrome (style block, Claude mark, icon
+    # sprite, dashboard header — ~10 KB) or nothing can fit and the drop path
+    # is not what is being tested. See test_budget_below_fixed_chrome_warns
+    # for that case, and _fixed_chrome_bytes below, which pins the figure so
+    # this number stops drifting silently.
     with pytest.warns(Warning, match="dropped"):
-        html = render_widget(profiles, {"count": 80, "ok": 80}, max_bytes=12_000)
-    assert len(html.encode("utf-8")) <= 12_000
+        html = render_widget(profiles, {"count": 80, "ok": 80}, max_bytes=16_000)
+    assert len(html.encode("utf-8")) <= 16_000
     # The most-recently-probed profile (agent-with-...-000) must survive the drop.
     assert "agent-with-a-fairly-long-profile-name-000" in html
 
@@ -442,7 +444,7 @@ def test_square_gauges_render_one_grid_per_window():
     usage = _usage(session_pct=2, weekly_pct=76)
     html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
     card = html.split('<div class="rw-card">')[1]
-    grids = re.findall(r'rw-sqgrid" style="--p:(\d+)%', card)
+    grids = re.findall(r'rw-sqgrid" style="--p:(\d+)px', card)
     assert len(grids) == 3
     assert card.count("<i") == 0, "the grid is drawn, not built from tags"
 
@@ -457,8 +459,8 @@ def test_square_gauge_lights_at_least_one_row_when_nonzero():
     usage = _usage(session_pct=2, weekly_pct=0)
     html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
     card = html.split('<div class="rw-card">')[1]
-    fills = [int(v) for v in re.findall(r'rw-sqgrid" style="--p:(\d+)%', card)]
-    assert fills[0] == 10, "2% lights exactly one row"
+    fills = [int(v) for v in re.findall(r'rw-sqgrid" style="--p:(\d+)px', card)]
+    assert fills[0] == 7, "2% lights exactly one row (7px cell, gap trimmed)"
     assert fills[1] == 0, "0% lights none"
 
 
@@ -471,10 +473,12 @@ def test_square_gauge_fill_quantises_to_whole_rows():
     usage = _usage(session_pct=50, weekly_pct=76)
     html = render_widget([_profile(usage=usage)], {"count": 1, "ok": 1})
     card = html.split('<div class="rw-card">')[1]
-    fills = [int(v) for v in re.findall(r'rw-sqgrid" style="--p:(\d+)%', card)]
-    assert fills[0] == 50
-    assert fills[1] == 80, "76% snaps to the nearest whole row"
-    assert all(f % 10 == 0 for f in fills), "every fill lands on a row edge"
+    fills = [int(v) for v in re.findall(r'rw-sqgrid" style="--p:(\d+)px', card)]
+    assert fills[0] == 43, "50% = 5 rows = 5*9-2 px"
+    assert fills[1] == 70, "76% snaps to 8 rows = 8*9-2 px"
+    # Every stop must be a whole pixel or the browser antialiases the edge,
+    # which is what made the grid render soft.
+    assert all((f + 2) % 9 == 0 for f in fills if f), "fills land on row edges"
 
 
 def test_view_toggle_is_css_only_no_script():
@@ -619,3 +623,43 @@ def test_clean_days_carry_no_tooltip():
     strip = re.findall(r'rw-cstrip">(.*?)</div>', html, re.S)[0]
     assert strip.count("title=") == 1, "only the incident day is captioned"
     assert "08-02 minor ×2" in strip
+
+
+def test_fixed_chrome_leaves_room_for_a_real_fleet():
+    """Pin the chrome cost so it cannot creep past the budget unnoticed.
+
+    Every profile card is ~4 KB. The chrome (style block, Claude mark, icon
+    sprite, dashboard header) is paid once regardless of fleet size, so it
+    is the figure that decides how many cards fit before the drop path
+    starts silently removing profiles from a fleet overview.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        floor = len(render_widget([], {}).encode("utf-8"))
+    assert floor < 12_000, (
+        f"fixed chrome is {floor} bytes; at this rate a four-profile fleet "
+        "stops fitting the 28 KB inline-render budget"
+    )
+
+
+def test_stat_icons_use_a_sprite_not_repeated_paths():
+    """Four cards x five stats is twenty icons; inlining the paths twenty
+    times would cost more than the cards themselves."""
+    profiles = [_profile(name=f"p{i}") for i in range(4)]
+    stats = {f"p{i}": {"picks": 10, "execs": 2, "fail_pct": 0} for i in range(4)}
+    html = render_widget(profiles, {"count": 4, "ok": 4}, stats=stats)
+    assert html.count("<defs>") == 1, "one sprite"
+    assert html.count('<use href="#i-') >= 8, "referenced, not repeated"
+    # The referencing svg needs its own viewBox or the 24-unit icons clip.
+    assert 'class="rw-i" viewBox="0 0 24 24"' in html
+
+
+def test_stats_render_only_what_exists():
+    """A missing metric renders no chip. The usage log is opt-in, so a zero
+    would misread as 'never dispatched' rather than 'not recorded'."""
+    html = render_widget(
+        [_profile()], {"count": 1, "ok": 1}, stats={"agent-01": {"picks": 5}}
+    )
+    assert "Picks" in html
+    assert "Execs" not in html
+    assert "Full in" not in html

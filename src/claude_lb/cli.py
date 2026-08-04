@@ -648,7 +648,30 @@ def _widget_stats(names: list[str]) -> dict[str, dict[str, Any]]:
 
     out: dict[str, dict[str, Any]] = {name: {} for name in names}
     try:
-        report = aggregate_stats(parse_pick_log(pick_log_path()))
+        records = parse_pick_log(pick_log_path())
+        report = aggregate_stats(records)
+        # Per-profile exec latency and failure rate. aggregate_stats reports
+        # both fleet-wide only, but a card is about one profile — a global
+        # p50 on four cards is the same number four times.
+        durations: dict[str, list[float]] = {name: [] for name in names}
+        failures: dict[str, int] = dict.fromkeys(names, 0)
+        for record in records:
+            if record.get("action") != "EXEC":
+                continue
+            profile = str(record.get("profile") or "")
+            if profile not in durations:
+                continue
+            details = record.get("details") or {}
+            # The field is written as `dur=10030ms` — a number with a unit
+            # glued on, not a bare int. Reading it as one silently yielded no
+            # samples at all, so the median chip never appeared.
+            raw = str(details.get("dur", "")).removesuffix("ms")
+            try:
+                durations[profile].append(float(raw))
+            except (TypeError, ValueError):
+                pass
+            if str(details.get("rc", "0")) not in ("0", ""):
+                failures[profile] += 1
         for name in names:
             picks = report.pick_by_profile.get(name)
             if picks:
@@ -656,6 +679,10 @@ def _widget_stats(names: list[str]) -> dict[str, dict[str, Any]]:
             execs = report.exec_by_profile.get(name)
             if execs:
                 out[name]["execs"] = execs
+                out[name]["fail_pct"] = round(100 * failures[name] / execs)
+            samples = sorted(durations[name])
+            if samples:
+                out[name]["p50_ms"] = samples[len(samples) // 2]
     except (OSError, ValueError):
         pass
     try:

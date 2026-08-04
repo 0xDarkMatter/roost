@@ -100,6 +100,54 @@ _COMPONENT_COLORS = {
     "under_maintenance": "#8a8a86",
 }
 
+# 10 columns x 10 rows = 100 cells per window. The fill quantises to whole
+# ROWS, so the granularity is 10% even though 100 cells are drawn — the
+# density is for legibility at a glance, and the exact figure is printed
+# beneath, which is what keeps the rounding honest. Per-cell resolution
+# would mean filling part of a row left-to-right, which a linear gradient
+# cannot express; it would need 100 real elements per window.
+_GRID_ROWS = 10
+
+# Geometry in WHOLE PIXELS, deliberately. An earlier build sized the block
+# fluidly with percentage gradient stops so it would fill any card width —
+# and every cell edge then landed on a fractional pixel, so the browser
+# antialiased all 200 of them and the grid rendered soft with visibly uneven
+# gaps. Integer stops are the entire reason the cells look sharp, and that
+# costs the fluid width: the block is a fixed size, sized so three of them
+# fill a card at its minimum width.
+#
+# The CSS and the fill maths MUST agree on these numbers, which is why the
+# style block is derived from them rather than hand-written. A stop edited
+# in one place and not the other misaligns the fill boundary by a pixel or
+# two — exactly the defect this is fixing.
+_CELL_PX = 7
+_GAP_PX = 2
+_PERIOD_PX = _CELL_PX + _GAP_PX
+# The trailing gap is trimmed, so N cells span N*period - gap.
+_GRID_PX = _GRID_ROWS * _PERIOD_PX - _GAP_PX
+
+# Icon sprite, defined once and referenced with <use href="#i-...">. Drawn
+# here rather than pulled from a webfont because the show_widget CSP blocks
+# every outbound request — a Tabler <i class="ti"> renders as a blank box.
+# A sprite costs ~30 bytes per use instead of repeating the path on every
+# card, which matters at four cards x five stats.
+_ICON_SPRITE = (
+    '<svg width="0" height="0" style="position:absolute" aria-hidden="true">'
+    '<defs><g id="i-target" fill="none" stroke="currentColor" stroke-width="2">'
+    '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5"/></g>'
+    '<g id="i-play" fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linejoin="round"><path d="M7 5l12 7-12 7z"/></g>'
+    '<g id="i-alert" fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round"><path d="M12 4L2 20h20z"/><path d="M12 10v4"/>'
+    '<path d="M12 17.5v.01"/></g>'
+    '<g id="i-clock" fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/>'
+    '<path d="M12 7v5l3.5 2"/></g>'
+    '<g id="i-gauge" fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round"><path d="M4 18a9 9 0 1116 0"/>'
+    '<path d="M12 14l4-4"/></g></defs></svg>'
+)
+
 _STYLE = (
     "<style>"
     ".rw{color-scheme:light dark;"
@@ -220,11 +268,13 @@ _STYLE = (
     "text-overflow:ellipsis}"
     ".rw-cstate{margin-left:auto;white-space:nowrap}"
     ".rw-gridlabel{font-size:9px;color:var(--rw-muted);margin-top:6px}"
-    ".rw-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;"
+    ".rw-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:5px 4px;"
     "font-size:10px;color:var(--rw-muted);border-top:1px solid var(--rw-border);"
     "padding-top:6px;margin-top:1px}"
-    ".rw-stats b{display:block;color:var(--rw-text);font-weight:500;"
+    ".rw-stats span{display:flex;align-items:center;gap:3px;flex-wrap:wrap}"
+    ".rw-stats b{flex-basis:100%;color:var(--rw-text);font-weight:500;"
     "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace;font-size:11px}"
+    ".rw-i{width:11px;height:11px;flex:none;vertical-align:-1px}"
     # Square-grid gauges. The 10x10 block is drawn with THREE stacked
     # gradients on a single element, not 100 <i> tags: two repeating
     # gradients paint the card-coloured gaps that separate the cells, and one
@@ -232,17 +282,18 @@ _STYLE = (
     # be 1,200 tags across four cards — enough on its own to push the page
     # well past the budget that decides whether it renders inline. The gaps
     # must be listed BEFORE the fill so they paint over it.
-    ".rw-squares{display:none;gap:10px;padding:2px 0 1px}"
-    ".rw-sqcol{flex:1;min-width:0;display:flex;flex-direction:column;"
-    "align-items:center;gap:5px}"
-    # Fluid width so the three blocks fill the card, with aspect-ratio:1
-    # keeping the cells square at whatever that width turns out to be — a
-    # fixed pixel size would go landscape the moment the card grew. Gaps are
-    # expressed in PERCENT for the same reason: 10 columns and 10 rows of
-    # 8.5%-cell / 1.5%-gap, so the geometry survives any container width.
-    ".rw-sqgrid{width:100%;aspect-ratio:1;background-image:"
-    "repeating-linear-gradient(to right,transparent 0 8.5%,var(--rw-card) 8.5% 10%),"
-    "repeating-linear-gradient(to bottom,transparent 0 8.5%,var(--rw-card) 8.5% 10%),"
+    ".rw-squares{display:none;gap:10px;justify-content:space-between;"
+    "padding:2px 0 1px}"
+    ".rw-sqcol{display:flex;flex-direction:column;align-items:center;gap:5px}"
+    # Every stop below is a whole pixel, so each cell is exactly
+    # _CELL_PX square and no edge gets antialiased. Do NOT convert these to
+    # percentages to make the block fluid — that was the previous build, and
+    # it rendered soft with visibly uneven gaps.
+    f".rw-sqgrid{{width:{_GRID_PX}px;height:{_GRID_PX}px;background-image:"
+    f"repeating-linear-gradient(to right,transparent 0 {_CELL_PX}px,"
+    f"var(--rw-card) {_CELL_PX}px {_PERIOD_PX}px),"
+    f"repeating-linear-gradient(to bottom,transparent 0 {_CELL_PX}px,"
+    f"var(--rw-card) {_CELL_PX}px {_PERIOD_PX}px),"
     "linear-gradient(to top,var(--f) var(--p),var(--rw-track) var(--p))}"
     ".rw-sqlabel{font-size:10px;color:var(--rw-muted)}"
     ".rw-sqval{font-size:11px;font-weight:500;"
@@ -378,7 +429,7 @@ def _render(
     )
     # Everything lives inside .rw so the palette custom properties stay scoped
     # to this fragment instead of leaking onto the host page.
-    return f'{_STYLE}<div class="rw">{toggle}{head}{grid}</div>'
+    return f'{_STYLE}{_ICON_SPRITE}<div class="rw">{toggle}{head}{grid}</div>'
 
 
 
@@ -762,14 +813,6 @@ def _render_card(
     )
 
 
-# 10 columns x 10 rows = 100 cells per window. The fill quantises to whole
-# ROWS, so the granularity is 10% even though 100 cells are drawn — the
-# density is for legibility at a glance, and the exact figure is printed
-# beneath, which is what keeps the rounding honest. Raising this to
-# per-cell resolution would mean filling part of a row left-to-right, which
-# a linear gradient cannot express; it would need 100 real elements per
-# window and about 8 KB per card.
-_GRID_ROWS = 10
 
 
 def _gauge_column(label: str, pct: float | None) -> str:
@@ -793,13 +836,15 @@ def _gauge_column(label: str, pct: float | None) -> str:
         if clamped > 0:
             rows_filled = max(1, rows_filled)
         colour = _severity_color(clamped)
-    # Quantised to whole rows so the fill boundary always lands on a gap.
-    # An unsnapped gradient would slice a row of squares in half, which reads
-    # as a rendering fault rather than as a value.
-    fill_pct = rows_filled * (100 // _GRID_ROWS)
+    # In PIXELS, on a row boundary. A percentage of the block height lands
+    # between cells at most fill levels and antialiases the boundary, which
+    # is the same defect that made the whole grid soft. `rows*period - gap`
+    # is the top edge of the nth row counted from the bottom, i.e. the middle
+    # of the gap above it.
+    fill_px = max(0, rows_filled * _PERIOD_PX - _GAP_PX)
     return (
         '<div class="rw-sqcol">'
-        f'<div class="rw-sqgrid" style="--p:{fill_pct}%;--f:{colour}" '
+        f'<div class="rw-sqgrid" style="--p:{fill_px}px;--f:{colour}" '
         f'role="img" aria-label="{_esc(label)} {_fmt_pct(pct)} used"></div>'
         f'<span class="rw-sqlabel">{_esc(label)}</span>'
         f'<b class="rw-sqval" style="color:{colour}">{_fmt_pct(pct)}</b>'
@@ -826,14 +871,42 @@ def _render_stats(stats: dict[str, Any] | None) -> str:
     cells = []
     picks = stats.get("picks")
     if isinstance(picks, int):
-        cells.append(f"<span>Picks<b>{picks:,}</b></span>")
+        cells.append(_stat("target", "Picks", f"{picks:,}"))
     execs = stats.get("execs")
     if isinstance(execs, int) and execs:
-        cells.append(f"<span>Execs<b>{execs:,}</b></span>")
+        cells.append(_stat("play", "Execs", f"{execs:,}"))
+    fail = stats.get("fail_pct")
+    if isinstance(fail, int) and isinstance(execs, int) and execs:
+        cells.append(_stat("alert", "Failed", f"{fail}%"))
+    p50 = stats.get("p50_ms")
+    if isinstance(p50, (int, float)) and p50 > 0:
+        cells.append(_stat("clock", "Median", _duration(float(p50))))
     eta = stats.get("eta")
     if isinstance(eta, str) and eta:
-        cells.append(f"<span>Full in<b>{_esc(eta)}</b></span>")
+        cells.append(_stat("gauge", "Full in", eta))
     return f'<div class="rw-stats">{"".join(cells)}</div>' if cells else ""
+
+
+def _stat(icon: str, label: str, value: str) -> str:
+    return (
+        f'<span><svg class="rw-i" viewBox="0 0 24 24" aria-hidden="true">'
+        f'<use href="#i-{icon}"/></svg>{_esc(label)}'
+        f"<b>{_esc(value)}</b></span>"
+    )
+
+
+def _duration(ms: float) -> str:
+    """Compact wall-clock for an exec median."""
+    if ms < 1000:
+        return f"{int(ms)}ms"
+    seconds = ms / 1000
+    if seconds < 60:
+        return f"{seconds:.1f}s".replace(".0s", "s")
+    minutes, secs = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
+    hours, mins = divmod(minutes, 60)
+    return f"{hours}h {mins}m" if mins else f"{hours}h"
 
 
 
