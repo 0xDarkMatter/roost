@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .models import HealthCache, ProfileHealth
-from .term import Term, display_width, emit_panel
+from .term import Term, display_width, emit_panel, ensure_utf8
 
 stderr = Console(stderr=True)
 
@@ -44,26 +44,6 @@ def emit_ndjson(items: list[Any]) -> None:
     sys.stdout.flush()
 
 
-def _ensure_utf8_stdout() -> None:
-    """Reconfigure stdout to UTF-8 once, if the stream supports it.
-
-    Idempotent and best-effort: a stream already at UTF-8 is left alone, and a
-    replaced stdout (pytest's capture, a StringIO) may lack `reconfigure`
-    entirely — neither case is an error worth failing a command over.
-    """
-    stream = sys.stdout
-    encoding = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
-    if encoding in ("utf8", "utf8mb4"):
-        return
-    reconfigure = getattr(stream, "reconfigure", None)
-    if reconfigure is None:
-        return
-    try:
-        reconfigure(encoding="utf-8")
-    except (ValueError, OSError):  # pragma: no cover -- exotic stream
-        pass
-
-
 def emit_text(text: str) -> None:
     """Write plain text to stdout with a trailing newline.
 
@@ -72,7 +52,7 @@ def emit_text(text: str) -> None:
     the widget and table renderers emit — redirecting `roost widget` to a
     file produced mojibake before this. Data on stdout must survive a pipe.
     """
-    _ensure_utf8_stdout()
+    ensure_utf8(sys.stdout)
     sys.stdout.write(text)
     if not text.endswith("\n"):
         sys.stdout.write("\n")

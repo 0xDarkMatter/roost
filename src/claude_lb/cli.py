@@ -22,6 +22,7 @@ from .output import (
     emit_error_json,
     emit_json,
     emit_text,
+    render_capacity_cards,
     render_pick_explanation,
     render_status_table,
     stderr,
@@ -510,6 +511,13 @@ def profiles_status(
             help="Skip the status.claude.com check (no extra fetch on cache miss).",
         ),
     ] = False,
+    cards: Annotated[
+        bool,
+        typer.Option(
+            "--cards",
+            help="Render capacity cards instead of the table.",
+        ),
+    ] = False,
 ) -> None:
     """Show cached health per profile (probes if stale).
 
@@ -538,7 +546,10 @@ def profiles_status(
         for n in names
         if n in cache.profiles
     ]
-    render_status_table(entries)
+    if cards:
+        render_capacity_cards(entries)
+    else:
+        render_status_table(entries)
     emit_text(_summary_line(cache, names))
 
 
@@ -549,6 +560,7 @@ def top_status(
     refresh: Annotated[bool, typer.Option("--refresh")] = False,
     max_age: Annotated[int | None, typer.Option("--max-age")] = None,
     no_platform_status: Annotated[bool, typer.Option("--no-platform-status")] = False,
+    cards: Annotated[bool, typer.Option("--cards")] = False,
 ) -> None:
     """Alias for `profiles status`."""
     profiles_status(
@@ -557,6 +569,7 @@ def top_status(
         refresh=refresh,
         max_age=max_age,
         no_platform_status=no_platform_status,
+        cards=cards,
     )
 
 
@@ -2594,7 +2607,7 @@ def report(
             "--metric",
             help=(
                 "Which metric to aggregate. Options: weekly_pct, session_pct, "
-                "sonnet_pct, opus_pct, overage_pct."
+                "fable_pct, sonnet_pct, opus_pct, overage_pct, spend_pct."
             ),
         ),
     ] = "weekly_pct",
@@ -2646,7 +2659,8 @@ def report(
     from .stats import project_exhaustion, sparkline, summarise_metric
 
     valid_metrics = {
-        "weekly_pct", "session_pct", "sonnet_pct", "opus_pct", "overage_pct",
+        "weekly_pct", "session_pct", "fable_pct", "sonnet_pct", "opus_pct",
+        "overage_pct", "spend_pct",
     }
     if metric not in valid_metrics:
         msg = (

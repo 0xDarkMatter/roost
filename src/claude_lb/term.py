@@ -281,8 +281,34 @@ class Term:
         return f"{self.paint(color, self.health_glyph(state))} {text}"
 
 
+def ensure_utf8(stream: IO[str]) -> None:
+    """Reconfigure a text stream to UTF-8 once, if it supports it.
+
+    Windows defaults both stdout and stderr to the console codepage
+    (cp1252/cp437), which cannot encode the box-drawing, bullet, and dash
+    glyphs this module emits — they arrive as U+FFFD. The ASCII fallback
+    exists for terminals that genuinely cannot display Unicode; a stream that
+    merely defaults to a legacy codepage should be upgraded, not degraded.
+
+    Idempotent and best-effort: a stream already at UTF-8 is left alone, and a
+    replaced stream (pytest capture, StringIO) may lack `reconfigure` — neither
+    is an error worth failing a command over.
+    """
+    encoding = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+    if encoding in ("utf8", "utf8mb4"):
+        return
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is None:
+        return
+    try:
+        reconfigure(encoding="utf-8")
+    except (ValueError, OSError):  # pragma: no cover -- exotic stream
+        pass
+
+
 def emit_panel(lines: list[str], *, file: IO[str] | None = None) -> None:
     """Print pre-built panel lines to a stream (default stderr)."""
     out = file if file is not None else sys.stderr
+    ensure_utf8(out)
     out.write("\n".join(lines) + "\n")
     out.flush()
