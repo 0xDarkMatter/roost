@@ -4933,3 +4933,24 @@ def test_exec_timeout_derives_lease_duration(profile_factory) -> None:
     assert result.exit_code == 0
     assert captured[0]["lease_duration_s"] == 72  # int(60 * 1.2)
 
+
+
+def test_all_model_limit_maps_to_semantic_exit_code() -> None:
+    """Every pick-failure reason needs a real exit code and message.
+
+    ALL_MODEL_LIMIT was added to pick.py without a REASON_TO_EXIT entry, so
+    it fell through to the generic exit 1 — a script branching on pick's exit
+    code could not tell "every profile is model-limited" (wait for the window
+    to reset) from an unexpected crash. Assert the whole mapping is total so
+    the next reason added cannot regress the same way.
+    """
+    from claude_lb import cli
+    from claude_lb.pick import PickFailureReason
+
+    for reason in PickFailureReason:
+        assert reason in cli.REASON_TO_EXIT, f"{reason} has no exit code"
+        assert reason in cli.REASON_MESSAGES, f"{reason} has no message"
+        assert cli.REASON_TO_EXIT[reason] != cli.EXIT_ERROR, (
+            f"{reason} falls back to the generic error code"
+        )
+    assert cli.REASON_TO_EXIT[PickFailureReason.ALL_MODEL_LIMIT] == cli.EXIT_UNAVAILABLE

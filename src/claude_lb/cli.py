@@ -160,6 +160,12 @@ REASON_TO_EXIT: dict[PickFailureReason, int] = {
     PickFailureReason.ALL_AUTH_DEAD: EXIT_AUTH_REQUIRED,
     PickFailureReason.ALL_AUTH_EXPIRED: EXIT_AUTH_REQUIRED,
     PickFailureReason.ALL_WEEKLY: EXIT_UNAVAILABLE,
+    # Mirrors ALL_WEEKLY: the accounts are alive but none can serve the
+    # scoped model until its window resets, which is an availability problem,
+    # not an auth or throttling one. Without this entry the reason fell
+    # through to the generic exit 1, so a script could not tell "every
+    # profile is model-limited" from an unexpected crash.
+    PickFailureReason.ALL_MODEL_LIMIT: EXIT_UNAVAILABLE,
     PickFailureReason.ALL_THROTTLED: EXIT_RATE_LIMITED,
     PickFailureReason.ALL_TERMINAL: EXIT_UNAVAILABLE,
     PickFailureReason.REQUIRE_OK_NONE: EXIT_FORBIDDEN,
@@ -176,6 +182,10 @@ REASON_MESSAGES: dict[PickFailureReason, str] = {
         "All access tokens expired. Run: roost refresh --expired"
     ),
     PickFailureReason.ALL_WEEKLY: "All profiles weekly-exhausted.",
+    PickFailureReason.ALL_MODEL_LIMIT: (
+        "All profiles model-limited. The accounts are healthy but none can "
+        "serve the scoped model until its window resets. Run: roost status"
+    ),
     PickFailureReason.ALL_THROTTLED: "All profiles throttled.",
     PickFailureReason.ALL_TERMINAL: "No profiles available. Run: roost status",
     PickFailureReason.REQUIRE_OK_NONE: "No profiles currently ok. Run: roost probe",
