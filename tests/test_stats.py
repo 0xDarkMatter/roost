@@ -293,6 +293,55 @@ def test_summarise_metric_to_json_excludes_series() -> None:
     assert payload["samples"] == 1
 
 
+def test_summarise_metric_fable_pct() -> None:
+    records = [
+        _record("2026-04-27T12:00:00Z", "a", fable_pct=5),
+        _record("2026-04-27T12:05:00Z", "a", fable_pct=15),
+        _record("2026-04-27T12:10:00Z", "a", fable_pct=25),
+    ]
+    summary = summarise_metric(records, metric="fable_pct")[0]
+    assert summary.samples == 3
+    assert summary.minimum == 5
+    assert summary.maximum == 25
+    assert summary.average == 15
+    assert summary.latest == 25
+
+
+def test_summarise_metric_spend_pct() -> None:
+    records = [
+        _record("2026-04-27T12:00:00Z", "a", spend_pct=10),
+        _record("2026-04-27T12:05:00Z", "a", spend_pct=30),
+    ]
+    summary = summarise_metric(records, metric="spend_pct")[0]
+    assert summary.samples == 2
+    assert summary.average == 20
+    assert summary.latest == 30
+
+
+def test_summarise_metric_all_null_metric_returns_no_data() -> None:
+    """sonnet_pct/opus_pct are null on every record under the new response
+    shape — summarise_metric must return an empty (no-data) result rather
+    than raising or dividing by zero."""
+    records = [
+        _record("2026-04-27T12:00:00Z", "a", sonnet_pct=None, weekly_pct=10),
+        _record("2026-04-27T12:05:00Z", "a", sonnet_pct=None, weekly_pct=20),
+        _record("2026-04-27T12:00:00Z", "b", sonnet_pct=None, weekly_pct=30),
+    ]
+    summaries = summarise_metric(records, metric="sonnet_pct")
+    assert summaries == []
+
+    # Downstream consumers (sparkline over an absent summary's series) must
+    # also degrade cleanly rather than raising.
+    assert sparkline([]) == ""
+
+
+def test_summarise_metric_missing_key_entirely_returns_no_data() -> None:
+    """A metric name that never appears in any record (not even as null)
+    must also produce a clean empty result."""
+    records = [_record("2026-04-27T12:00:00Z", "a", weekly_pct=10)]
+    assert summarise_metric(records, metric="fable_pct") == []
+
+
 # ---------------------------------------------------------------------------
 # project_exhaustion (linear burn-rate forecast)
 # ---------------------------------------------------------------------------

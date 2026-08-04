@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from claude_lb import usage_log
-from claude_lb.models import ExtraUsage, Health, ProfileHealth, Usage
+from claude_lb.models import ExtraUsage, Health, ProfileHealth, ScopedLimit, Spend, Usage
 
 
 @pytest.fixture(autouse=True)
@@ -127,6 +127,48 @@ def test_append_record_includes_overage_when_present(
     assert record["currency"] == "AUD"
 
 
+def test_append_record_includes_fable_pct_from_scoped_limit(
+    _isolate_paths: Path,
+) -> None:
+    usage_log.enable_marker()
+    entry = _profile_health(usage=Usage(
+        weekly_pct=10,
+        limits=[ScopedLimit(kind="weekly_scoped", model="Fable", percent=33, is_active=True)],
+    ))
+    usage_log.append(entry)
+    record = json.loads((_isolate_paths / "usage-log.ndjson").read_text().strip())
+    assert record["fable_pct"] == 33
+
+
+def test_append_record_includes_spend_pct_from_spend_block(
+    _isolate_paths: Path,
+) -> None:
+    usage_log.enable_marker()
+    entry = _profile_health(usage=Usage(
+        weekly_pct=10,
+        spend=Spend(used_minor=500, currency="USD", exponent=2, percent=25, enabled=True),
+    ))
+    usage_log.append(entry)
+    record = json.loads((_isolate_paths / "usage-log.ndjson").read_text().strip())
+    assert record["spend_pct"] == 25
+
+
+def test_append_record_usage_none_writes_nulls_not_crash(
+    _isolate_paths: Path,
+) -> None:
+    usage_log.enable_marker()
+    entry = _profile_health(usage=None)
+    usage_log.append(entry)  # must not raise
+    record = json.loads((_isolate_paths / "usage-log.ndjson").read_text().strip())
+    assert record["session_pct"] is None
+    assert record["weekly_pct"] is None
+    assert record["sonnet_pct"] is None
+    assert record["opus_pct"] is None
+    assert record["fable_pct"] is None
+    assert record["overage_pct"] is None
+    assert record["spend_pct"] is None
+
+
 def test_append_many_writes_all_records_when_enabled(
     _isolate_paths: Path,
 ) -> None:
@@ -231,6 +273,36 @@ def test_iter_records_returns_empty_when_file_missing(
 ) -> None:
     out = list(usage_log.iter_records())
     assert out == []
+
+
+def test_iter_records_parses_old_shape_lines_without_fable_or_spend(
+    _isolate_paths: Path,
+) -> None:
+    """A line written before fable_pct/spend_pct existed must still parse,
+    with the new keys reading None rather than raising KeyError. This is the
+    load-bearing backwards-compat contract for an append-only, unrotated log:
+    every historical line must remain parseable by every future reader."""
+    old_shape_line = json.dumps({
+        "ts": "2026-01-01T00:00:00Z",
+        "profile": "legacy",
+        "health": "ok",
+        "session_pct": 45,
+        "weekly_pct": 62,
+        "sonnet_pct": 70,
+        "opus_pct": 30,
+        "overage_pct": None,
+        "currency": "USD",
+        "latency_ms": 187,
+    })
+    log_file = _isolate_paths / "usage-log.ndjson"
+    log_file.write_text(old_shape_line + "\n")
+    records = list(usage_log.iter_records())
+    assert len(records) == 1
+    record = records[0]
+    assert record["profile"] == "legacy"
+    assert record["sonnet_pct"] == 70
+    assert record.get("fable_pct") is None
+    assert record.get("spend_pct") is None
 
 
 # ---------------------------------------------------------------------------

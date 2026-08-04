@@ -12,10 +12,19 @@ never crash the probe path. Format:
 
     {"ts": "...", "profile": "...", "health": "ok",
      "session_pct": 45, "weekly_pct": 62, "sonnet_pct": 70, "opus_pct": 30,
-     "overage_pct": null, "currency": "USD", "latency_ms": 187}
+     "fable_pct": 12, "overage_pct": null, "spend_pct": null,
+     "currency": "USD", "latency_ms": 187}
 
 `roost report` reads this back. Users are responsible for rotation; the file
 is plain text and `> usage-log.ndjson` truncates safely.
+
+This log is append-only with no rotation and no migration: every line ever
+written stays parseable forever, and `iter_records` is the only reader for
+all of them at once. Any future change to the record shape MUST keep every
+key added so far, because old lines on disk will never gain the new key
+retroactively — `iter_records` has to keep reading `sonnet_pct`/`opus_pct`
+lines from before `fable_pct`/`spend_pct` existed, and future readers will
+have to keep reading these lines the same way. Never remove a key here.
 """
 
 from __future__ import annotations
@@ -84,6 +93,7 @@ def _record_for(entry: ProfileHealth) -> dict[str, Any]:
     """
     usage = entry.usage
     extra = usage.extra if usage else None
+    spend = usage.spend if usage else None
     return {
         "ts": entry.probed_at.replace(tzinfo=entry.probed_at.tzinfo or UTC)
             .isoformat().replace("+00:00", "Z"),
@@ -91,9 +101,16 @@ def _record_for(entry: ProfileHealth) -> dict[str, Any]:
         "health": entry.health.value,
         "session_pct": usage.session_pct if usage else None,
         "weekly_pct": usage.weekly_pct if usage else None,
+        # sonnet_pct/opus_pct are `null` on every account under the new
+        # response shape (per-model capacity moved to `limits[]`) but are
+        # kept here, not removed: they may still populate for Pro/Team or
+        # older server builds, and dropping the key would break
+        # `iter_records` for every historical line already on disk.
         "sonnet_pct": usage.sonnet_pct if usage else None,
         "opus_pct": usage.opus_pct if usage else None,
+        "fable_pct": usage.fable_pct if usage else None,
         "overage_pct": extra.utilization if extra else None,
+        "spend_pct": spend.percent if spend else None,
         "currency": extra.currency if extra else None,
         "latency_ms": entry.probe_latency_ms,
     }
