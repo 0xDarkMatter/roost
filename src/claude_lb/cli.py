@@ -617,8 +617,64 @@ def status_widget(
             payload["meta"],
             max_bytes=max_kb * 1024,
             recommended=_recommended_profile(cache, names),
+            stats=_widget_stats(names),
         )
     )
+
+
+def _widget_stats(names: list[str]) -> dict[str, dict[str, Any]]:
+    """Per-profile dispatch history and capacity trend for the cards.
+
+    Sourced from roost's own logs, not the usage API: pick/exec counts from
+    picks.log, the trend series and burn-rate ETA from the opt-in usage log.
+    The API reports no tokens and no turns, so there is deliberately nothing
+    resembling a token count here.
+
+    Entirely best-effort. The usage log is opt-in and off by default, picks.log
+    may not exist on a fresh install, and neither is worth failing a render
+    over — a missing series renders as no chip rather than a zero.
+    """
+    from datetime import datetime, timedelta
+
+    from .paths import pick_log_path
+    from .output import humanize_until
+    from .stats import (
+        aggregate_stats,
+        parse_pick_log,
+        project_exhaustion,
+        summarise_metric,
+    )
+    from .usage_log import iter_records
+
+    out: dict[str, dict[str, Any]] = {name: {} for name in names}
+    try:
+        report = aggregate_stats(parse_pick_log(pick_log_path()))
+        for name in names:
+            picks = report.pick_by_profile.get(name)
+            if picks:
+                out[name]["picks"] = picks
+            execs = report.exec_by_profile.get(name)
+            if execs:
+                out[name]["execs"] = execs
+    except (OSError, ValueError):
+        pass
+    try:
+        records = list(iter_records())
+        now = datetime.now(UTC)
+        for summary in summarise_metric(records, metric="weekly_pct"):
+            if summary.profile not in out:
+                continue
+            out[summary.profile]["trend"] = [value for _ts, value in summary.series]
+            # project_exhaustion returns SECONDS until the metric hits 100,
+            # not a timestamp — humanize_until wants the latter.
+            seconds = project_exhaustion(summary)
+            if seconds is not None:
+                out[summary.profile]["eta"] = humanize_until(
+                    now + timedelta(seconds=seconds), now
+                ).removeprefix("in ")
+    except (OSError, ValueError):
+        pass
+    return out
 
 
 def _recommended_profile(cache: HealthCache, names: list[str]) -> dict[str, Any]:

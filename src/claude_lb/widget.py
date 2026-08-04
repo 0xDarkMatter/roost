@@ -169,11 +169,14 @@ _STYLE = (
     "padding-top:2px}"
     ".rw-ringbox{display:flex;flex-direction:column;align-items:center;gap:2px;"
     "min-width:56px}"
-    ".rw-ring{width:46px;height:46px;display:block}"
-    ".rw-ringname{font-size:10px;color:var(--rw-muted);max-width:76px;"
+    # Sized for TWO concentric arcs plus a centre figure. At the original
+    # 46px the inner ring crowded the number and the two tracks read as one
+    # thick band.
+    ".rw-ring{width:68px;height:68px;display:block}"
+    ".rw-ringname{font-size:10px;color:var(--rw-muted);max-width:88px;"
     "overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
-    ".rw-legrow{display:flex;gap:6px}"
-    ".rw-leg{font-size:9px;font-weight:500;"
+    ".rw-legrow{display:flex;gap:7px}"
+    ".rw-leg{font-size:10px;font-weight:500;"
     "font-family:ui-monospace,\"Cascadia Code\",Consolas,monospace}"
     ".rw-ringwin{font-size:9px;color:var(--rw-muted)}"
     # Component rows + incident grid (right column).
