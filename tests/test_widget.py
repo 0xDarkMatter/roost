@@ -577,8 +577,8 @@ def test_component_strips_render_per_service():
         },
     }
     html = render_widget([_profile()], meta)
-    strips = re.findall(r'rw-cstrip">(.*?)</div>', html, re.S)
-    assert len(strips) == 2, "one strip per component"
+    strips = re.findall(r'rw-cal">(.*?)</div>', html, re.S)
+    assert len(strips) == 2, "one calendar per component"
     assert 'class="c-o"' in strips[0], "Claude Code shows its major-impact day"
     assert 'class="c-o"' not in strips[1], "Claude API stays clean that day"
 
@@ -620,7 +620,7 @@ def test_clean_days_carry_no_tooltip():
         },
     }
     html = render_widget([_profile()], meta)
-    strip = re.findall(r'rw-cstrip">(.*?)</div>', html, re.S)[0]
+    strip = re.findall(r'rw-cal">(.*?)</div>', html, re.S)[0]
     assert strip.count("title=") == 1, "only the incident day is captioned"
     assert "08-02 minor ×2" in strip
 
@@ -663,3 +663,90 @@ def test_stats_render_only_what_exists():
     assert "Picks" in html
     assert "Execs" not in html
     assert "Full in" not in html
+
+
+def test_detail_is_shed_before_any_profile_is_dropped():
+    """A fleet overview that omits an account is lying by omission.
+
+    The drop path removes the LEAST-RECENTLY-PROBED profile — precisely the
+    one you are least likely to notice missing. Losing the alternate gauge
+    view costs a nicety; losing a card costs the answer.
+    """
+    profiles = [_profile(name=f"agent-{i}", usage=_usage()) for i in range(4)]
+    meta = {
+        "count": 4,
+        "ok": 4,
+        "platform_status": {
+            "indicator": "none",
+            "components": [{"name": f"svc-{i}", "status": "operational"} for i in range(5)],
+            "history_days": 29,
+            "component_days": {
+                f"svc-{i}": [
+                    {"date": f"2026-07-{d:02d}", "impact": "none", "count": 0}
+                    for d in range(1, 30)
+                ]
+                for i in range(5)
+            },
+        },
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any drop warning fails the test
+        html = render_widget(profiles, meta, max_bytes=20_000)
+    for i in range(4):
+        assert f">agent-{i}<" in html, f"agent-{i} was dropped instead of detail"
+
+
+def test_reduced_detail_still_shows_gauges_and_hides_the_toggle():
+    """Bars are the CSS default, so dropping the bar markup without pinning
+    the squares visible renders cards with no gauges at all — and leaves a
+    toggle whose other position shows nothing."""
+    profiles = [_profile(name=f"agent-{i}", usage=_usage()) for i in range(4)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        html = render_widget(profiles, {"count": 4, "ok": 4}, max_bytes=15_000)
+    assert "rw-sq-only" in html, "squares must be pinned visible"
+    assert "rw-sqgrid" in html, "some gauge must survive"
+    assert 'class="rw-toggle"' not in html, "no toggle without a bar view"
+    assert 'id="rw-mode"' not in html
+
+
+def test_incident_calendar_pads_to_the_weekday_column():
+    """Seven columns only mean something if each is one weekday.
+
+    2026-07-01 is a Wednesday, so two blanks precede it.
+    """
+    meta = {
+        "count": 1,
+        "ok": 1,
+        "platform_status": {
+            "indicator": "none",
+            "components": [{"name": "Claude Code", "status": "operational"}],
+            "history_days": 3,
+            "component_days": {
+                "Claude Code": [
+                    {"date": "2026-07-01", "impact": "none", "count": 0},
+                    {"date": "2026-07-02", "impact": "none", "count": 0},
+                ]
+            },
+        },
+    }
+    html = render_widget([_profile()], meta)
+    cal = re.findall(r'rw-cal">(.*?)</div>', html, re.S)[0]
+    assert cal.count("rw-pad") == 2, "Wednesday sits in the third column"
+    assert cal.count("<i") == 4, "two pads plus two days"
+
+
+def test_incident_calendar_survives_an_unparseable_date():
+    """Best-effort enrichment must not raise on bad upstream data."""
+    meta = {
+        "count": 1,
+        "ok": 1,
+        "platform_status": {
+            "indicator": "none",
+            "components": [{"name": "Claude Code", "status": "operational"}],
+            "history_days": 1,
+            "component_days": {"Claude Code": [{"date": "not-a-date", "impact": "none"}]},
+        },
+    }
+    html = render_widget([_profile()], meta)
+    assert "rw-cal" in html

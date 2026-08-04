@@ -108,6 +108,10 @@ _COMPONENT_COLORS = {
 # cannot express; it would need 100 real elements per window.
 _GRID_ROWS = 10
 
+# Detail ladder, richest first. render_widget steps down this before it will
+# drop a single profile card — see the comment there for why.
+_DETAIL_LEVELS = ("full", "compact", "minimal")
+
 # Geometry in WHOLE PIXELS, deliberately. An earlier build sized the block
 # fluidly with percentage gradient stops so it would fill any card width —
 # and every cell edge then landed on a fractional pixel, so the browser
@@ -258,9 +262,12 @@ _STYLE = (
     ".rw-svc:hover{background:var(--rw-track)}"
     ".rw-scap{font-size:9px;color:var(--rw-muted);display:block;"
     "margin-bottom:2px}"
-    ".rw-cstrip{display:flex;gap:1px;height:10px}"
-    ".rw-cstrip i{flex:1;min-width:1px;border-radius:1px;display:block;"
-    "opacity:.9}"
+    # Seven columns, one per weekday, so the block reads as a wall calendar
+    # rather than a wrapped strip. Whole-pixel cells for the same reason the
+    # capacity grids use them: fractional sizes antialias every edge.
+    ".rw-cal{display:grid;grid-template-columns:repeat(7,10px);gap:2px}"
+    ".rw-cal i{width:10px;height:10px;border-radius:2px;display:block}"
+    ".rw-pad{background:transparent}"
     ".rw-comp{display:flex;align-items:center;gap:6px;font-size:10px;"
     "color:var(--rw-muted);line-height:1.5}"
     ".rw-cdot{width:6px;height:6px;border-radius:1.5px;flex:none}"
@@ -318,6 +325,11 @@ _STYLE = (
     "background:var(--rw-border);color:var(--rw-text)}"
     ".rw-modechk:focus-visible~.rw-head .rw-toggle{outline:2px solid "
     "var(--rw-warn);outline-offset:1px}"
+    # Reduced-detail fallback: no toggle, squares pinned visible. Without
+    # this the cards render no gauges at all, because bars are the CSS
+    # default and the bar markup is what got dropped.
+    ".rw-sq-only .rw-bars{display:none}"
+    ".rw-sq-only .rw-squares{display:flex}"
     "</style>"
 )
 
@@ -375,11 +387,20 @@ def render_widget(
     working = [p for p in (profiles or []) if isinstance(p, dict)]
     original_count = len(working)
 
-    html = _render(working, meta, recommended, stats)
+    # Shed DETAIL before shedding accounts. A fleet overview that quietly
+    # omits a profile is lying by omission — and it drops the
+    # least-recently-probed one, which is precisely the account you are least
+    # likely to notice missing. Losing the alternate gauge view, or the
+    # per-service history, costs a nicety; losing a card costs the answer.
+    html = _render(working, meta, recommended, stats, _DETAIL_LEVELS[0])
+    for detail in _DETAIL_LEVELS[1:]:
+        if len(html.encode("utf-8")) <= max_bytes:
+            break
+        html = _render(working, meta, recommended, stats, detail)
     while len(html.encode("utf-8")) > max_bytes and working:
         working = sorted(working, key=_probed_sort_key)
         working.pop(0)
-        html = _render(working, meta, recommended, stats)
+        html = _render(working, meta, recommended, stats, _DETAIL_LEVELS[-1])
 
     dropped = original_count - len(working)
     if dropped:
@@ -410,26 +431,38 @@ def _render(
     meta: dict[str, Any],
     recommended: dict[str, Any] | None = None,
     stats: dict[str, dict[str, Any]] | None = None,
+    detail: str = "full",
 ) -> str:
     now = datetime.now(UTC)
     cards = "".join(
-        _render_card(p, now, (stats or {}).get(str(p.get("name")))) for p in profiles
+        _render_card(p, now, (stats or {}).get(str(p.get("name"))), detail)
+        for p in profiles
     )
     if cards:
         grid = f'<div class="rw-grid">{cards}</div>'
     else:
         grid = '<div class="rw-empty">No profiles discovered — run <code>roost probe</code> first.</div>'
-    head = _render_dashboard(profiles, meta, recommended)
-    # The checkbox must precede both the header (which holds its label) and
-    # the grid (which it restyles), because CSS can only select FORWARD
-    # siblings. Moving it breaks the toggle silently.
-    toggle = (
-        '<input type="checkbox" id="rw-mode" class="rw-modechk" '
-        'aria-label="Switch between bar and grid gauges">'
-    )
+    head = _render_dashboard(profiles, meta, recommended, detail)
+    # Below "full" the bar view is not rendered at all, so the toggle would
+    # point at an empty div — and since bars are the CSS default, the cards
+    # would show no gauges whatsoever. Drop the control and pin the squares
+    # visible instead. A toggle with one working position is worse than no
+    # toggle.
+    if detail == "full":
+        # The checkbox must precede both the header (which holds its label)
+        # and the grid (which it restyles), because CSS can only select
+        # FORWARD siblings. Moving it breaks the toggle silently.
+        toggle = (
+            '<input type="checkbox" id="rw-mode" class="rw-modechk" '
+            'aria-label="Switch between bar and grid gauges">'
+        )
+        root = "rw"
+    else:
+        toggle = ""
+        root = "rw rw-sq-only"
     # Everything lives inside .rw so the palette custom properties stay scoped
     # to this fragment instead of leaking onto the host page.
-    return f'{_STYLE}{_ICON_SPRITE}<div class="rw">{toggle}{head}{grid}</div>'
+    return f'{_STYLE}{_ICON_SPRITE}<div class="{root}">{toggle}{head}{grid}</div>'
 
 
 
@@ -540,6 +573,7 @@ def _render_dashboard(
     profiles: list[dict[str, Any]],
     meta: dict[str, Any],
     recommended: dict[str, Any] | None,
+    detail: str = "full",
 ) -> str:
     """Fleet-level header: counts, platform status, recommendation, rings."""
     total = meta.get("count")
@@ -567,7 +601,7 @@ def _render_dashboard(
 
     rings = "".join(_ring(p) for p in profiles)
     ring_row = f'<div class="rw-rings">{rings}</div>' if rings else ""
-    right = _render_platform_panel(meta)
+    right = _render_platform_panel(meta, detail)
 
     body = (
         f'<div class="rw-cols"><div class="rw-col-l">{ring_row}</div>'
@@ -583,17 +617,22 @@ def _render_dashboard(
         f'<span class="rw-counts">{total} profile{"" if total == 1 else "s"} · '
         f"{ok} ok</span>"
         f"{status}"
-        '<label class="rw-toggle" for="rw-mode" title="Bar or grid gauges">'
-        '<span class="rw-t-bar">Bars</span><span class="rw-t-grid">Grid</span>'
-        "</label>"
-        "</div>"
+        # Only when the bar view actually exists — see _render.
+        + (
+            '<label class="rw-toggle" for="rw-mode" title="Bar or grid gauges">'
+            '<span class="rw-t-bar">Bars</span>'
+            '<span class="rw-t-grid">Grid</span></label>'
+            if detail == "full"
+            else ""
+        )
+        + "</div>"
         f"{pick_row}{body}"
         f"{_incident_line(meta)}"
         "</div>"
     )
 
 
-def _render_platform_panel(meta: dict[str, Any]) -> str:
+def _render_platform_panel(meta: dict[str, Any], detail: str = "full") -> str:
     """Right-hand column: Anthropic component states + incident-day grid.
 
     Both inputs are optional — an older cache, a `--no-platform-status` run, or
@@ -635,7 +674,9 @@ def _render_platform_panel(meta: dict[str, Any]) -> str:
                 f'<span class="rw-cname">{_esc(name)}</span>'
                 f"{label}</div>"
             )
-            strip = _component_strip(platform, raw_name)
+            strip = (
+                "" if detail == "minimal" else _component_strip(platform, raw_name)
+            )
             strips.append(
                 f'<div class="rw-s"><span class="rw-scap">{_esc(name)} · '
                 f'{_esc(_incident_window_text(platform))}</span>{strip}</div>'
@@ -673,10 +714,18 @@ def _component_strip(platform: dict[str, Any], component: str) -> str:
     days = series.get(component)
     if not isinstance(days, list) or not days:
         return ""
-    cells = []
-    for day in days[-_STRIP_DAYS:]:
+    cells: list[str] = []
+    leading = 0
+    for index, day in enumerate(days[-_STRIP_DAYS:]):
         if not isinstance(day, dict):
             continue
+        date = str(day.get("date") or "")
+        if index == 0:
+            # Pad so every column is one weekday, the way a wall calendar
+            # reads. Without it the grid is just a wrapped strip and the
+            # columns mean nothing.
+            leading = _weekday_index(date)
+            cells.extend(['<i class="rw-pad"></i>'] * leading)
         impact = str(day.get("impact") or "none")
         cls = _IMPACT_CLASSES.get(impact, "c-n")
         if impact == "none":
@@ -687,13 +736,27 @@ def _component_strip(platform: dict[str, Any], component: str) -> str:
             # says it.
             cells.append(f'<i class="{cls}"></i>')
             continue
-        date = str(day.get("date") or "")[5:]  # MM-DD; the year is implied
         count = day.get("count")
         suffix = f" ×{count}" if isinstance(count, int) and count > 1 else ""
-        cells.append(f'<i class="{cls}" title="{_esc(date)} {_esc(impact)}{suffix}"></i>')
+        cells.append(
+            f'<i class="{cls}" title="{_esc(date[5:])} {_esc(impact)}{suffix}"></i>'
+        )
     if not cells:
         return ""
-    return f'<div class="rw-cstrip">{"".join(cells)}</div>'
+    return f'<div class="rw-cal">{"".join(cells)}</div>'
+
+
+def _weekday_index(date: str) -> int:
+    """Monday-first column for an ISO date, or 0 if it cannot be parsed.
+
+    Degrading to 0 leaves the calendar left-aligned rather than raising —
+    a misaligned grid is a cosmetic loss, and this whole panel is
+    best-effort enrichment (AGENTS.md rule 20).
+    """
+    try:
+        return datetime.strptime(date[:10], "%Y-%m-%d").weekday()
+    except (ValueError, TypeError):
+        return 0
 
 
 _STRIP_DAYS = 45
@@ -777,6 +840,7 @@ def _render_card(
     profile: dict[str, Any],
     now: datetime,
     stats: dict[str, Any] | None = None,
+    detail: str = "full",
 ) -> str:
     name = profile.get("name") or "unknown"
     health = profile.get("health") or "unknown"
@@ -799,7 +863,13 @@ def _render_card(
     if overage_pct is not None:
         windows.append(("Overage", overage_pct, None))
 
-    bars = "".join(_gauge_row(label, pct, reset, now) for label, pct, reset in windows)
+    # At reduced detail only the square grid survives; the bar view is the
+    # toggle's alternate, and a toggle is worth less than an account.
+    bars = (
+        ""
+        if detail != "full"
+        else "".join(_gauge_row(label, pct, reset, now) for label, pct, reset in windows)
+    )
     squares = "".join(_gauge_column(label, pct) for label, pct, _ in windows)
 
     return (
@@ -875,12 +945,22 @@ def _render_stats(stats: dict[str, Any] | None) -> str:
     execs = stats.get("execs")
     if isinstance(execs, int) and execs:
         cells.append(_stat("play", "Execs", f"{execs:,}"))
-    fail = stats.get("fail_pct")
-    if isinstance(fail, int) and isinstance(execs, int) and execs:
-        cells.append(_stat("alert", "Failed", f"{fail}%"))
-    p50 = stats.get("p50_ms")
-    if isinstance(p50, (int, float)) and p50 > 0:
-        cells.append(_stat("clock", "Median", _duration(float(p50))))
+    # Deliberately NOT shown: exec failure rate and median exec duration.
+    # Both were computed and both were junk on a card whose job is "is this
+    # profile healthy?".
+    #
+    # `rc` is the CHILD's exit code. `roost exec -- claude ...` propagates
+    # whatever claude returned, so a prompt that errored, a Ctrl+C, or a
+    # deliberate failure test all read as the profile failing. Worse, the
+    # samples are tiny and ancient: mknv74's "Failed 100%" was six runs
+    # inside three minutes on one day in May, and it would have kept saying
+    # 100% forever. Median has the same defect — it timed the command, not
+    # the account, so a 47ms `env` and a 133s claude session averaged into a
+    # number about neither.
+    #
+    # If exec outcomes are ever worth showing, they need a recency window
+    # and a way to separate "the profile was unusable" from "the command
+    # exited non-zero". Until then, absent beats misleading.
     eta = stats.get("eta")
     if isinstance(eta, str) and eta:
         cells.append(_stat("gauge", "Full in", eta))
@@ -893,21 +973,6 @@ def _stat(icon: str, label: str, value: str) -> str:
         f'<use href="#i-{icon}"/></svg>{_esc(label)}'
         f"<b>{_esc(value)}</b></span>"
     )
-
-
-def _duration(ms: float) -> str:
-    """Compact wall-clock for an exec median."""
-    if ms < 1000:
-        return f"{int(ms)}ms"
-    seconds = ms / 1000
-    if seconds < 60:
-        return f"{seconds:.1f}s".replace(".0s", "s")
-    minutes, secs = divmod(int(seconds), 60)
-    if minutes < 60:
-        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
-    hours, mins = divmod(minutes, 60)
-    return f"{hours}h {mins}m" if mins else f"{hours}h"
-
 
 
 
