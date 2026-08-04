@@ -47,6 +47,7 @@ def _entry(
     expires_at: datetime | None = None,
     weekly_reset_at: datetime | None = None,
     session_reset_at: datetime | None = None,
+    model_reset_at: datetime | None = None,
     probed_at: datetime | None = None,
 ) -> ProfileHealth:
     from claude_lb.models import ExtraUsage
@@ -72,6 +73,7 @@ def _entry(
         usage=usage,
         weekly_reset_at=weekly_reset_at,
         session_reset_at=session_reset_at,
+        model_reset_at=model_reset_at,
     )
 
 
@@ -1155,3 +1157,70 @@ def test_pick_filter_scores_present_in_sticky_path(
     assert outcome.chosen is not None
     assert outcome.chosen.name == "sticky"
     assert "sticky" in outcome.filter_scores
+
+
+# ---------------------------------------------------------------------------
+# MODEL_LIMIT — scoped-limit exhaustion (limits[] / Fable)
+# ---------------------------------------------------------------------------
+
+
+def test_model_limit_with_future_reset_is_filtered_out() -> None:
+    cache = _cache(
+        _entry(
+            "a",
+            Health.MODEL_LIMIT,
+            model_reset_at=FIXED_NOW + timedelta(hours=24),
+        ),
+        _entry("b", Health.OK),
+    )
+    outcome = pick(cache, ["a", "b"], now=FIXED_NOW)
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "b"
+
+
+def test_model_limit_with_past_reset_is_selectable() -> None:
+    cache = _cache(
+        _entry(
+            "a",
+            Health.MODEL_LIMIT,
+            model_reset_at=FIXED_NOW - timedelta(minutes=1),
+        ),
+    )
+    outcome = pick(cache, ["a"], strategy=Strategy.LEAST_USED, now=FIXED_NOW)
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "a"
+
+
+def test_model_limit_with_no_reset_is_filtered_out() -> None:
+    """No model_reset_at at all -> treated as still-exhausted (matches the
+    None-means-not-yet-recovered semantic of WEEKLY_LIMIT/SESSION_LIMIT)."""
+    cache = _cache(
+        _entry("a", Health.MODEL_LIMIT, model_reset_at=None),
+        _entry("b", Health.OK),
+    )
+    outcome = pick(cache, ["a", "b"], now=FIXED_NOW)
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "b"
+
+
+def test_all_model_limit_signals_earliest_recovery() -> None:
+    reset_a = FIXED_NOW + timedelta(hours=24)
+    reset_b = FIXED_NOW + timedelta(hours=12)
+    cache = _cache(
+        _entry("a", Health.MODEL_LIMIT, model_reset_at=reset_a),
+        _entry("b", Health.MODEL_LIMIT, model_reset_at=reset_b),
+    )
+    outcome = pick(cache, ["a", "b"], now=FIXED_NOW)
+    assert outcome.chosen is None
+    assert outcome.reason is PickFailureReason.ALL_MODEL_LIMIT
+    assert outcome.earliest_recovery_at == reset_b
+
+
+def test_model_limit_mixed_with_ok_prefers_ok() -> None:
+    cache = _cache(
+        _entry("limited", Health.MODEL_LIMIT, model_reset_at=FIXED_NOW + timedelta(hours=1)),
+        _entry("ok", Health.OK, weekly_pct=50),
+    )
+    outcome = pick(cache, ["limited", "ok"], now=FIXED_NOW)
+    assert outcome.chosen is not None
+    assert outcome.chosen.name == "ok"

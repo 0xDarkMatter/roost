@@ -77,6 +77,7 @@ class PickFailureReason(str, Enum):
     ALL_AUTH_DEAD = "all_auth_dead"
     ALL_AUTH_EXPIRED = "all_auth_expired"
     ALL_WEEKLY = "all_weekly_limit"
+    ALL_MODEL_LIMIT = "all_model_limit"
     ALL_THROTTLED = "all_throttled"
     ALL_TERMINAL = "all_terminal"
     REQUIRE_OK_NONE = "require_ok_none"
@@ -259,8 +260,12 @@ def _is_selectable(entry: ProfileHealth, now: datetime, require_ok: bool) -> boo
         reset = entry.weekly_reset_at
         if reset is None or reset > now:
             return False
-    if entry.health is Health.SESSION_LIMIT:  # pragma: no branch  -- WEEKLY/SESSION/RATE branches mutually exclusive on a single entry
+    if entry.health is Health.SESSION_LIMIT:  # pragma: no branch  -- WEEKLY/SESSION/MODEL/RATE branches mutually exclusive on a single entry
         reset = entry.session_reset_at
+        if reset is None or reset > now:  # pragma: no branch  -- truthy condition always taken when filter ladder reaches here
+            return False
+    if entry.health is Health.MODEL_LIMIT:  # pragma: no branch  -- WEEKLY/SESSION/MODEL/RATE branches mutually exclusive on a single entry
+        reset = entry.model_reset_at
         if reset is None or reset > now:  # pragma: no branch  -- truthy condition always taken when filter ladder reaches here
             return False
     if entry.health is Health.RATE_LIMITED:  # pragma: no branch
@@ -277,7 +282,7 @@ def _is_selectable(entry: ProfileHealth, now: datetime, require_ok: bool) -> boo
 def _earliest_recovery(entries: list[ProfileHealth]) -> datetime | None:
     candidates: list[datetime] = []
     for e in entries:
-        for ts in (e.weekly_reset_at, e.session_reset_at, e.expires_at):
+        for ts in (e.weekly_reset_at, e.session_reset_at, e.model_reset_at, e.expires_at):
             if ts is not None:
                 candidates.append(ts)
     return min(candidates) if candidates else None
@@ -577,6 +582,11 @@ def _diagnose_failure(
     if all(e.health is Health.WEEKLY_LIMIT for e in entries):
         return PickOutcome(
             reason=PickFailureReason.ALL_WEEKLY,
+            earliest_recovery_at=_earliest_recovery(entries),
+        )
+    if all(e.health is Health.MODEL_LIMIT for e in entries):
+        return PickOutcome(
+            reason=PickFailureReason.ALL_MODEL_LIMIT,
             earliest_recovery_at=_earliest_recovery(entries),
         )
     if all(e.health in (Health.RATE_LIMITED, Health.SESSION_LIMIT) for e in entries):
