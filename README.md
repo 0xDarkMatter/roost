@@ -9,9 +9,7 @@
 
 > Pick the healthiest Claude Code OAuth profile — health taxonomy + load balancer for local OAuth profiles. Works with any plan (Max / Pro / Team), with richer usage data on Max.
 
-**Built for the Claude Opus 4.7 Hackathon.**
-
-![roost](docs/assets/hackathon.gif)
+![roost widget — fleet dashboard](docs/assets/widget-light.png)
 
 ## Trial dispatch (recommended pattern)
 
@@ -290,9 +288,8 @@ Overage bars) to stderr instead of the table — same data, denser per-profile v
 CDN script or stylesheet, no webfont, no outbound request of any kind — the tool
 renders it behind a strict CSP that blocks all of them.
 
-![roost widget — fleet dashboard](docs/assets/widget-light.png)
-
-The page is a fleet dashboard header above a grid of per-profile cards:
+The page is a fleet dashboard header above a grid of per-profile cards
+(pictured at the top of this README):
 
 | Element | What it shows |
 |---------|---------------|
@@ -875,3 +872,9 @@ This tool follows the [Forma Protocol](https://github.com/forma-tools/forma):
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+**Built for the Claude Opus 4.7 Hackathon.**
+
+![roost](docs/assets/hackathon.gif)
