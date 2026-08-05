@@ -1,8 +1,8 @@
-# Findings — open questions from HANDOFF.md
+# Findings — open questions from the v0.1 build brief
 
 Status as of v0.1.0 · 2026-04-24
 
-The HANDOFF listed five open questions to resolve during implementation. This
+The v0.1 build brief listed five open questions to resolve during implementation. This
 document records what is currently known, what remains unconfirmed against
 live Anthropic infrastructure, and where the resolution lives in code.
 
@@ -255,7 +255,7 @@ strings present).
 
 **Method:**
 
-1. `roost session evolution7 --out /tmp/test/.credentials.json` (snapshot
+1. `roost session account-a --out /tmp/test/.credentials.json` (snapshot
    captures live chain head).
 2. `jq` mutated `expiresAt` to a past timestamp; file hash recorded.
 3. `CLAUDE_CONFIG_DIR=/tmp/test claude -p "reply: PASS"` ran successfully.

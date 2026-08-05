@@ -10,16 +10,20 @@ Auto-loaded by `/sync`. Notes that should survive across sessions.
 
 ## Current state (last update: 2026-08-04)
 
-- **Version:** v0.5.0 on `main`, plus an unreleased batch (see below). The
-  tool was **renamed `claude-lb` → `roost`**; `paths.py` migrates the old
-  `~/.config/claude-lb` config dir on first resolution. The Python package is
-  still `src/claude_lb/` — only the CLI name and config dir moved.
-- **Remote:** `origin` = https://github.com/0xDarkMatter/roost (private). Tags pushed: v0.1.0, v0.2.0, v0.3.0, v0.4.0, plus `hackathon-submission` (annotated, points at the v0.3.0 squash commit). **Nothing since v0.5.0 has been pushed** — see the standing no-push directive above.
-- **Tests:** 871 mocked + 28 live (`uv run pytest` for the mocked suite, `uv run pytest -m live` for the integration suite). All green at last check.
-- **Live fleet:** 4 profiles under `~/.claude-profiles/` — `agent-01`,
-  `evolution7`, `mknv74`, `roamhq`. All `max` plan. (Earlier notes said three
-  named `account-a/b/c`; that was wrong.) Variety of overage/usage states —
-  useful as a real-world testbed for `pytest -m live`.
+- **Version:** v0.6.0 on `main`. The tool was **renamed `claude-lb` → `roost`**;
+  `paths.py` migrates the old `~/.config/claude-lb` config dir on first
+  resolution. The Python package is still `src/claude_lb/` — only the CLI name
+  and config dir moved.
+- **Remote:** `origin` = https://github.com/0xDarkMatter/roost — **PUBLIC**.
+  Treat every file in this repo as world-readable; do not write real account
+  names, local absolute paths, or anything machine-specific into tracked
+  files. Run `roost list` for the live fleet rather than recording names here.
+- **Tag/release numbering is inconsistent** — see the reconciliation note
+  below before cutting any release.
+- **Tests:** 934 mocked + 28 live (`uv run pytest` for the mocked suite,
+  `uv run pytest -m live` for the integration suite). All green at last check.
+- **Live fleet:** 4 profiles under `~/.claude-profiles/`, all `max` plan, with
+  a spread of usage states — a useful real-world testbed for `pytest -m live`.
 
 ### [Unreleased] Fable capacity + model_limit (2026-08-04)
 
@@ -31,7 +35,7 @@ worth remembering as a class of failure, not just an incident.
   the model there today. Roost kept reporting `null` per-model usage as
   though the accounts had no data — silent degradation, no error, for weeks.
 - **`Health.MODEL_LIMIT` is the ninth state.** A scoped limit exhausts
-  independently of the aggregate weekly window: mknv74 read `weekly_all` 76%
+  independently of the aggregate weekly window: account-b read `weekly_all` 76%
   with Fable at 90%. Before this, roost called that `ok` and picked it.
   Weekly still beats model when both fire.
 - **`is_active` means "the constraint currently binding", NOT "enforced".**

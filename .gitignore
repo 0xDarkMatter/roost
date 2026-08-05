@@ -53,3 +53,6 @@ Thumbs.db
 docs/screenshots/
 BLOCKERS.md
 results.tsv
+
+# Planning / handoff notes — local working docs, not part of the published repo.
+.claude/plans/

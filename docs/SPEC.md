@@ -504,7 +504,7 @@ roost pick --strategy round-robin # Load-spread explicitly (ignores stickiness)
 
 **Env var:** `CLAUDE_LB_STICKINESS=<seconds>` (default 300). A stickiness of 0 disables the behaviour and reverts to the configured strategy.
 
-**Max plan note:** on pay-per-token API keys, prompt cache hits cost ~10% of input tokens, saving materially on long contexts. On Max subscriptions the cost model is flat-rate but sessions / weekly budgets are token-counted; whether cache hits count less against Max quotas is undocumented as of 2026-04 — see [HANDOFF.md "open questions"]. Stickiness is beneficial either way: cache hits on Max plans reduce latency even if they don't reduce quota burn.
+**Max plan note:** on pay-per-token API keys, prompt cache hits cost ~10% of input tokens, saving materially on long contexts. On Max subscriptions the cost model is flat-rate but sessions / weekly budgets are token-counted; whether cache hits count less against Max quotas is undocumented as of 2026-04 — see `docs/findings.md` §5. Stickiness is beneficial either way: cache hits on Max plans reduce latency even if they don't reduce quota burn.
 
 ### Filter ladder
 
@@ -684,7 +684,6 @@ Standard Forma §16 layout, Python + `uv`:
 roost/
 ├── README.md                     # This file
 ├── SPEC.md                       # This spec
-├── HANDOFF.md                    # For the build agent
 ├── LICENSE                       # MIT
 ├── pyproject.toml                # Package config + [tool.forma]
 ├── docs/
