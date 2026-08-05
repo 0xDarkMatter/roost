@@ -82,7 +82,12 @@ def test_version() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert "roost" in result.stdout
-    assert "0.5.0" in result.stdout
+    # Read the version rather than hardcoding it — a literal here turns every
+    # release into a test failure, which trains you to edit the assertion
+    # instead of reading it.
+    from claude_lb import __version__
+
+    assert __version__ in result.stdout
 
 
 def test_help_exits_zero() -> None:

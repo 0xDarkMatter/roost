@@ -3,7 +3,7 @@
 [![Forma](https://img.shields.io/badge/forma-experimental-orange.svg)](https://github.com/forma-tools/forma)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.6.0-blue.svg)](CHANGELOG.md)
 [![Hackathon](https://img.shields.io/badge/Claude%20Opus%204.7-Hackathon-blueviolet?logo=anthropic)](https://www.anthropic.com/)
 ![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)
 
@@ -44,11 +44,11 @@ For long-running agents (multi-day), dedicate one profile and exclude it
 from the rotation pool:
 
 ```bash
-# Agent owns roamhq permanently:
-CLAUDE_CONFIG_DIR=~/.claude-profiles/roamhq claude -p ... &
+# Agent owns this profile permanently:
+CLAUDE_CONFIG_DIR=~/.claude-profiles/agent claude -p ... &
 
 # Trial fleet routes around it:
-roost pick --avoid roamhq
+roost pick --avoid agent
 ```
 
 **Do not** snapshot `credentials.json` and hand the copy to a workload
@@ -64,84 +64,46 @@ and the architectural reason.
 [**Releases on GitHub**](https://github.com/0xDarkMatter/roost/releases) ·
 [Full CHANGELOG](CHANGELOG.md)
 
-### v0.5.0 — credential rotation safety
+**v0.6.0** (August 2026)
 
-> **Note (added 2026-05-11):** the `--lease` and `roost snapshot`
-> surface ship and work as described below, but empirical testing
-> revealed claude itself auto-refreshes credentials.json and writes the
-> new chain back to the read-from file. This makes the snapshot pattern
-> unsafe for any workload that triggers a refresh (typically ≥8h
-> wall-time). The current recommendation for trial dispatch is the
-> "Trial dispatch (recommended pattern)" section above — direct
-> `CLAUDE_CONFIG_DIR` against the live profile dir, no snapshot. The
-> v0.5.0 features remain available for sub-8h cases or workloads that
-> can't read `~/.claude-profiles/<name>/` directly. See
-> `docs/findings.md` §6.
+*   🚀 **Fable capacity via `limits[]`** - Anthropic moved per-model usage out of `seven_day_sonnet` / `seven_day_opus` (now `null` on every profile) into a top-level `limits[]` array; **Fable** is the model there today. roost parses it and surfaces `fable_pct` across the status table, JSON, cards, and `report --metric fable_pct | spend_pct`.
+*   🎯 **`model_limit` — a ninth health state** - A scoped limit exhausts independently of the aggregate weekly window, so a profile could read `weekly_all` 76% with its Fable allotment spent and still be picked, burning the dispatch. `pick` now filters those out until the scoped window resets (`ALL_MODEL_LIMIT` → exit 9).
+*   🎨 **`roost widget`** - Self-contained HTML fleet dashboard for Claude Code's `show_widget`: a capacity ring per profile, the current recommendation, live Claude Status components, and per-service incident calendars. No `<script>` tag and no external asset — the tool renders it behind a strict CSP.
+*   🆕 **`roost status --cards`** - The same per-profile capacity view in the terminal, via the new `term.py` panel renderer, with ASCII and `NO_COLOR` fallbacks.
+*   🔍 **API drift tripwire** - `roost doctor` warns when `/api/oauth/usage` returns unknown, missing, or newly-null modelled fields. The shape changed once without notice and roost degraded silently for weeks; this catches the next one.
+*   🔄 **Renamed `claude-lb` → `roost`** - CLI, docs, and config dir. The pre-rename `~/.config/claude-lb` is migrated on first resolution, so existing cache, `picks.log`, and leases survive.
 
-- **`roost exec --lease` (default on)** — pins the picked profile against
-  `roost refresh` for the child's lifetime. A background probe can no longer
-  rotate the OAuth token under a long-running child (`LEASE_HELD`, exit 7).
-  `--no-lease` opts out; `--lease-for <dur>` overrides the TTL (default:
-  `timeout * 1.2` or 30m). Released in a `finally` block — Ctrl+C and
-  exceptions both clean up.
-- **`roost snapshot <profile> <out-path>`** — documented point-in-time credential
-  copy with a stderr warning. Makes the "copy once, use for duration" pattern
-  discoverable for external consumers (containers, sub-processes) that can't
-  participate in the lease system.
+**v0.5.0** (May 2026)
 
-### v0.4.0 — symmetric API, observability, integration surfaces
+*   🛡️ **`roost exec --lease` (default on)** - Pins the picked profile against `roost refresh` for the child's lifetime, so a background probe can't rotate the OAuth token under a long-running child (`LEASE_HELD`, exit 7). `--no-lease` opts out; `--lease-for <dur>` overrides the TTL. Released in a `finally` block.
+*   📦 **`roost snapshot <profile> <out-path>`** - Documented point-in-time credential copy with a stderr warning, for external consumers (containers, sub-processes) that can't participate in the lease system.
+*   ⚠️ **Snapshots are unsafe for long workloads** - Later testing showed `claude` auto-refreshes `credentials.json` and writes the new chain back to the file it read from, orphaning the live profile. For trial dispatch use `CLAUDE_CONFIG_DIR` against the live profile dir instead — see [Trial dispatch](#trial-dispatch-recommended-pattern) and `docs/findings.md` §6.
 
-- **Symmetric profile management** — `roost remove`, `roost rename`, plus
-  the read-only `roost which` (returns what `pick` *would* choose without
-  side effects on `picks.log` / `last-pick.json`).
-- **Pick algorithm** — `--avoid <name>` (repeatable), `--max-cost <pct>`
-  (gate by monthly overage), `--fallback <name>` (last-resort safety net),
-  `--explain` (decision-tree rendering), and a new `lowest-overage`
-  strategy.
-- **Observability** — `roost stats` aggregates `picks.log` (totals,
-  durations, failure rates); opt-in `roost report` aggregates a new
-  `usage-log.ndjson` per-probe time-series with sparklines + linear
-  burn-rate projection. Toggle via `roost config usage-log {on|off|status}`
-  or `CLAUDE_LB_USAGE_LOG=1`.
-- **Reliability** — per-profile exponential backoff for `network_error`
-  (30s → 60s → 120s → 240s → 480s, capped) so a flapping endpoint stops
-  thundering-herd. `refresh --jitter <s>` for cron-spread.
-- **Integration surfaces** — `roost shellinit` emits a transparent
-  `claude` wrapper for bash/zsh/fish/pwsh; `roost trace <name>` dumps
-  request/response + classifier reasoning (token redacted); `roost top`
-  is a Rich `Live` TUI of the status table.
-- **Live integration tests** — `pytest -m live` exercises the full CLI
-  against the local fleet; default `pytest` keeps the mocked suite
-  hermetic.
+**v0.4.0** (April 2026)
 
-### v0.3.0 — onboarding + observability
+*   🔄 **Symmetric profile management** - `roost remove`, `roost rename`, plus the read-only `roost which` (returns what `pick` *would* choose without side effects on `picks.log` / `last-pick.json`).
+*   🎯 **Pick algorithm** - `--avoid <name>` (repeatable), `--max-cost <pct>` (gate by monthly overage), `--fallback <name>` (last-resort safety net), `--explain` (decision-tree rendering), and a new `lowest-overage` strategy.
+*   🔍 **Observability** - `roost stats` aggregates `picks.log` (totals, durations, failure rates); opt-in `roost report` aggregates a `usage-log.ndjson` per-probe time-series with sparklines + linear burn-rate projection.
+*   ⚡ **Reliability** - Per-profile exponential backoff for `network_error` (30s → 480s, capped) so a flapping endpoint stops thundering-herd. `refresh --jitter <s>` for cron-spread.
+*   🔌 **Integration surfaces** - `roost shellinit` emits a transparent `claude` wrapper for bash/zsh/fish/pwsh; `roost trace <name>` dumps request/response + classifier reasoning (token redacted); `roost top` is a Rich `Live` TUI.
+*   🧪 **Live integration tests** - `pytest -m live` exercises the full CLI against the local fleet; default `pytest` keeps the mocked suite hermetic.
 
-- **`roost add <name>`** — import an existing `.credentials.json` (default
-  source: `~/.claude/.credentials.json`) into the multi-profile layout. Cuts
-  onboarding from "manually copy files into a directory I haven't created"
-  to one command.
-- **`roost status` surfaces Anthropic-side incidents** above the profile table
-  by polling `https://status.claude.com/api/v2/summary.json` (60s cache,
-  stale-fallback). Silent when all clean; folds into `meta.platform_status`
-  on `--json`. Opt out with `--no-platform-status`.
-- **`roost doctor` status.claude.com check** — always-fresh, WARN-level.
-  Helps distinguish "my setup is broken" from "Anthropic is degraded".
-- Audience widened: any Claude Code OAuth account (Max / Pro / Team).
+**v0.3.0** (April 2026)
 
-### v0.2.0 — exec, multi-pick, operational tooling
+*   🆕 **`roost add <name>`** - Import an existing `.credentials.json` (default source: `~/.claude/.credentials.json`) into the multi-profile layout. Cuts onboarding from "manually copy files into a directory I haven't created" to one command.
+*   🔍 **Platform-status awareness** - `roost status` surfaces Anthropic-side incidents above the profile table by polling status.claude.com (60s cache, stale-fallback). Silent when clean; folds into `meta.platform_status` on `--json`. Opt out with `--no-platform-status`.
+*   🩺 **`roost doctor` status check** - Always-fresh, WARN-level. Helps distinguish "my setup is broken" from "Anthropic is degraded".
+*   📐 **Audience widened** - Any Claude Code OAuth account (Max / Pro / Team), not just Max.
 
-- **`roost exec <cmd...>`** — pick a profile, set `ROOST_PROFILE`,
-  exec the command, propagate child rc. With `--auto-refresh` and
-  `--retry-on-429`.
-- **`roost pick --auto-refresh`** — inline-refresh expired tokens before
-  picking. Folds the two-step preflight into one call.
-- **`roost pick --count N` (alias `-n N`)** — multi-pick for parallel
-  dispatch workflows.
-- **Shell completion** (`roost --install-completion`) — bash/zsh/fish/pwsh.
-- **`roost history`** — read the picks.log audit trail with `--profile`,
-  `--since 30m`, `--tail N` filters.
-- **`refresh --soon DURATION`** — anticipatory refresh; cron-friendly
-  (`*/15 * * * * roost refresh --soon 30m --json`).
+**v0.2.0** (April 2026)
+
+*   🚀 **`roost exec <cmd...>`** - Pick a profile, set `ROOST_PROFILE`, exec the command, propagate child rc. With `--auto-refresh` and `--retry-on-429`.
+*   🎯 **`roost pick --auto-refresh`** - Inline-refresh expired tokens before picking, folding the two-step preflight into one call. `--count N` (alias `-n N`) adds multi-pick for parallel dispatch.
+*   🛠️ **Shell completion** - `roost --install-completion` for bash/zsh/fish/pwsh.
+*   🔍 **`roost history`** - Read the picks.log audit trail with `--profile`, `--since 30m`, `--tail N` filters.
+*   🔁 **`refresh --soon DURATION`** - Anticipatory refresh; cron-friendly (`*/15 * * * * roost refresh --soon 30m --json`).
+
+[View full changelog →](https://github.com/0xDarkMatter/roost/commits/main)
 
 ## Architecture
 
@@ -198,7 +160,7 @@ git clone https://github.com/0xDarkMatter/roost.git
 cd roost
 uv tool install --editable .
 
-roost --version    # → roost 0.5.0
+roost --version    # → roost 0.6.0
 ```
 
 To upgrade later, pull + reinstall:
@@ -327,6 +289,8 @@ Overage bars) to stderr instead of the table — same data, denser per-profile v
 **stdout**, sized for Claude Code's `show_widget` tool: no `<script>` tag at all, no
 CDN script or stylesheet, no webfont, no outbound request of any kind — the tool
 renders it behind a strict CSP that blocks all of them.
+
+![roost widget — fleet dashboard](docs/assets/widget-light.png)
 
 The page is a fleet dashboard header above a grid of per-profile cards:
 

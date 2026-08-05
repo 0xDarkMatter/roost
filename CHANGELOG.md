@@ -3,129 +3,125 @@
 All notable changes to this project are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/)
 
-## [Unreleased]
+## [0.6.0] - 2026-08-05
 
 ### Added
 
-- **`roost widget` is a fleet dashboard, not just a card grid.** A header
-  above the profile cards carries fleet counts, the profile `pick` would
-  currently return, and a concentric ring per profile (outer arc Weekly,
-  inner arc Fable — the two windows exhaust independently, and the gap
-  between them is the point). Beside it, a **Claude Status** panel shows live
-  component states from status.claude.com next to a per-service incident
-  calendar; hovering a service swaps the calendar to that service's history.
-  The recommendation uses `which` semantics — it runs the pick algorithm
-  without writing `picks.log` or moving the stickiness pointer, so rendering
-  a dashboard never changes which profile the next dispatch gets.
-- **Bars / Grid toggle**, switching every card between horizontal bars and
-  10×10 square grids. Implemented with a hidden checkbox and sibling
-  selectors — no JavaScript, so the page keeps its "no `<script>` at all"
-  property, which is what makes the ban on `alert`/`confirm`/`prompt`
+- **Model-scoped capacity (`limits[]`/`spend`) parsing and the `model_limit`
+  health state.** Anthropic moved per-model usage (currently the Fable model)
+  out of the `seven_day_sonnet`/`seven_day_opus` windows — now `null` on every
+  profile — into a top-level `limits[]` array, with a sibling `spend` block
+  carrying monthly overage in minor units. `roost` parses both (`ScopedLimit`,
+  `Spend` in `models.py`) and classifies a profile as `model_limit` when an
+  *active* scoped limit is exhausted (`percent >= 100`) even though the
+  aggregate weekly/session windows are still under 100 — a gap the previous
+  classifier could not see. Ninth `Health` state; `MODEL_LIMIT` sits in the
+  filter ladder between `WEEKLY_LIMIT` and `AUTH_EXPIRED`, and loses precedence
+  to `WEEKLY_LIMIT`/`SESSION_LIMIT` when more than one condition fires for the
+  same profile. See `docs/findings.md` §7.
+- **Fable column** in `roost status`'s table (shown only when at least one
+  profile has model-scoped data), plus a dedicated Fable gauge on
+  `status --cards`, `roost widget`, and `roost trace`.
+- **`roost widget` — a self-contained HTML fleet dashboard** for Claude Code's
+  `show_widget` tool (strict CSP: no CDN, no webfont, no outbound request, no
+  `<script>` tag at all). A header above the profile cards carries fleet
+  counts, the profile `pick` would currently return, and a concentric ring per
+  profile (outer arc Weekly, inner arc Fable — the two windows exhaust
+  independently, and the gap between them is the point). Beside it a **Claude
+  Status** panel shows live component states from status.claude.com next to a
+  per-service incident calendar; hovering a service swaps the calendar to that
+  service's history. The recommendation uses `which` semantics — it runs the
+  pick algorithm without writing `picks.log` or moving the stickiness pointer,
+  so rendering a dashboard never changes which profile the next dispatch gets.
+  Byte budget via `--max-kb` (default 28).
+- **Bars / Grid toggle** on the widget, switching every card between
+  horizontal bars and 10×10 square grids. Implemented with a hidden checkbox
+  and sibling selectors — no JavaScript, so the page keeps its "no `<script>`
+  at all" property, which is what makes the ban on `alert`/`confirm`/`prompt`
   structural rather than conventional.
+- **`roost status --cards`** — one capacity-card panel per profile
+  (Session / Weekly / Fable / Overage) to stderr instead of the table, via the
+  new `term.py` panel renderer with ASCII and `NO_COLOR` fallbacks.
 - **Per-component incident history** (`PlatformStatus.component_days`),
-  derived from the incidents payload already fetched — no extra request.
-  Each series carries the same dates, order and length as the fleet-wide
+  derived from the incidents payload already fetched — no extra request. Each
+  series carries the same dates, order and length as the fleet-wide
   `incident_days`, so parallel grids need no alignment logic.
+- **`usage_field_drift` doctor check** — probes one profile and diffs the raw
+  response's top-level keys against what `roost` knows about
+  (`probe.KNOWN_USAGE_KEYS` / `MODELLED_USAGE_KEYS`); always WARN-level, never
+  fails the doctor run. This is the check that would have caught the
+  `seven_day_opus`/`seven_day_sonnet`-going-null shift before it went unnoticed.
+- **`roost report --metric`** gains `fable_pct` and `spend_pct`.
+
+### Changed
+
+- **Renamed `claude-lb` to `roost`** across the CLI, docs, and config
+  directory. `paths.config_dir()` migrates a pre-rename `~/.config/claude-lb`
+  on first resolution, so existing cache, `picks.log`, and leases survive. The
+  Python package remains `src/claude_lb/`.
 
 ### Fixed
 
+- **`is_active` was being applied to reporting, not just classification.** An
+  earlier build filtered `limits[]` on `is_active` when rendering `fable_pct`
+  and the widget gauge, which reported "no data" for a profile whose Fable
+  window was genuinely at 0% simply because its session window happened to be
+  the nearer cap that day. The classifier still gates `MODEL_LIMIT` on
+  `is_active` (correctly — only the binding constraint should disqualify a
+  profile from `pick`); reporting does not.
 - **The widget dropped a profile to stay under its byte budget.** A
   four-profile fleet rendered three cards: the budget removed the
   least-recently-probed profile — precisely the account least likely to be
   missed — and the stderr warning was easily swallowed by a redirect.
   `render_widget()` now steps down a detail ladder (`full` → `compact` →
   `minimal`), shedding the alternate gauge view and then the per-service
-  calendars, and only drops a card as a last resort. A fleet overview that
-  silently omits an account is worse than one missing a nicety.
+  calendars, and only drops a card as a last resort.
+- **Model-scoped resets never rendered in the widget.** The CLI passes the
+  status payload in-process, where `build_status_payload` hand-formats
+  top-level timestamps to ISO strings but dumps nested `limits[]` wholesale —
+  so a scoped limit's `resets_at` arrived as a `datetime` while the widget's
+  parser accepted only strings. Every widget test fed JSON-shaped strings, so
+  the suite stayed green while the rendered card silently lost the line.
 - **Square-grid gauges rendered soft.** They had been sized fluidly with
-  percentage gradient stops, so every cell edge fell on a fractional pixel
-  and the browser antialiased all 200 of them. Geometry is now whole pixels
-  throughout, with the CSS derived from the same constants as the fill maths
-  so the two cannot drift apart.
-- **Model-scoped resets never rendered.** The CLI passes the status payload
-  in-process, where `build_status_payload` hand-formats top-level timestamps
-  to ISO strings but dumps nested `limits[]` wholesale — so a scoped limit's
-  `resets_at` arrived as a `datetime` while the widget's parser accepted only
-  strings. Every widget test fed JSON-shaped strings, so the suite stayed
-  green while the rendered card silently lost the line.
-- **Panel glyphs were mojibake on Windows.** Both stdout and stderr default
-  to the console codepage, which cannot encode the box-drawing, bullet and
-  dash characters the widget and `term.py` emit. `term.ensure_utf8()` now
-  upgrades either stream; the ASCII fallback remains for terminals that
+  percentage gradient stops, so every cell edge fell on a fractional pixel and
+  the browser antialiased all 200 of them. Geometry is now whole pixels
+  throughout, with the CSS derived from the same constants as the fill maths.
+- **stdout and stderr forced to UTF-8.** Windows defaults both streams to the
+  console codepage (cp1252/cp437), which cannot encode the box-drawing
+  separators, bullets and dashes the widget and `term.py` emit — piping
+  `roost widget` to a file, or running under a non-UTF console, produced
+  mojibake. `output.emit_text` and `term.emit_panel` now call
+  `term.ensure_utf8()`; the ASCII fallback remains for terminals that
   genuinely cannot display Unicode.
+- **`PickFailureReason.ALL_MODEL_LIMIT` had no exit code**, falling through to
+  the generic exit 1 so a script could not distinguish "every profile is
+  model-limited" from an unexpected crash. Now maps to `EXIT_UNAVAILABLE` (9),
+  mirroring `ALL_WEEKLY`.
 
 ### Removed
 
 - **Exec failure rate and median exec duration from the profile cards.** Both
   were misleading on a card whose job is "is this profile healthy?". `rc` is
   the *child's* exit code, so a bad prompt or a Ctrl+C read as the profile
-  failing; and the samples never expired — one profile's "Failed 100%" was
-  six runs inside three minutes on a single day months earlier. Median timed
-  the command rather than the account. `Picks` and `Full in` remain.
-
-- **Model-scoped capacity (`limits[]`/`spend`) parsing and the `model_limit`
-  health state.** Anthropic moved per-model usage (currently the Fable model)
-  out of the `seven_day_sonnet`/`seven_day_opus` windows — now `null` on every
-  profile — into a top-level `limits[]` array, with a sibling `spend` block
-  carrying monthly overage in minor units. `roost` now parses both
-  (`ScopedLimit`, `Spend` in `models.py`) and classifies a profile as
-  `model_limit` when an *active* scoped limit is exhausted (`percent >= 100`)
-  even though the aggregate weekly/session windows are still under 100 — a gap
-  the previous classifier couldn't see. Ninth `Health` state; `MODEL_LIMIT`
-  sits in the filter ladder between `WEEKLY_LIMIT` and `AUTH_EXPIRED`, and
-  loses precedence to `WEEKLY_LIMIT`/`SESSION_LIMIT` when more than one
-  condition fires for the same profile. See `docs/findings.md` §7.
-- **Fable column** in `roost status`'s table (shown only when at least one
-  profile has model-scoped data) and a dedicated Fable gauge on
-  `status --cards`, `roost widget`, and `roost trace`.
-- **`roost widget`** — renders capacity cards as a single self-contained HTML
-  fragment on stdout, sized for Claude Code's `show_widget` tool (strict CSP:
-  no CDN, no webfont, no outbound requests, no `<script>` tag at all). Hard
-  byte budget via `--max-kb` (default 28); drops the least-recently-probed
-  profiles to fit, warning on stderr if it had to.
-- **`roost status --cards`** — renders one capacity-card panel per profile
-  (Session / Weekly / Fable / Overage bars) to stderr instead of the table.
-- **`usage_field_drift` doctor check** — probes one profile and diffs the raw
-  response's top-level keys against what `roost` knows about
-  (`probe.KNOWN_USAGE_KEYS` / `MODELLED_USAGE_KEYS`); always WARN-level, never
-  fails the doctor run. This is the check that would have caught the
-  `seven_day_opus`/`seven_day_sonnet`-going-null shift before it went
-  unnoticed for a while.
-- **`roost report --metric`** gains `fable_pct` and `spend_pct`.
-
-### Fixed
-
-- **`is_active` was being applied to reporting, not just classification.** An
-  earlier build of the Fable display filtered `limits[]` on `is_active` when
-  rendering `fable_pct` / the widget gauge, which reported "no data" for a
-  profile whose Fable window was genuinely at 0% simply because its session
-  window happened to be the nearer cap that day. The classifier still gates
-  `MODEL_LIMIT` on `is_active` (correctly — only the binding constraint
-  should disqualify a profile from `pick`); reporting
-  (`Usage.model_pct()`, `widget._active_fable_limit()`) does not.
-- **stdout/stderr forced to UTF-8.** Windows defaults both streams to the
-  console codepage (cp1252/cp437), which cannot encode the box-drawing
-  separators and dashes the widget and table renderers emit — piping
-  `roost widget` to a file, or running under a non-UTF console, produced
-  mojibake. `output.emit_text` / `term.ensure_utf8` now force UTF-8 on the
-  way out.
+  failing; and the samples never expired — one profile's "Failed 100%" was six
+  runs inside three minutes on a single day months earlier. Median timed the
+  command rather than the account. `Picks` and `Full in` remain.
 
 ### Documentation
 
 - **OAuth auto-refresh finding (2026-05-11).** Empirical verification that
-  `claude` (Claude Code CLI) auto-refreshes its OAuth chain when the
-  access_token expires, writing the new chain back to the file it read from
+  `claude` auto-refreshes its OAuth chain when the access_token expires,
+  writing the new chain back to the file it read from
   (`$CLAUDE_CONFIG_DIR/.credentials.json`). This makes the snapshot pattern
   introduced in v0.5.0 unsafe for any workload long enough to trigger a
   refresh — the snapshot's new refresh_token diverges from the live source
-  profile's, server-side-invalidating the source. New recommended
-  trial-dispatch pattern: `CLAUDE_CONFIG_DIR=~/.claude-profiles/$(roost
-  pick)` directly against the live profile dir; let claude own the refresh
-  chain. See `docs/findings.md` §6 and the new "Trial dispatch (recommended
-  pattern)" section of the README. No code changes — the `--lease` and
-  `roost snapshot` surface remain available for sub-8h cases.
+  profile's, server-side-invalidating the source. The recommended
+  trial-dispatch pattern is now `CLAUDE_CONFIG_DIR` directly against the live
+  profile dir. See `docs/findings.md` §6.
+- **AGENTS.md rules 29–39** record the invariants this release introduced,
+  each one chosen because it breaks *silently* if undone.
 
-## [0.5.0] - Unreleased
+## [0.5.0] - 2026-05-11
 
 ### Added
 
